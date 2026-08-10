@@ -2156,6 +2156,9 @@ class GnomeSpeaksService:
 
         Uses the unified llm_stream library for all providers (including bedrock).
         """
+        # AI replies are user-initiated speech: hold the agent speech queue
+        # for the whole turn (LLM streaming + sentence TTS).
+        self._user_speech_active.set()
         try:
             provider = CONFIG.get("llm_provider", "anthropic")
             model = CONFIG.get("llm_model", "claude-opus-4.6")
@@ -2328,6 +2331,8 @@ class GnomeSpeaksService:
                     if not self._stop_event.is_set()
                     else False
                 ))
+        finally:
+            self._user_speech_active.clear()
 
     # -- Conversation worker ------------------------------------------------
 
