@@ -265,6 +265,28 @@ journalctl --user -u gnome-speaks -f
 systemctl --user restart gnome-speaks
 ```
 
+## HTTP API
+
+A localhost REST API on port `7710` for browser- and agent-driven TTS. Speech
+requests **queue FIFO** — concurrent callers never cut each other off — while
+speech you trigger yourself (keyboard shortcut, D-Bus, AI replies) preempts the
+current utterance immediately and holds the queue until you finish.
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /speak` | Queue text for speech. Body: `text` (required), `voice` (Azure ShortName), `quality` (`fast`/`hd`), `output_file` (save WAV instead of playing), `interrupt` (`true` = flush everything and speak now). Returns `{ok, id, position, state}` — plus `flushed` (how many queued items an interrupt deleted); `429` when the queue (depth 32) is full. |
+| `POST /skip` | Cancel the current utterance; the next queued one plays. Returns `{ok, skipped}`. (SSIP calls this `STOP`.) |
+| `POST /stop` | Panic button: stop playback and drain the queue. Returns `{ok, cleared}`. (SSIP calls this `CANCEL` — note the inverted verbs if you have speech-dispatcher reflexes.) |
+| `POST /pause` / `POST /resume` | Pause/resume. Queue-level: while paused, the next queued item won't start either. |
+| `GET /queue` | Queue introspection: `{current, pending, depth, recent}`. `recent` holds the last 16 terminal outcomes — `done`, `canceled` (dropped before starting), `interrupted` (cut off mid-play), or `error` — so callers can learn the fate of a submitted `id`. |
+| `GET /status` | Service state, pause flag, `queue_depth`, playback progress. |
+| `GET /voices` | Available Azure voices (cached 5 min). |
+
+```bash
+curl -X POST localhost:7710/speak -H 'Content-Type: application/json' \
+  -d '{"text": "Hello from the queue", "voice": "en-US-JennyNeural"}'
+```
+
 ## License
 
 [GPL-3.0-or-later](LICENSE)
