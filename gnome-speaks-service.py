@@ -30,6 +30,7 @@ import signal
 import subprocess
 import sys
 import itertools
+from collections import deque
 from dataclasses import dataclass
 import queue
 from concurrent.futures import ThreadPoolExecutor
@@ -687,6 +688,10 @@ class GnomeSpeaksService:
         # Playback ownership token: each playback claims a fresh object();
         # a preempted worker's cleanup must not reset state it no longer owns.
         self._speak_token = None
+        # Terminal outcome per queue item (done/canceled/interrupted/error),
+        # exposed on GET /queue so the /speak id isn't write-only. Exactly one
+        # terminal outcome per item (Android-style invariant).
+        self._queue_recent = deque(maxlen=16)
         threading.Thread(target=self._tts_dispatcher, daemon=True,
                          name="tts-queue-dispatcher").start()
 
@@ -1500,13 +1505,19 @@ class GnomeSpeaksService:
     def _drain_tts_queue(self):
         """Remove all pending speech-queue items. Returns the count cleared."""
         cleared = 0
+        ids = []
         while True:
             try:
-                self._tts_queue.get_nowait()
+                item = self._tts_queue.get_nowait()
+                ids.append(item.id)
+                self._queue_recent.append({"id": item.id, "outcome": "canceled"})
                 cleared += 1
             except queue.Empty:
                 if cleared:
-                    log.info("Drained %d queued speech item(s)", cleared)
+                    # Blast-radius trace: when two agents fight over the
+                    # voice, this line is the whole debugging story.
+                    log.info("Drained %d queued speech item(s): ids %s",
+                             cleared, ids)
                 return cleared
 
     def _tts_dispatcher(self):
@@ -1519,7 +1530,10 @@ class GnomeSpeaksService:
         while True:
             # Wait until clear BEFORE dequeuing, so held items stay visible
             # in GET /queue and remain drainable by /stop during user speech.
+            # Pause is queue-level (unanimous across Web Speech/.NET/Apple):
+            # a paused service must not start the next item either.
             while (self._user_speech_active.is_set()
+                   or state._pause_event.is_set()
                    or self.current_state in ("listening", "processing")):
                 time.sleep(0.2)
             try:
@@ -1535,14 +1549,19 @@ class GnomeSpeaksService:
                 self._speak_token = token
                 has_next = not self._tts_queue.empty()
                 # Runs synchronously in this thread — playback is the wait.
-                self._speak_worker(item.text, voice=item.voice,
-                                   quality=item.quality,
-                                   output_file=item.output_file,
-                                   user_initiated=False,
-                                   suppress_idle=has_next,
-                                   owner_token=token)
+                outcome = self._speak_worker(item.text, voice=item.voice,
+                                             quality=item.quality,
+                                             output_file=item.output_file,
+                                             user_initiated=False,
+                                             suppress_idle=has_next,
+                                             owner_token=token)
+                if state._cancel_event.is_set():
+                    outcome = "interrupted"  # killed mid-play (skip/stop/preempt)
+                self._queue_recent.append({"id": item.id,
+                                           "outcome": outcome or "done"})
             except Exception:
                 log.exception("Speech queue: item %d failed, continuing", item.id)
+                self._queue_recent.append({"id": item.id, "outcome": "error"})
             finally:
                 with self._queue_current_lock:
                     self._queue_current = None
@@ -1648,7 +1667,9 @@ class GnomeSpeaksService:
 
         Runs as a background thread for user speech (speak()) and
         synchronously inside the queue dispatcher for HTTP items.
+        Returns "done" or "error" (the dispatcher records per-item outcomes).
         """
+        outcome = "done"
         try:
             state._cancel_event.clear()
             q = quality or self._voice_quality
@@ -1680,6 +1701,7 @@ class GnomeSpeaksService:
                                         output_file=output_file)
                 if result.get("error"):
                     GLib.idle_add(self._emit_error, result["error"])
+                    outcome = "error"
             finally:
                 # Always stop subtitle thread, even if TTS raises
                 sub_stop.set()
@@ -1687,6 +1709,7 @@ class GnomeSpeaksService:
         except Exception as exc:
             log.exception("Speak failed: %s", exc)
             GLib.idle_add(self._emit_error, f"Speak failed: {exc}")
+            outcome = "error"
         finally:
             # Clear HTTP progress to idle state
             with self._http_progress_lock:
@@ -1719,6 +1742,7 @@ class GnomeSpeaksService:
                                   and CONFIG.get("conversation_mode", False)
                                   and not self._stop_event.is_set())
                               else False)
+        return outcome
 
     def speak_clipboard(self):
         """Read clipboard and speak its contents."""
@@ -2545,9 +2569,13 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         voice = body.get("voice") or None
         output_file = body.get("output_file") or None
 
-        # interrupt: true — flush everything and speak now (panic + speak)
+        # interrupt: true — flush everything and speak now (panic + speak).
+        # flushed reports the blast radius: this deletes OTHER callers'
+        # queued speech (Android hides this ability entirely; we expose it
+        # but make it leave a trace).
+        flushed = None
         if body.get("interrupt"):
-            svc._drain_tts_queue()
+            flushed = svc._drain_tts_queue()
             svc.stop(drain_queue=False)
             # The dispatcher clears _queue_current moments after the cancel;
             # wait briefly so position/state in the response reflect the flush.
@@ -2567,8 +2595,11 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
 
         state_str = ("speaking" if position == 0
                      and svc.current_state == "idle" else "queued")
-        self._send_json({"ok": True, "id": item_id,
-                         "position": position, "state": state_str})
+        resp = {"ok": True, "id": item_id,
+                "position": position, "state": state_str}
+        if flushed is not None:
+            resp["flushed"] = flushed
+        self._send_json(resp)
 
     def _handle_stop(self):
         svc = self.service
@@ -2600,7 +2631,8 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         pending = [{"id": i.id, "text": i.text[:80], "voice": i.voice,
                     "enqueued_at": i.enqueued_at} for i in items]
         self._send_json({"current": current, "pending": pending,
-                         "depth": len(pending)})
+                         "depth": len(pending),
+                         "recent": list(svc._queue_recent)})
 
     def _handle_pause(self):
         svc = self.service

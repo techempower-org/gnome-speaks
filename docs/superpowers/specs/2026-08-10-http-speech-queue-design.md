@@ -74,6 +74,35 @@ naturally blocked while an item plays.
    - D-Bus `Speak` mid-queue → preempts; queue resumes after.
    - Start dictation with non-empty queue → queue holds until idle.
 
+## Post-research amendments (2026-08-10, same day)
+
+Three prior-art research agents (speech-dispatcher/SSIP, Project Spiel + Ubuntu,
+cross-platform API survey — reports in
+`~/.claude/projects/-home-jp/scratch/speech-queue-prior-art/`) drove four changes:
+
+1. **`/pause` is queue-level** — the dispatcher's hold predicate includes the pause
+   event. Unanimous prior art (Web Speech, .NET, Apple): a paused service must not
+   start the next item. Without this, pausing at an item boundary let the next
+   agent utterance play into a "paused" room.
+2. **`interrupt` reports blast radius** — response gains `flushed: <n>`, and drained
+   item ids log at INFO. (Android structurally forbids flushing other apps' speech;
+   we allow it but make it leave a trace.)
+3. **Per-item outcomes** — `GET /queue` gains `recent`: ring buffer (16) of
+   `{id, outcome}` with `done` / `canceled` (never started) / `interrupted`
+   (cut off mid-play) / `error`. One terminal outcome per item, vocabulary borrowed
+   from Web Speech + Android. 5/5 surveyed APIs have completion reporting.
+4. **SSIP verb mapping documented** — our `/skip`≈SSIP `STOP`, `/stop`≈SSIP `CANCEL`
+   (inverted verbs); README notes it rather than renaming.
+
+Deliberately deferred (filed as follow-up): per-source coalescing keys and a
+`progress`-style drop-intermediate-keep-final class (SSIP's best ideas — real design
+work, separate cycle), id-scoped `/skip` (1/5 precedent).
+
+Also: "Ubuntu looking into it" = **Myna**, Canonical's speech-to-TEXT project
+(17 Jun 2026, Ubuntu 26.10) — relevant to Type mode, not this queue. Spiel is a
+per-app synthesis API with no cross-app arbitration — aligning with it would
+recreate the stomping problem; not a fit.
+
 ## Docs Ripple (at ship time)
 
 - README HTTP API section.
