@@ -2561,6 +2561,12 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._send_error_json(400, "Missing or empty 'text' field")
             return
 
+        # Reject up front rather than enqueueing items doomed to fail —
+        # a keyless service must not answer 200 and then say nothing.
+        if not CONFIG.get("key"):
+            self._send_error_json(503, "Azure Speech key not configured")
+            return
+
         svc = self.service
         # Per-item overrides travel inside the TTSQueueItem — no service-global
         # swaps, so overlapping requests can't race. Voice is an Azure ShortName
