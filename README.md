@@ -265,6 +265,28 @@ journalctl --user -u gnome-speaks -f
 systemctl --user restart gnome-speaks
 ```
 
+## HTTP API
+
+A localhost REST API on port `7710` for browser- and agent-driven TTS. Speech
+requests **queue FIFO** — concurrent callers never cut each other off — while
+speech you trigger yourself (keyboard shortcut, D-Bus, AI replies) preempts the
+current utterance immediately and holds the queue until you finish.
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /speak` | Queue text for speech. Body: `text` (required), `voice` (Azure ShortName), `quality` (`fast`/`hd`), `output_file` (save WAV instead of playing), `interrupt` (`true` = flush everything and speak now). Returns `{ok, id, position, state}`; `429` when the queue (depth 32) is full. |
+| `POST /skip` | Cancel the current utterance; the next queued one plays. Returns `{ok, skipped}`. |
+| `POST /stop` | Panic button: stop playback and drain the queue. Returns `{ok, cleared}`. |
+| `POST /pause` / `POST /resume` | Pause/resume current playback. |
+| `GET /queue` | Queue introspection: `{current, pending, depth}`. |
+| `GET /status` | Service state, pause flag, `queue_depth`, playback progress. |
+| `GET /voices` | Available Azure voices (cached 5 min). |
+
+```bash
+curl -X POST localhost:7710/speak -H 'Content-Type: application/json' \
+  -d '{"text": "Hello from the queue", "voice": "en-US-JennyNeural"}'
+```
+
 ## License
 
 [GPL-3.0-or-later](LICENSE)
