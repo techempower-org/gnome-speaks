@@ -98,6 +98,18 @@ Deliberately deferred (filed as follow-up): per-source coalescing keys and a
 `progress`-style drop-intermediate-keep-final class (SSIP's best ideas — real design
 work, separate cycle), id-scoped `/skip` (1/5 precedent).
 
+**Overflow policy — explicit decision (post-research):** the queue keeps
+reject-newest (429) rather than drop-oldest. The SSIP thesis ("fresh speech beats
+stale speech") argues for drop-oldest, but 429 gives the producer a synchronous,
+actionable failure, while drop-oldest silently victimizes a different caller.
+With the `recent` outcome ring, drop-oldest would at least be observable
+(`canceled`), so if a stale-backlog problem materializes in practice, revisit
+alongside per-source coalescing — coalescing is the better fix for the same
+root cause.
+
+**Known non-goal:** stop-at-word-boundary (Apple-only precedent) — `speech_tts.tts()`
+exposes no mid-playback hook; not implementable without restructuring the audio path.
+
 Also: "Ubuntu looking into it" = **Myna**, Canonical's speech-to-TEXT project
 (17 Jun 2026, Ubuntu 26.10) — relevant to Type mode, not this queue. Spiel is a
 per-app synthesis API with no cross-app arbitration — aligning with it would
