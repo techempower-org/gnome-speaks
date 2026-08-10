@@ -684,6 +684,9 @@ class GnomeSpeaksService:
         self._queue_current = None                # TTSQueueItem now playing
         self._queue_current_lock = threading.Lock()
         self._user_speech_active = threading.Event()
+        # Playback ownership token: each playback claims a fresh object();
+        # a preempted worker's cleanup must not reset state it no longer owns.
+        self._speak_token = None
         threading.Thread(target=self._tts_dispatcher, daemon=True,
                          name="tts-queue-dispatcher").start()
 
@@ -1514,22 +1517,30 @@ class GnomeSpeaksService:
         idle flap is suppressed via suppress_idle to avoid badge flicker).
         """
         while True:
-            item = self._tts_queue.get()
+            # Wait until clear BEFORE dequeuing, so held items stay visible
+            # in GET /queue and remain drainable by /stop during user speech.
             while (self._user_speech_active.is_set()
                    or self.current_state in ("listening", "processing")):
                 time.sleep(0.2)
+            try:
+                item = self._tts_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
             with self._queue_current_lock:
                 self._queue_current = item
             try:
                 if self.current_state != "speaking":
                     self._set_state("speaking")
+                token = object()
+                self._speak_token = token
                 has_next = not self._tts_queue.empty()
                 # Runs synchronously in this thread — playback is the wait.
                 self._speak_worker(item.text, voice=item.voice,
                                    quality=item.quality,
                                    output_file=item.output_file,
                                    user_initiated=False,
-                                   suppress_idle=has_next)
+                                   suppress_idle=has_next,
+                                   owner_token=token)
             except Exception:
                 log.exception("Speech queue: item %d failed, continuing", item.id)
             finally:
@@ -1568,9 +1579,12 @@ class GnomeSpeaksService:
 
         with self._speak_lock:
             self._set_state("speaking")
+            token = object()
+            self._speak_token = token
             self._speak_thread = threading.Thread(
                 target=self._speak_worker,
                 args=(text.strip(), voice),
+                kwargs={"owner_token": token},
                 daemon=True,
             )
             self._speak_thread.start()
@@ -1628,7 +1642,8 @@ class GnomeSpeaksService:
             self._run_subtitle_progress(text, estimated_duration, stop_event)
 
     def _speak_worker(self, text, voice=None, quality=None, output_file=None,
-                      user_initiated=True, suppress_idle=False):
+                      user_initiated=True, suppress_idle=False,
+                      owner_token=None):
         """TTS using speech_tts.tts().
 
         Runs as a background thread for user speech (speak()) and
@@ -1684,7 +1699,8 @@ class GnomeSpeaksService:
             # Read state under lock, then call _set_state outside (it acquires its own lock).
             with self._state_lock:
                 still_speaking = self._state == "speaking"
-            if still_speaking and not suppress_idle:
+            if (still_speaking and not suppress_idle
+                    and self._speak_token is owner_token):
                 self._set_state("idle")
             _schedule_warmup()
             if user_initiated:
@@ -1768,6 +1784,9 @@ class GnomeSpeaksService:
 
                 self._stop_event.clear()
                 self._set_state("speaking")
+                # Claim playback ownership so a preempted queue worker's
+                # cleanup can't reset our speaking state.
+                self._speak_token = object()
 
                 # Use an event to pass the result back from the worker thread
                 result_holder = {"reply": ""}
@@ -2249,6 +2268,7 @@ class GnomeSpeaksService:
                     if first_sentence:
                         # Transition to speaking state on first sentence
                         self._set_state("speaking")
+                        self._speak_token = object()  # claim playback ownership
                         state._cancel_event.clear()
                         # On headphones, prewarm recorder during TTS
                         if not CONFIG.get("half_duplex", False):
@@ -2274,6 +2294,7 @@ class GnomeSpeaksService:
             if remainder and not self._stop_event.is_set():
                 if first_sentence:
                     self._set_state("speaking")
+                    self._speak_token = object()  # claim playback ownership
                     state._cancel_event.clear()
                     if not CONFIG.get("half_duplex", False):
                         _schedule_warmup()
@@ -2471,6 +2492,8 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._handle_status()
         elif path == "/voices":
             self._handle_voices()
+        elif path == "/queue":
+            self._handle_queue()
         else:
             self._send_error_json(404, f"Unknown endpoint: {path}")
 
@@ -2484,6 +2507,8 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._handle_pause()
         elif path == "/resume":
             self._handle_resume()
+        elif path == "/skip":
+            self._handle_skip()
         else:
             self._send_error_json(404, f"Unknown endpoint: {path}")
 
@@ -2513,32 +2538,69 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             return
 
         svc = self.service
+        # Per-item overrides travel inside the TTSQueueItem — no service-global
+        # swaps, so overlapping requests can't race. Voice is an Azure ShortName
+        # (e.g. en-US-JennyNeural), sanitized downstream in _prepare_tts.
+        quality = body.get("quality") if body.get("quality") in ("fast", "hd") else None
+        voice = body.get("voice") or None
+        output_file = body.get("output_file") or None
 
-        # Temporarily override voice/quality/speed if provided
-        original_quality = None
-        if body.get("quality") and body["quality"] in ("fast", "hd"):
-            original_quality = svc._voice_quality
-            svc._voice_quality = body["quality"]
-
-        # Per-utterance voice override (Azure ShortName like en-US-JennyNeural).
-        # Forwarded to speech_tts.tts() which falls back to CONFIG's fast/HD
-        # voice when None. Sanitized downstream in _prepare_tts.
-        voice_override = body.get("voice") or None
-
-        # Set output file for save-to-disk (one-shot, cleared after use)
-        if body.get("output_file"):
-            svc._pending_output_file = body["output_file"]
+        # interrupt: true — flush everything and speak now (panic + speak)
+        if body.get("interrupt"):
+            svc._drain_tts_queue()
+            svc.stop(drain_queue=False)
+            # The dispatcher clears _queue_current moments after the cancel;
+            # wait briefly so position/state in the response reflect the flush.
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                with svc._queue_current_lock:
+                    if svc._queue_current is None:
+                        break
+                time.sleep(0.02)
 
         try:
-            svc.speak(text, voice=voice_override)
-            self._send_json({"ok": True, "state": "speaking"})
-        finally:
-            if original_quality is not None:
-                svc._voice_quality = original_quality
+            item_id, position = svc.enqueue_speech(
+                text, voice=voice, quality=quality, output_file=output_file)
+        except queue.Full:
+            self._send_error_json(429, "queue full")
+            return
+
+        state_str = ("speaking" if position == 0
+                     and svc.current_state == "idle" else "queued")
+        self._send_json({"ok": True, "id": item_id,
+                         "position": position, "state": state_str})
 
     def _handle_stop(self):
-        self.service.stop()
-        self._send_json({"ok": True, "state": "idle"})
+        svc = self.service
+        cleared = svc._drain_tts_queue()
+        svc.stop(drain_queue=False)
+        self._send_json({"ok": True, "state": "idle", "cleared": cleared})
+
+    def _handle_skip(self):
+        """Cancel the current queued utterance only; the next one plays."""
+        svc = self.service
+        with svc._queue_current_lock:
+            current = svc._queue_current
+        if current is None:
+            self._send_json({"ok": True, "skipped": None})
+            return
+        state.cancel_active()
+        self._send_json({"ok": True, "skipped": current.id})
+
+    def _handle_queue(self):
+        svc = self.service
+        with svc._queue_current_lock:
+            cur = svc._queue_current
+        current = None
+        if cur is not None:
+            current = {"id": cur.id, "text": cur.text[:80], "voice": cur.voice,
+                       "enqueued_at": cur.enqueued_at}
+        with svc._tts_queue.mutex:
+            items = list(svc._tts_queue.queue)
+        pending = [{"id": i.id, "text": i.text[:80], "voice": i.voice,
+                    "enqueued_at": i.enqueued_at} for i in items]
+        self._send_json({"current": current, "pending": pending,
+                         "depth": len(pending)})
 
     def _handle_pause(self):
         svc = self.service
@@ -2584,7 +2646,8 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
                     "text": p["text"],
                 }
 
-        result = {"state": current, "paused": paused}
+        result = {"state": current, "paused": paused,
+                  "queue_depth": svc._tts_queue.qsize()}
         if progress is not None:
             result["progress"] = progress
         self._send_json(result)
