@@ -33,6 +33,8 @@ import itertools
 from collections import deque
 from dataclasses import dataclass
 import queue
+
+import spellbook
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
@@ -592,6 +594,29 @@ def apply_voice_commands(text):
     return result
 
 
+def _get_ha_token():
+    """Home Assistant long-lived token: env → cache file → Vaultwarden.
+    Returns None when unavailable. The value is never logged."""
+    token = os.environ.get("HA_TOKEN", "").strip()
+    if token:
+        return token
+    try:
+        with open(os.path.expanduser("~/.cache/ha-token-tmp")) as f:
+            token = f.read().strip()
+        if token:
+            return token
+    except OSError:
+        pass
+    try:
+        proc = subprocess.run(["bw", "get", "password", "ha-llat"],
+                              capture_output=True, text=True, timeout=10)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
 def apply_auto_corrections(text):
     """Apply user-defined word corrections from config."""
     corrections = CONFIG.get("auto_corrections", {})
@@ -694,6 +719,20 @@ class GnomeSpeaksService:
         self._queue_recent = deque(maxlen=16)
         threading.Thread(target=self._tts_dispatcher, daemon=True,
                          name="tts-queue-dispatcher").start()
+
+        # Voice spellbook (incantation layer) — "cast …" routes here instead
+        # of typing/LLM. Repo default + user overlay, mtime hot-reload.
+        self._spellbook_paths = (
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "spellbook.json"),
+            os.path.expanduser("~/.config/speech-to-cli/spellbook.json"),
+        )
+        self._spellbook = spellbook.load_spellbook(*self._spellbook_paths)
+        self._spellbook_mtimes = self._spellbook_stat()
+        self._spell_executor = spellbook.SpellExecutor(
+            chime=self.play_sound, speak=self._spell_speak,
+            dbus_self=self._spell_ctx_dbus, confirm=self.talk,
+            ha_token=_get_ha_token)
 
     # -- Config sync -------------------------------------------------------
 
@@ -979,6 +1018,15 @@ class GnomeSpeaksService:
             user_text = result.get("text", "")
 
             self._set_state("processing")
+
+            # Spell incantations ("cast …") short-circuit typing/LLM routing;
+            # matched on the raw transcript before punctuation substitution.
+            if user_text and self._try_cast(user_text):
+                GLib.idle_add(self._emit_transcription_ready, user_text)
+                self._set_state("idle")
+                _schedule_warmup()
+                return
+
             if user_text:
                 user_text = apply_voice_commands(user_text)
                 user_text = apply_auto_corrections(user_text)
@@ -1354,6 +1402,20 @@ class GnomeSpeaksService:
             if use_lexical and user_text:
                 user_text = _terminal_lowercase(user_text)
             _log(f"FINAL: {repr(user_text[:100])}")
+
+            # Spell incantations ("cast …") short-circuit typing/LLM routing;
+            # matched on the raw transcript before punctuation substitution.
+            # In loop mode the cycle continues listening; replies queue until
+            # the mic closes (never TTS over an open mic).
+            if user_text and self._try_cast(user_text):
+                if live_typing and typed_partial[0]:
+                    _send_backspaces(len(typed_partial[0]))
+                GLib.idle_add(self._emit_transcription_ready, user_text)
+                if (is_loop and not self._stop_event.is_set()
+                        and CONFIG.get("continuous_dictation", False)):
+                    self._set_state("listening")
+                    continue
+                break
 
             # 8. Post-process: voice commands and auto-corrections
             if user_text:
@@ -1782,6 +1844,78 @@ class GnomeSpeaksService:
         except Exception as e:
             log.exception("PlaySound failed for %s: %s", sound_name, e)
             return False
+
+    # -- Voice spellbook -----------------------------------------------------
+
+    def skip_current(self):
+        """Cancel the current queued utterance only; the next one plays."""
+        with self._queue_current_lock:
+            current = self._queue_current
+        if current is not None:
+            state.cancel_active()
+            return current.id
+        return None
+
+    def _spell_speak(self, text, voice=None):
+        """Spell replies ride the speech queue — same ordering/preemption
+        contract as agent speech; a chatty spell can't stomp dictation."""
+        if not text:
+            return
+        try:
+            self.enqueue_speech(text, voice=voice)
+        except queue.Full:
+            log.warning("Spell reply dropped: speech queue full")
+
+    def _spell_ctx_dbus(self, op):
+        """Self-directed spell operations (dbus_self action type)."""
+        if op == "stop":
+            self.stop()
+        elif op == "skip":
+            self.skip_current()
+        elif op == "terminal_mode":
+            self._save_config_flag("terminal_mode", True)
+            self._save_config_flag("conversation_mode", False)
+        elif op == "ai_mode":
+            self._save_config_flag("conversation_mode", True)
+            self._save_config_flag("terminal_mode", False)
+        elif op == "type_mode":
+            self._save_config_flag("conversation_mode", False)
+            self._save_config_flag("terminal_mode", False)
+        elif op == "read_notifications_toggle":
+            self._save_config_flag(
+                "read_notifications",
+                not CONFIG.get("read_notifications", False))
+        else:
+            raise ValueError(f"unknown dbus_self op: {op}")
+
+    def _spellbook_stat(self):
+        return tuple(os.path.getmtime(p) if os.path.isfile(p) else 0
+                     for p in self._spellbook_paths)
+
+    def _maybe_reload_spellbook(self):
+        mtimes = self._spellbook_stat()
+        if mtimes != self._spellbook_mtimes:
+            self._spellbook = spellbook.load_spellbook(*self._spellbook_paths)
+            self._spellbook_mtimes = mtimes
+
+    def _try_cast(self, text):
+        """Route 'cast …' utterances to the spellbook. True = consumed
+        (the text must not be typed or sent to the LLM)."""
+        self._maybe_reload_spellbook()
+        kind, spell, remainder = spellbook.match(text, self._spellbook)
+        if kind == "miss":
+            return False
+        if kind == "fizzle":
+            log.info("CAST | fizzle | nothing matched %r",
+                     (remainder or "")[:60])
+            self._spell_speak(spellbook.FIZZLE_TEXT)
+            return True
+        # Execute off-thread: actions may block on network/confirm, and the
+        # caller is an STT worker that needs to wrap up its cycle.
+        threading.Thread(target=self._spell_executor.cast,
+                         args=(spell, remainder), daemon=True,
+                         name=f"spell-{spell['name']}").start()
+        return True
 
     # -- Talk (full-duplex TTS+STT) ----------------------------------------
 
@@ -2533,6 +2667,8 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._handle_resume()
         elif path == "/skip":
             self._handle_skip()
+        elif path == "/cast":
+            self._handle_cast()
         else:
             self._send_error_json(404, f"Unknown endpoint: {path}")
 
@@ -2615,14 +2751,20 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_skip(self):
         """Cancel the current queued utterance only; the next one plays."""
-        svc = self.service
-        with svc._queue_current_lock:
-            current = svc._queue_current
-        if current is None:
-            self._send_json({"ok": True, "skipped": None})
+        self._send_json({"ok": True, "skipped": self.service.skip_current()})
+
+    def _handle_cast(self):
+        """Text seam for the spellbook: same path and gates as spoken casts.
+        Lets agents cast spells and makes every spell curl-testable."""
+        body = self._read_json_body()
+        if body is None:
             return
-        state.cancel_active()
-        self._send_json({"ok": True, "skipped": current.id})
+        text = body.get("text", "")
+        if not text or not text.strip():
+            self._send_error_json(400, "Missing or empty 'text' field")
+            return
+        handled = self.service._try_cast(text)
+        self._send_json({"ok": True, "handled": handled})
 
     def _handle_queue(self):
         svc = self.service
