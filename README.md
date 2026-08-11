@@ -287,6 +287,43 @@ curl -X POST localhost:7710/speak -H 'Content-Type: application/json' \
   -d '{"text": "Hello from the queue", "voice": "en-US-JennyNeural"}'
 ```
 
+## Voice Spellbook
+
+Utterances beginning with a trigger word (`cast` or `invoke`) are **incantations**:
+they route to a local spellbook instead of being typed or sent to the LLM. Works in
+every mode; a realm chime confirms the match instantly (~2 ms) and spoken replies
+ride the speech queue (during continuous dictation, replies wait for the mic to
+close — casting never speaks over an open microphone). An unknown incantation
+speaks "The spell fizzles" instead of silently typing.
+
+Spells are data: the repo ships `spellbook.json` with the self-control spells;
+a user overlay at `~/.config/speech-to-cli/spellbook.json` merges over it by
+spell name and hot-reloads on save. The realm/oracle/home spells below are
+overlay examples — their endpoints are site-specific and never live in the repo.
+
+| Incantation | Effect |
+|---|---|
+| "cast silence" / "cast skip" | stop everything / skip current utterance |
+| "cast terminal mode" / "ai mode" / "type mode" | switch modes |
+| "cast read notifications" | toggle the notification herald |
+| "cast defense report" | combat-ward summary, spoken |
+| "cast my level" | character sheet from realm progression |
+| "cast recent events" | last 5 realm events, spoken |
+| "cast mana reserves" | solar/battery/grid report |
+| "cast consult the oracle \<question\>" | ask the realm Oracle; streamed reply |
+| "cast torches \<request\>" | natural-language pass-through to Home Assistant Assist |
+
+Safety: spells are gated `instant` (read-only/reversible) or `confirm` (the service
+speaks a challenge and requires a spoken "confirm"); a hardcoded executor denylist
+refuses to load any spell touching destructive surfaces (grid transfer, locks,
+valves, safety automations, remote exec) regardless of config. Test or script
+spells without a microphone via `POST /cast`:
+
+```bash
+curl -X POST localhost:7710/cast -H 'Content-Type: application/json' \
+  -d '{"text": "cast defense report"}'
+```
+
 ## License
 
 [GPL-3.0-or-later](LICENSE)

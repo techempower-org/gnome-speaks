@@ -1,0 +1,38 @@
+{
+  "trigger_words": ["cast", "invoke"],
+  "spells": [
+    {"name": "silence",
+     "patterns": ["silence", "be silent", "quiet"],
+     "action": {"type": "dbus_self", "op": "stop"},
+     "gate": "instant"},
+
+    {"name": "skip",
+     "patterns": ["skip", "next"],
+     "action": {"type": "dbus_self", "op": "skip"},
+     "gate": "instant"},
+
+    {"name": "terminal-mode",
+     "patterns": ["terminal mode"],
+     "action": {"type": "dbus_self", "op": "terminal_mode", "reply": "Terminal mode."},
+     "chime": "xp_gain",
+     "gate": "instant"},
+
+    {"name": "ai-mode",
+     "patterns": ["ai mode", "conversation mode"],
+     "action": {"type": "dbus_self", "op": "ai_mode", "reply": "A I mode."},
+     "chime": "xp_gain",
+     "gate": "instant"},
+
+    {"name": "type-mode",
+     "patterns": ["type mode", "dictation mode"],
+     "action": {"type": "dbus_self", "op": "type_mode", "reply": "Type mode."},
+     "chime": "xp_gain",
+     "gate": "instant"},
+
+    {"name": "read-notifications",
+     "patterns": ["read notifications", "notifications"],
+     "action": {"type": "dbus_self", "op": "read_notifications_toggle", "reply": "Notification herald toggled."},
+     "chime": "xp_gain",
+     "gate": "instant"}
+  ]
+}
