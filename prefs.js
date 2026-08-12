@@ -812,7 +812,7 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
             1, 65535, 1, 0, 10300,
             'Wyoming STT service (e.g. wyoming-onnx-asr)');
 
-        this._addEntryRow(offlineGroup, 'Offline Voice', 'wyoming_tts_voice', '',
+        this._addEntryRow(offlineGroup, 'Offline Voice', 'wyoming_tts_voice', 'en_GB-cori-high',
             'Piper voice name (empty = server default)');
 
         window.add(page);
