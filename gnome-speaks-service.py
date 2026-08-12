@@ -1423,6 +1423,19 @@ class GnomeSpeaksService:
                 GLib.idle_add(self._emit_transcription_ready, user_text)
                 if (is_loop and not self._stop_event.is_set()
                         and CONFIG.get("continuous_dictation", False)):
+                    # Let the spell's spoken reply play before re-opening the
+                    # mic — the queue never speaks over an open mic, so
+                    # re-listening instantly starves replies forever.
+                    self._set_state("idle")
+                    deadline = time.time() + 20
+                    while time.time() < deadline and not self._stop_event.is_set():
+                        with self._queue_current_lock:
+                            busy = self._queue_current is not None
+                        if not busy and self._tts_queue.empty():
+                            break
+                        time.sleep(0.2)
+                    if self._stop_event.is_set():
+                        break
                     self._set_state("listening")
                     continue
                 break
