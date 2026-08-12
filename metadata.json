@@ -1,9 +1,9 @@
 {
     "uuid": "gnome-speaks@jphein",
     "name": "GNOME Speaks",
-    "description": "Beautiful floating TTS/STT badge powered by Azure Speech Services",
+    "description": "Voice for your desktop — dictation, AI conversation, spellbook commands, wake word, and offline fallback",
     "shell-version": ["46", "47", "48"],
-    "version": 1,
+    "version": 2,
     "settings-schema": "org.gnome.shell.extensions.gnome-speaks",
     "url": "https://github.com/techempower-org/gnome-speaks"
 }
