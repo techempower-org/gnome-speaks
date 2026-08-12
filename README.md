@@ -327,6 +327,23 @@ that promotion is free — dropping older same-source items always leaves the
 newest, and the newest always gets spoken — so `kind: "progress"` is the same
 machinery under a name that reads better at the call site.
 
+## Spiel provider
+
+gnome-speaks can register as a [Spiel](https://github.com/project-spiel) speech
+provider (`org.gnome.Speaks.Speech.Provider`), making its voices available to
+any libspiel client — notably Orca's experimental Spiel backend. Off by
+default; in `~/.config/speech-to-cli/config.json`:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `spiel_provider` | `false` | Own the provider bus name and serve `Synthesize`. |
+| `spiel_voices` | `["en_GB-cori-high"]` | Curated Piper voices to advertise (the Wyoming host synthesizes them). |
+| `spiel_expose_azure` | `false` | Also advertise the configured Azure voices — **metered**: a screen reader narrating your desktop through these costs real money per sentence. |
+
+The provider writes raw S16LE PCM to the client's pipe (the client owns
+playback, per Spiel's design), handles concurrent requests, and treats a
+closed pipe as cancellation. No SSML or word-event support is advertised.
+
 ## Voice Spellbook
 
 Utterances beginning with a trigger word (`cast` or `invoke`) are **incantations**:

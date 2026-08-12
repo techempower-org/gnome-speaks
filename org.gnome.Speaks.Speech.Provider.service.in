@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.gnome.Speaks.Speech.Provider
+Exec=@SERVICE_EXEC@
+SystemdService=gnome-speaks.service
