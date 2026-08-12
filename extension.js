@@ -95,6 +95,14 @@ const DBUS_XML = `
     <method name="GetState">
       <arg direction="out" type="s" name="state"/>
     </method>
+    <method name="GetChronicle">
+      <arg direction="in" type="i" name="limit"/>
+      <arg direction="out" type="s" name="entries_json"/>
+    </method>
+    <method name="Respeak">
+      <arg direction="in" type="x" name="id"/>
+      <arg direction="out" type="b" name="success"/>
+    </method>
     <signal name="StateChanged">
       <arg type="s" name="state"/>
     </signal>
@@ -1201,6 +1209,14 @@ export default class GnomeSpeaksExtension extends Extension {
         }
         menu.addMenuItem(this._langSubMenu);
 
+        // The Chronicle — everything said, newest first; click to respeak.
+        this._chronicleSubMenu = new PopupMenu.PopupSubMenuMenuItem('Chronicle');
+        this._chronicleSubMenu.menu.connect('open-state-changed', (_m, open) => {
+            if (open)
+                this._populateChronicleMenu();
+        });
+        menu.addMenuItem(this._chronicleSubMenu);
+
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         this._menuBadgeToggle = new PopupMenu.PopupSwitchMenuItem('Show Badge', this._badgeVisible);
@@ -1234,6 +1250,49 @@ export default class GnomeSpeaksExtension extends Extension {
             Main.extensionManager.disableExtension(this.uuid);
         });
         menu.addMenuItem(disableItem);
+    }
+
+    _populateChronicleMenu() {
+        if (this._destroyed || !this._proxy || !this._chronicleSubMenu)
+            return;
+
+        this._proxy.GetChronicleRemote(12, (result, error) => {
+            if (this._destroyed || !this._chronicleSubMenu)
+                return;
+            let submenu = this._chronicleSubMenu.menu;
+            submenu.removeAll();
+
+            let entries = [];
+            if (!error && result) {
+                try {
+                    entries = JSON.parse(result[0]);
+                } catch (e) {
+                    entries = [];
+                }
+            }
+
+            if (entries.length === 0) {
+                let empty = new PopupMenu.PopupMenuItem(
+                    error ? 'Chronicle unavailable' : 'Nothing recorded yet');
+                empty.setSensitive(false);
+                submenu.addMenuItem(empty);
+                return;
+            }
+
+            // Newest first — the thing you want to hear again is recent.
+            entries.reverse();
+            for (let entry of entries) {
+                let who = entry.kind === 'you' ? 'You' : 'It';
+                let text = entry.text.replace(/\s+/g, ' ');
+                if (text.length > 55)
+                    text = `${text.substring(0, 55)}…`;
+                let item = new PopupMenu.PopupMenuItem(`${who}: ${text}`);
+                item.connect('activate', () => {
+                    this._proxy.RespeakRemote(entry.id, () => {});
+                });
+                submenu.addMenuItem(item);
+            }
+        });
     }
 
     _updatePanelMenu() {
@@ -1897,6 +1956,14 @@ export default class GnomeSpeaksExtension extends Extension {
         // In dictation mode (not AI), text is typed at cursor — subtitles are redundant
         if (!this._conversationMode)
             return;
+        // Per-source toggles. This path carries BOTH voices: your live STT
+        // partials while LISTENING, and its streamed sentences while
+        // SPEAKING — the state picks whose toggle applies (same convention
+        // as _applySubtitleColor).
+        const sourceFlag = this._state === States.SPEAKING
+            ? 'subtitles_tts' : 'subtitles_user';
+        if (!this._getConfigFlag(sourceFlag, true))
+            return;
 
         if (text === this._lastPartialText)
             return;
@@ -1950,6 +2017,9 @@ export default class GnomeSpeaksExtension extends Extension {
         if (this._destroyed)
             return;
         if (this._state !== States.SPEAKING)
+            return;
+        // Per-source toggle: captions of ITS voice
+        if (!this._getConfigFlag('subtitles_tts', true))
             return;
 
         // When reveal reaches 100%, always render immediately (final state)
@@ -2005,6 +2075,9 @@ export default class GnomeSpeaksExtension extends Extension {
 
         // In dictation mode, text is already at cursor — skip subtitle
         if (!this._conversationMode)
+            return;
+        // Per-source toggle: live transcript of YOUR voice
+        if (!this._getConfigFlag('subtitles_user', true))
             return;
 
         // Show in the subtitle overlay — final, non-italic style

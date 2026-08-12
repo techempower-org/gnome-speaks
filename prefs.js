@@ -378,6 +378,14 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
 
         this._addSubtitlesMasterRow(subGroup);
 
+        this._addSwitchRow(subGroup, 'Your Voice',
+            'Live transcript while you speak. Default: on',
+            'subtitles_user', true);
+
+        this._addSwitchRow(subGroup, 'Its Voice',
+            'Captions while it speaks. Default: on',
+            'subtitles_tts', true);
+
         this._addSwitchRow(subGroup, 'Word Highlights',
             'Newly heard words flash as they appear. Default: on',
             'show_word_highlights', true);
@@ -387,6 +395,20 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
 
         this._addComboRow(subGroup, 'Its Words', 'subtitle_color_tts',
             SUBTITLE_COLORS, 'amber');
+
+        // ── Chronicle ──
+        const chronGroup = new Adw.PreferencesGroup({
+            title: 'Chronicle',
+            description: 'A local record of everything said — yours and ' +
+                'its. Browse it from the panel menu and click any line to ' +
+                'hear it again, or say "cast echo" to replay the last one.',
+        });
+        page.add(chronGroup);
+
+        this._addSwitchRow(chronGroup, 'Keep the Chronicle',
+            'Written to ~/.local/state/gnome-speaks/chronicle.jsonl — ' +
+            'never leaves this machine. Default: on',
+            'chronicle', true);
 
         // ── Chimes ──
         const chimeGroup = new Adw.PreferencesGroup({title: 'Chimes'});

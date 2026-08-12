@@ -218,6 +218,14 @@ INTROSPECTION_XML = """
     <method name="GetState">
       <arg direction="out" type="s" name="state"/>
     </method>
+    <method name="GetChronicle">
+      <arg direction="in" type="i" name="limit"/>
+      <arg direction="out" type="s" name="entries_json"/>
+    </method>
+    <method name="Respeak">
+      <arg direction="in" type="x" name="id"/>
+      <arg direction="out" type="b" name="success"/>
+    </method>
     <signal name="StateChanged">
       <arg type="s" name="state"/>
     </signal>
@@ -245,6 +253,90 @@ INTROSPECTION_XML = """
   </interface>
 </node>
 """
+
+# ---------------------------------------------------------------------------
+# The Chronicle — append-only ledger of everything said (both directions).
+# One JSON object per line; local-only (never enters git). Entries are
+# respeakable via POST /respeak, the Respeak D-Bus method, or "cast echo".
+# ---------------------------------------------------------------------------
+
+CHRONICLE_PATH = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "gnome-speaks", "chronicle.jsonl")
+_chronicle_lock = threading.Lock()
+_chronicle_last_id = 0
+
+
+def _chronicle_append(kind, text, voice=None, source=None):
+    """Record one utterance. kind: 'you' (heard) or 'spoken' (played).
+
+    Best-effort — a full disk must never take down the voice pipeline.
+    """
+    if not CONFIG.get("chronicle", True):
+        return
+    text = (text or "").strip()
+    if not text:
+        return
+    global _chronicle_last_id
+    entry = {"kind": kind, "text": text,
+             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    if voice:
+        entry["voice"] = voice
+    if source:
+        entry["source"] = source
+    try:
+        with _chronicle_lock:
+            # ms timestamp as id; bump on same-ms collisions so ids stay
+            # unique without a persistent counter.
+            eid = int(time.time() * 1000)
+            if eid <= _chronicle_last_id:
+                eid = _chronicle_last_id + 1
+            _chronicle_last_id = eid
+            entry["id"] = eid
+            os.makedirs(os.path.dirname(CHRONICLE_PATH), exist_ok=True)
+            with open(CHRONICLE_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        log.warning("Chronicle append failed", exc_info=True)
+
+
+def _chronicle_read(limit=20, q=None, kind=None):
+    """Return the newest matching entries, oldest-first (ready to display)."""
+    entries = deque(maxlen=max(1, min(int(limit or 20), 500)))
+    try:
+        with _chronicle_lock, open(CHRONICLE_PATH, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if kind and entry.get("kind") != kind:
+                    continue
+                if q and q.lower() not in entry.get("text", "").lower():
+                    continue
+                entries.append(entry)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        log.warning("Chronicle read failed", exc_info=True)
+    return list(entries)
+
+
+def _chronicle_find(entry_id):
+    """Return the entry with this id, or None."""
+    try:
+        with _chronicle_lock, open(CHRONICLE_PATH, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("id") == entry_id:
+                    return entry
+    except (FileNotFoundError, OSError):
+        pass
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Clipboard helpers (our own — do not import from speech-to-cli)
@@ -758,7 +850,7 @@ class GnomeSpeaksService:
         "conversation_mode", "continuous_dictation", "dictation_mode",
         "terminal_mode", "skip_final_paste", "read_notifications",
         "wake_word", "wake_word_model", "llm_thinking",
-        "speed", "pitch", "volume",
+        "speed", "pitch", "volume", "chronicle",
         # LLM provider config
         "llm_provider", "llm_model", "llm_api_key", "llm_system_prompt",
         # Chimes
@@ -854,6 +946,7 @@ class GnomeSpeaksService:
         return False
 
     def _emit_transcription_ready(self, text):
+        _chronicle_append("you", text)
         if self._connection is not None:
             self._connection.emit_signal(
                 None, OBJECT_PATH, INTERFACE_NAME,
@@ -1603,6 +1696,27 @@ class GnomeSpeaksService:
             self._tts_queue.put_nowait(item)
         return item.id, position, dropped
 
+    def respeak(self, entry_id=None):
+        """Re-enqueue a chronicle entry for playback. None = newest 'spoken'.
+
+        Returns the entry dict on success, None when nothing matches.
+        A 'spoken' entry replays in its original voice; a 'you' entry is
+        read back in the default voice.
+        """
+        if entry_id:
+            entry = _chronicle_find(entry_id)
+        else:
+            last = _chronicle_read(limit=1, kind="spoken")
+            entry = last[0] if last else None
+        if not entry:
+            return None
+        try:
+            self.enqueue_speech(entry["text"], voice=entry.get("voice"),
+                                source="chronicle")
+        except queue.Full:
+            return None
+        return entry
+
     def _coalesce_source(self, source):
         """Drop this source's not-yet-started items. Returns the dropped ids.
 
@@ -1682,6 +1796,8 @@ class GnomeSpeaksService:
                 token = object()
                 self._speak_token = token
                 has_next = not self._tts_queue.empty()
+                _chronicle_append("spoken", item.text, voice=item.voice,
+                                  source=item.source or "queue")
                 # Runs synchronously in this thread — playback is the wait.
                 outcome = self._speak_worker(item.text, voice=item.voice,
                                              quality=item.quality,
@@ -1732,6 +1848,7 @@ class GnomeSpeaksService:
 
         with self._speak_lock:
             self._set_state("speaking")
+            _chronicle_append("spoken", text, voice=voice, source="direct")
             token = object()
             self._speak_token = token
             self._speak_thread = threading.Thread(
@@ -2003,6 +2120,29 @@ class GnomeSpeaksService:
             except Exception:
                 log.warning("Subtitles gsettings sync failed")
             return "Subtitles %s." % ("on" if new else "off")
+        elif op == "echo":
+            entry = self.respeak(None)
+            if entry is None:
+                return "The chronicle holds nothing to echo."
+            return None  # the respeak itself is the reply
+        elif op == "chronicle_recent":
+            entries = _chronicle_read(limit=3)
+            if not entries:
+                return "The chronicle is empty."
+            parts = []
+            for e in entries:
+                who = "You said" if e["kind"] == "you" else "I said"
+                text = e["text"]
+                if len(text) > 120:
+                    text = text[:120] + "…"
+                parts.append(f"{who}: {text}")
+            return " … ".join(parts)
+        elif op == "chronicle_toggle":
+            new = not CONFIG.get("chronicle", True)
+            self._save_config_flag("chronicle", new)
+            if new:
+                return "The chronicle records once more."
+            return "The chronicle is sealed — nothing will be written."
         else:
             raise ValueError(f"unknown dbus_self op: {op}")
         return None
@@ -2688,6 +2828,9 @@ class GnomeSpeaksService:
 
             reply = "".join(full_reply)
             if reply:
+                # Whole reply as one chronicle entry — the sentence-level TTS
+                # calls above would fragment it into respeak-useless shards.
+                _chronicle_append("spoken", reply, source="assistant")
                 with self._conversation_lock:
                     self._conversation_history.append({"role": "user", "content": user_text})
                     self._conversation_history.append({"role": "assistant", "content": reply})
@@ -2866,6 +3009,8 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._handle_voices()
         elif path == "/queue":
             self._handle_queue()
+        elif path == "/chronicle":
+            self._handle_chronicle()
         else:
             self._send_error_json(404, f"Unknown endpoint: {path}")
 
@@ -2883,6 +3028,8 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._handle_skip()
         elif path == "/cast":
             self._handle_cast()
+        elif path == "/respeak":
+            self._handle_respeak()
         else:
             self._send_error_json(404, f"Unknown endpoint: {path}")
 
@@ -3036,6 +3183,37 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         self._send_json({"current": current, "pending": pending,
                          "depth": len(pending),
                          "recent": list(svc._queue_recent)})
+
+    def _handle_chronicle(self):
+        """GET /chronicle?limit=20&q=text&kind=you|spoken — newest last."""
+        from urllib.parse import urlparse, parse_qs
+        params = parse_qs(urlparse(self.path).query)
+        try:
+            limit = int(params.get("limit", ["20"])[0])
+        except ValueError:
+            limit = 20
+        kind = params.get("kind", [None])[0]
+        if kind not in (None, "you", "spoken"):
+            self._send_error_json(400, "kind must be 'you' or 'spoken'")
+            return
+        entries = _chronicle_read(limit=limit, q=params.get("q", [None])[0],
+                                  kind=kind)
+        self._send_json({"entries": entries, "count": len(entries),
+                         "enabled": CONFIG.get("chronicle", True)})
+
+    def _handle_respeak(self):
+        """POST /respeak {"id": N} — omit id to replay the last spoken line."""
+        body = self._read_json_body()
+        if body is None:
+            return  # error already sent
+        entry = self.service.respeak(body.get("id") or None)
+        if entry is None:
+            self._send_error_json(404, "Nothing to respeak (bad id, empty "
+                                        "chronicle, or queue full)")
+            return
+        self._send_json({"ok": True, "respeaking": {
+            "id": entry["id"], "kind": entry["kind"],
+            "text": entry["text"][:80]}})
 
     def _handle_pause(self):
         svc = self.service
@@ -3282,6 +3460,18 @@ class DBusHandler:
             elif method_name == "GetState":
                 result = self.service.current_state
                 invocation.return_value(GLib.Variant("(s)", (result,)))
+
+            elif method_name == "GetChronicle":
+                limit = parameters.unpack()[0]
+                entries = _chronicle_read(limit=limit if limit > 0 else 20)
+                invocation.return_value(
+                    GLib.Variant("(s)", (json.dumps(entries),)))
+
+            elif method_name == "Respeak":
+                entry_id = parameters.unpack()[0]
+                entry = self.service.respeak(entry_id or None)
+                invocation.return_value(
+                    GLib.Variant("(b)", (entry is not None,)))
 
             else:
                 invocation.return_dbus_error(

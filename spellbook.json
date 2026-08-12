@@ -1,56 +1,170 @@
 {
-  "trigger_words": ["cast", "invoke"],
+  "trigger_words": [
+    "cast",
+    "invoke"
+  ],
   "spells": [
-    {"name": "silence",
-     "patterns": ["silence", "be silent", "quiet"],
-     "action": {"type": "dbus_self", "op": "stop"},
-     "gate": "instant"},
-
-    {"name": "skip",
-     "patterns": ["skip", "next"],
-     "action": {"type": "dbus_self", "op": "skip"},
-     "gate": "instant"},
-
-    {"name": "terminal-mode",
-     "patterns": ["terminal mode"],
-     "action": {"type": "dbus_self", "op": "terminal_mode", "reply": "Terminal mode."},
-     "chime": "xp_gain",
-     "gate": "instant"},
-
-    {"name": "ai-mode",
-     "patterns": ["ai mode", "conversation mode"],
-     "action": {"type": "dbus_self", "op": "ai_mode", "reply": "A I mode."},
-     "chime": "xp_gain",
-     "gate": "instant"},
-
-    {"name": "type-mode",
-     "patterns": ["type mode", "dictation mode"],
-     "action": {"type": "dbus_self", "op": "type_mode", "reply": "Type mode."},
-     "chime": "xp_gain",
-     "gate": "instant"},
-
-    {"name": "read-notifications",
-     "patterns": ["read notifications", "notifications"],
-     "action": {"type": "dbus_self", "op": "read_notifications_toggle", "reply": "Notification herald toggled."},
-     "chime": "xp_gain",
-     "gate": "instant"},
-
-    {"name": "wake-word",
-     "patterns": ["wake word", "waking watch"],
-     "action": {"type": "dbus_self", "op": "wake_word_toggle", "reply": "The waking watch is toggled."},
-     "chime": "xp_gain",
-     "gate": "instant"},
-
-    {"name": "deep-thought",
-     "patterns": ["deep thought", "think deeply", "ponder"],
-     "action": {"type": "dbus_self", "op": "thinking_toggle", "reply": "Deep thought toggled."},
-     "chime": "level_up",
-     "gate": "instant"},
-
-    {"name": "subtitles",
-     "patterns": ["subtitles", "captions", "show the words"],
-     "action": {"type": "dbus_self", "op": "subtitles_toggle"},
-     "chime": "xp_gain",
-     "gate": "instant"}
+    {
+      "name": "silence",
+      "patterns": [
+        "silence",
+        "be silent",
+        "quiet"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "stop"
+      },
+      "gate": "instant"
+    },
+    {
+      "name": "skip",
+      "patterns": [
+        "skip",
+        "next"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "skip"
+      },
+      "gate": "instant"
+    },
+    {
+      "name": "terminal-mode",
+      "patterns": [
+        "terminal mode"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "terminal_mode",
+        "reply": "Terminal mode."
+      },
+      "chime": "xp_gain",
+      "gate": "instant"
+    },
+    {
+      "name": "ai-mode",
+      "patterns": [
+        "ai mode",
+        "conversation mode"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "ai_mode",
+        "reply": "A I mode."
+      },
+      "chime": "xp_gain",
+      "gate": "instant"
+    },
+    {
+      "name": "type-mode",
+      "patterns": [
+        "type mode",
+        "dictation mode"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "type_mode",
+        "reply": "Type mode."
+      },
+      "chime": "xp_gain",
+      "gate": "instant"
+    },
+    {
+      "name": "read-notifications",
+      "patterns": [
+        "read notifications",
+        "notifications"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "read_notifications_toggle",
+        "reply": "Notification herald toggled."
+      },
+      "chime": "xp_gain",
+      "gate": "instant"
+    },
+    {
+      "name": "wake-word",
+      "patterns": [
+        "wake word",
+        "waking watch"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "wake_word_toggle",
+        "reply": "The waking watch is toggled."
+      },
+      "chime": "xp_gain",
+      "gate": "instant"
+    },
+    {
+      "name": "deep-thought",
+      "patterns": [
+        "deep thought",
+        "think deeply",
+        "ponder"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "thinking_toggle",
+        "reply": "Deep thought toggled."
+      },
+      "chime": "level_up",
+      "gate": "instant"
+    },
+    {
+      "name": "subtitles",
+      "patterns": [
+        "subtitles",
+        "captions",
+        "show the words"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "subtitles_toggle"
+      },
+      "chime": "xp_gain",
+      "gate": "instant"
+    },
+    {
+      "name": "echo",
+      "patterns": [
+        "echo",
+        "say that again",
+        "repeat that",
+        "hear that again"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "echo"
+      },
+      "gate": "instant"
+    },
+    {
+      "name": "chronicle",
+      "patterns": [
+        "chronicle",
+        "the chronicle",
+        "read the chronicle"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "chronicle_recent"
+      },
+      "gate": "instant"
+    },
+    {
+      "name": "seal-chronicle",
+      "patterns": [
+        "seal the chronicle",
+        "chronicle toggle"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "chronicle_toggle"
+      },
+      "gate": "instant"
+    }
   ]
 }
