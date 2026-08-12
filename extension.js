@@ -124,6 +124,19 @@ const DBUS_XML = `
 
 const GnomeSpeaksProxy = Gio.DBusProxy.makeProxyWrapper(DBUS_XML);
 
+// Exported BY the extension (the service owns org.gnome.Speaks; this name is
+// ours). GNOME locked down Shell.Eval/Introspect, so the Python service can
+// no longer ask the compositor anything — this interface runs inside the
+// Shell and answers on its behalf (gnome-speaks#7).
+const DESKTOP_DBUS_XML = `<node>
+  <interface name="org.gnome.Speaks.Desktop">
+    <method name="GetFocusedApp">
+      <arg direction="out" type="s" name="wm_class"/>
+      <arg direction="out" type="s" name="title"/>
+    </method>
+  </interface>
+</node>`;
+
 const States = {
     IDLE: 'idle',
     LISTENING: 'listening',
@@ -220,6 +233,7 @@ export default class GnomeSpeaksExtension extends Extension {
         this._registerKeybindings();
         this._initProxy();
         this._connectNotificationReader();
+        this._exportDesktopInterface();
 
         // Watch for service restarts — re-sync state when the bus name reappears
         this._busWatchId = Gio.bus_watch_name(
@@ -253,6 +267,8 @@ export default class GnomeSpeaksExtension extends Extension {
     _disable() {
         this._destroyed = true;
 
+        this._unexportDesktopInterface();
+
         if (this._busWatchId) {
             Gio.bus_unwatch_name(this._busWatchId);
             this._busWatchId = 0;
@@ -278,6 +294,46 @@ export default class GnomeSpeaksExtension extends Extension {
         this._state = null;
         this._proxyReady = false;
         this._settings = null;
+    }
+
+    // -- Desktop D-Bus export ------------------------------------------------
+
+    _exportDesktopInterface() {
+        try {
+            this._desktopDbus = Gio.DBusExportedObject.wrapJSObject(
+                DESKTOP_DBUS_XML, this);
+            this._desktopDbus.export(Gio.DBus.session,
+                '/org/gnome/Speaks/Desktop');
+            this._desktopNameId = Gio.DBus.session.own_name(
+                'org.gnome.Speaks.Desktop',
+                Gio.BusNameOwnerFlags.NONE, null, null);
+        } catch (e) {
+            log(`[GNOME Speaks] Desktop D-Bus export failed: ${e.message}`);
+            this._desktopDbus = null;
+            this._desktopNameId = 0;
+        }
+    }
+
+    _unexportDesktopInterface() {
+        if (this._desktopNameId) {
+            Gio.bus_unown_name(this._desktopNameId);
+            this._desktopNameId = 0;
+        }
+        if (this._desktopDbus) {
+            try {
+                this._desktopDbus.unexport();
+            } catch (e) {
+                // already gone — fine
+            }
+            this._desktopDbus = null;
+        }
+    }
+
+    GetFocusedApp() {
+        const win = global.display.get_focus_window();
+        if (!win)
+            return ['', ''];
+        return [win.get_wm_class() || '', win.get_title() || ''];
     }
 
     // -- Keyboard shortcuts ------------------------------------------------
