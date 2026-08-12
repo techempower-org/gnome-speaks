@@ -2256,19 +2256,25 @@ class GnomeSpeaksService:
         return [k for k, pat in self._INTENT_PATTERNS.items() if pat.search(text)]
 
     def _get_focused_app(self):
-        """Get the focused window's WM_CLASS via GNOME Shell eval."""
+        """Focused window WM_CLASS (+ title) via the extension's
+        org.gnome.Speaks.Desktop interface. GNOME locked down Shell.Eval
+        (gnome-speaks#7), so the extension answers from inside the Shell.
+        Returns None when the extension isn't loaded — headless still works."""
         try:
             result = subprocess.run(
                 ["gdbus", "call", "--session",
-                 "--dest", "org.gnome.Shell",
-                 "--object-path", "/org/gnome/Shell",
-                 "--method", "org.gnome.Shell.Eval",
-                 "global.display.get_focus_window()?.get_wm_class() || ''"],
-                capture_output=True, text=True, timeout=1,
+                 "--dest", "org.gnome.Speaks.Desktop",
+                 "--object-path", "/org/gnome/Speaks/Desktop",
+                 "--method", "org.gnome.Speaks.Desktop.GetFocusedApp"],
+                capture_output=True, text=True, timeout=2,
             )
             if result.returncode == 0:
-                m = self._GDBUS_EVAL_RE.search(result.stdout)
-                return m.group(1) if m and m.group(1) else None
+                parts = re.findall(r"'((?:[^'\\]|\\.)*)'", result.stdout)
+                wm_class = parts[0] if parts else ""
+                title = parts[1] if len(parts) > 1 else ""
+                if wm_class and title:
+                    return f"{wm_class} — {title}"
+                return wm_class or None
         except Exception as exc:
             log.debug("Failed to get focused app: %s", exc)
         return None
