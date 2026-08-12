@@ -646,6 +646,7 @@ class TTSQueueItem:
     quality: str | None = None      # "fast" | "hd" | None = service default
     output_file: str | None = None  # save-to-disk instead of playback
     enqueued_at: float = 0.0
+    source: str | None = None       # coalescing key: "only my latest matters"
 
 
 class GnomeSpeaksService:
@@ -722,6 +723,11 @@ class GnomeSpeaksService:
         # exposed on GET /queue so the /speak id isn't write-only. Exactly one
         # terminal outcome per item (Android-style invariant).
         self._queue_recent = deque(maxlen=16)
+        # Serializes coalesce-then-put so two concurrent bursts from the same
+        # source can't interleave (drop, drop, put, put would leave two items
+        # where the caller asked for one). Order is always _enqueue_lock ->
+        # _tts_queue.mutex; never the reverse.
+        self._enqueue_lock = threading.Lock()
         threading.Thread(target=self._tts_dispatcher, daemon=True,
                          name="tts-queue-dispatcher").start()
 
@@ -1562,11 +1568,20 @@ class GnomeSpeaksService:
 
     # -- TTS: Using speech_tts.tts() directly ------------------------------
 
-    def enqueue_speech(self, text, voice=None, quality=None, output_file=None):
+    def enqueue_speech(self, text, voice=None, quality=None, output_file=None,
+                       source=None, coalesce=False):
         """Create and enqueue an HTTP speech item for serial playback.
 
-        Returns (item_id, position) where position is the number of items
-        ahead (0 = will play next). Raises queue.Full at capacity.
+        Args:
+            source: optional key identifying the producer, so it can coalesce
+                its own backlog without touching anyone else's speech.
+            coalesce: when True (requires source), drop this source's older
+                UNSPOKEN items first — the newest status wins. The item that
+                is currently PLAYING is never killed by coalescing; use /skip
+                or interrupt for that.
+
+        Returns (item_id, position, dropped_ids) where position is the number
+        of items ahead (0 = will play next). Raises queue.Full at capacity.
         """
         item = TTSQueueItem(
             id=next(self._tts_queue_seq),
@@ -1575,12 +1590,49 @@ class GnomeSpeaksService:
             quality=quality,
             output_file=output_file,
             enqueued_at=time.time(),
+            source=source,
         )
-        with self._queue_current_lock:
-            busy = self._queue_current is not None
-        position = self._tts_queue.qsize() + (1 if busy else 0)
-        self._tts_queue.put_nowait(item)
-        return item.id, position
+        with self._enqueue_lock:
+            dropped = (self._coalesce_source(source)
+                       if coalesce and source else [])
+            with self._queue_current_lock:
+                busy = self._queue_current is not None
+            position = self._tts_queue.qsize() + (1 if busy else 0)
+            self._tts_queue.put_nowait(item)
+        return item.id, position, dropped
+
+    def _coalesce_source(self, source):
+        """Drop this source's not-yet-started items. Returns the dropped ids.
+
+        Removes from the middle of the Queue, which has no public API for it,
+        so we edit the underlying deque under the Queue's own mutex — the same
+        access pattern GET /queue already uses for a snapshot. Safe because
+        every producer here uses put_nowait (no blocked putter needs waking)
+        and qsize()/maxsize read len(queue) live, so freed slots are real.
+        (unfinished_tasks goes stale, which is inert: nothing calls
+        task_done()/join() on this queue.)
+        """
+        dropped = []
+        with self._tts_queue.mutex:
+            keep = deque()
+            for item in self._tts_queue.queue:
+                if item.source == source:
+                    dropped.append(item.id)
+                else:
+                    keep.append(item)
+            if dropped:
+                # clear()+extend() keeps the deque identity that Queue's own
+                # methods close over — do not rebind self._tts_queue.queue.
+                self._tts_queue.queue.clear()
+                self._tts_queue.queue.extend(keep)
+        for dropped_id in dropped:
+            # Same terminal vocabulary as /stop's drain: never started.
+            self._queue_recent.append({"id": dropped_id,
+                                       "outcome": "canceled"})
+        if dropped:
+            log.info("Coalesced source %r: dropped %d unspoken item(s): ids %s",
+                     source, len(dropped), dropped)
+        return dropped
 
     def _drain_tts_queue(self):
         """Remove all pending speech-queue items. Returns the count cleared."""
@@ -1865,14 +1917,29 @@ class GnomeSpeaksService:
 
     # -- Voice spellbook -----------------------------------------------------
 
-    def skip_current(self):
-        """Cancel the current queued utterance only; the next one plays."""
+    def skip_current(self, item_id=None):
+        """Cancel the current queued utterance only; the next one plays.
+
+        item_id: when given, skip ONLY if that id is the item actually
+            playing, else no-op returning None. Closes the positional race:
+            agent A posts /skip meaning "kill mine", but by arrival A's item
+            has finished and B's is playing — unscoped, A silently kills B.
+
+        The id check and the cancel happen under _queue_current_lock together.
+        The dispatcher takes that same lock to claim and to clear the current
+        item, so holding it here means the item we verified cannot be swapped
+        out from under the cancel. cancel_active() only sets an event and
+        signals tracked subprocesses — it never takes this lock, so there is
+        no deadlock path.
+        """
         with self._queue_current_lock:
             current = self._queue_current
-        if current is not None:
+            if current is None:
+                return None
+            if item_id is not None and current.id != item_id:
+                return None
             state.cancel_active()
             return current.id
-        return None
 
     def _spell_speak(self, text, voice=None):
         """Spell replies ride the speech queue — same ordering/preemption
@@ -2847,6 +2914,25 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         voice = body.get("voice") or None
         output_file = body.get("output_file") or None
 
+        # Per-source coalescing: "only my latest status matters". With N agents
+        # narrating, a deep FIFO guarantees you hear STALE speech; dropping a
+        # source's own unspoken backlog fixes that at the root instead of
+        # choosing an overflow victim.
+        source = body.get("source") or None
+        if source is not None:
+            source = str(source)[:64]  # bound the key; it lands in logs
+        kind = body.get("kind") or None
+        # kind:"progress" is coalescing plus SSIP's end-of-burst guarantee
+        # ("Completed 100%" must always be heard). In a strict FIFO that
+        # guarantee is free: dropping older same-source items always leaves
+        # the newest, and the newest is always spoken. So it is the same
+        # machinery — documented equivalence, no separate class to maintain.
+        coalesce = bool(body.get("coalesce")) or kind == "progress"
+        if coalesce and not source:
+            self._send_error_json(
+                400, "'coalesce'/'kind' requires a 'source' key")
+            return
+
         # interrupt: true — flush everything and speak now (panic + speak).
         # flushed reports the blast radius: this deletes OTHER callers'
         # queued speech (Android hides this ability entirely; we expose it
@@ -2865,8 +2951,9 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
                 time.sleep(0.02)
 
         try:
-            item_id, position = svc.enqueue_speech(
-                text, voice=voice, quality=quality, output_file=output_file)
+            item_id, position, dropped = svc.enqueue_speech(
+                text, voice=voice, quality=quality, output_file=output_file,
+                source=source, coalesce=coalesce)
         except queue.Full:
             self._send_error_json(429, "queue full")
             return
@@ -2877,6 +2964,10 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
                 "position": position, "state": state_str}
         if flushed is not None:
             resp["flushed"] = flushed
+        if coalesce:
+            # Blast radius, same spirit as interrupt's `flushed` — but scoped
+            # to the caller's own source, so it can never surprise a peer.
+            resp["coalesced"] = dropped
         self._send_json(resp)
 
     def _handle_stop(self):
@@ -2886,8 +2977,24 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         self._send_json({"ok": True, "state": "idle", "cleared": cleared})
 
     def _handle_skip(self):
-        """Cancel the current queued utterance only; the next one plays."""
-        self._send_json({"ok": True, "skipped": self.service.skip_current()})
+        """Cancel the current queued utterance only; the next one plays.
+
+        Optional {"id": N} scopes the skip to that item — a no-op if it is not
+        the one playing. Bodyless /skip keeps the old positional behaviour
+        ("move on" is inherently positional when a human says it).
+        """
+        body = self._read_json_body()
+        if body is None:
+            return  # error already sent
+        item_id = body.get("id")
+        if item_id is not None:
+            try:
+                item_id = int(item_id)
+            except (TypeError, ValueError):
+                self._send_error_json(400, "'id' must be an integer")
+                return
+        self._send_json({"ok": True,
+                         "skipped": self.service.skip_current(item_id)})
 
     def _handle_cast(self):
         """Text seam for the spellbook: same path and gates as spoken casts.
@@ -2909,11 +3016,12 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         current = None
         if cur is not None:
             current = {"id": cur.id, "text": cur.text[:80], "voice": cur.voice,
-                       "enqueued_at": cur.enqueued_at}
+                       "source": cur.source, "enqueued_at": cur.enqueued_at}
         with svc._tts_queue.mutex:
             items = list(svc._tts_queue.queue)
         pending = [{"id": i.id, "text": i.text[:80], "voice": i.voice,
-                    "enqueued_at": i.enqueued_at} for i in items]
+                    "source": i.source, "enqueued_at": i.enqueued_at}
+                   for i in items]
         self._send_json({"current": current, "pending": pending,
                          "depth": len(pending),
                          "recent": list(svc._queue_recent)})
