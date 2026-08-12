@@ -1,6 +1,6 @@
 # GNOME Speaks
 
-A GNOME Shell extension that adds voice interaction to your desktop — speech-to-text dictation and text-to-speech readback — powered by [Azure Speech Services](https://azure.microsoft.com/en-us/products/ai-services/speech-services).
+A GNOME Shell extension that adds voice interaction to your desktop — speech-to-text dictation, text-to-speech readback, hands-free wake-word activation, and a spoken command "spellbook" — powered by [Azure Speech Services](https://azure.microsoft.com/en-us/products/ai-services/speech-services), with automatic offline fallback to a LAN [Wyoming](https://github.com/rhasspy/wyoming) server (Piper + local STT) when the cloud is unreachable.
 
 ## Ecosystem
 
@@ -41,6 +41,10 @@ GNOME Speaks preferences can configure all four projects from one unified settin
 ## Features
 
 - **Floating voice badge** — glassmorphism-styled status indicator with pulse animations
+- **Wake word** — hands-free activation via a LAN openwakeword server; speaking your wake phrase opens the mic like the keyboard shortcut (idle-only, never over TTS)
+- **Voice spellbook** — "cast …" utterances run local spells instead of being typed: mode switching, status reports spoken back in themed voices, home-automation rituals, oracle consultations — with confirmation gates and a hardcoded denylist for anything destructive
+- **Speech queue** — the HTTP API queues utterances FIFO so concurrent callers (agents, scripts, browsers) never cut each other off; your own speech always preempts
+- **Offline fallback** — network-class Azure failures automatically reroute STT/TTS to a Wyoming server on your LAN (Piper voice, local transcription) behind a circuit breaker
 - **Panel menu** — quick access to all voice actions from the top bar
 - **Speech-to-text** — real-time streaming transcription via Azure WebSocket STT
 - **Live typing** — partial transcriptions appear in the text field as you speak, replaced by the final text when done
@@ -62,18 +66,23 @@ GNOME Speaks preferences can configure all four projects from one unified settin
 
 ```
 GNOME Shell process                    Background service
-┌─────────────────┐     D-Bus IPC     ┌──────────────────────┐
-│  extension.js   │◄──────────────────►│ gnome-speaks-service │
-│  (UI only)      │   org.gnome.Speaks │  (Python)            │
-│  - badge        │                    │  - PipeWire capture  │
-│  - panel menu   │                    │  - Azure STT (WS)    │
-│  - keybindings  │                    │  - Azure TTS (REST)  │
-│  - settings     │                    │  - ydotool live type │
-│  - bus watcher  │                    │  - LLM integration   │
-└─────────────────┘                    └──────────────────────┘
+┌─────────────────┐     D-Bus IPC     ┌────────────────────────────┐
+│  extension.js   │◄──────────────────►│ gnome-speaks-service.py    │
+│  (UI only)      │   org.gnome.Speaks │  - PipeWire capture        │
+│  - badge        │                    │  - Azure STT (WS) + TTS    │
+│  - panel menu   │                    │  - speech queue + HTTP API │
+│  - keybindings  │                    │  - spellbook.py dispatch   │
+│  - settings     │                    │  - wake-word watcher       │
+│  - bus watcher  │                    │  - ydotool live typing     │
+└─────────────────┘                    │  - LLM integration         │
+                                       └──────────┬─────────────────┘
+                                                  │ Wyoming (LAN, optional)
+                                       ┌──────────▼─────────────────┐
+                                       │ openwakeword · Piper · STT │
+                                       └────────────────────────────┘
 ```
 
-The extension runs inside GNOME Shell's process and handles only UI. All network calls, audio I/O, and speech processing happen in a separate Python service communicating over the session D-Bus. Live typing uses ydotool (or xdotool) to inject keystrokes via `/dev/uinput`, bypassing Wayland's input restrictions.
+The extension runs inside GNOME Shell's process and handles only UI. All network calls, audio I/O, and speech processing happen in a separate Python service communicating over the session D-Bus. Live typing uses ydotool (or xdotool) to inject keystrokes via `/dev/uinput`, bypassing Wayland's input restrictions. Spoken output is serialized through a FIFO speech queue (see [HTTP API](#http-api)); transcripts pass through the [spellbook](#voice-spellbook) before mode routing; and an optional LAN Wyoming stack provides the wake word and offline STT/TTS.
 
 ## Modes
 

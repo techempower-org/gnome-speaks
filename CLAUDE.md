@@ -10,17 +10,23 @@ Two-process design connected by session D-Bus (`org.gnome.Speaks`):
 | File | Runtime | Role | Lines |
 |------|---------|------|-------|
 | `extension.js` | GNOME Shell (GJS) | UI: badge, panel indicator, subtitle overlay, keybindings, drag | ~1,800 |
-| `gnome-speaks-service.py` | systemd user service (Python) | Audio, STT, TTS, LLM, typing, clipboard, conversation | ~3,000 |
-| `prefs.js` | GNOME Extensions app (GJS/Gtk4) | 9-page preferences window | ~1,600 |
+| `gnome-speaks-service.py` | systemd user service (Python) | Audio, STT, TTS, speech queue, LLM, typing, clipboard, wake watcher | ~3,400 |
+| `spellbook.py` | imported by the service | Incantation matcher + executor ("cast …" → local actions); denylist | ~450 |
+| `spellbook.json` | data | Repo spells (self-control); user overlay at `~/.config/speech-to-cli/spellbook.json` merges + hot-reloads | — |
+| `prefs.js` | GNOME Extensions app (GJS/Gtk4) | 10-page preferences window (incl. Spellcraft) | ~1,750 |
 | `stylesheet.css` | GNOME Shell | Badge states, animations, subtitle overlay | ~350 |
 
 The extension touches **no** network or audio -- all I/O is in the Python service.
+Spoken output serializes through a FIFO **speech queue** (HTTP callers never stomp
+each other; user speech preempts). Transcripts hit the **spellbook** before mode
+routing. A **wake watcher** thread streams mic audio to a LAN Wyoming
+openwakeword server while idle.
 
 ## External Dependencies
 
 Two sibling projects are imported at runtime (not pip packages):
 
-- **speech-to-cli** (`~/Projects/speech-to-cli`, env `SPEECH_ENGINE_PATH`) -- provides `state`, `audio`, `stt`, `speech_tts` modules
+- **speech-to-cli** (`~/Projects/speech-to-cli`, env `SPEECH_ENGINE_PATH`) -- provides `state`, `audio`, `stt`, `speech_tts`, `wyoming` modules. `wyoming` carries the LAN offline fallback (Piper TTS / local STT with a 60s Azure circuit breaker; `SPEECH_FORCE_OFFLINE=1` forces it) and `detect_stream` for the wake word. **Import order gotcha**: these modules are importable only after the `sys.path.insert` for `SPEECH_ENGINE_PATH` (~line 58) — imports above it fail at service start.
 - **cloud-chat-assistant** (`~/Projects/cloud-chat-assistant`, env `CLOUD_CHAT_PATH`) -- optional Bedrock/Azure LLM backend
 
 Config files:
@@ -51,7 +57,10 @@ systemctl --user restart gnome-speaks.service
 journalctl --user -u gnome-speaks.service -f    # live logs
 ```
 
-HTTP REST API on `localhost:7710` for browser-based TTS control.
+HTTP REST API on `localhost:7710`: `POST /speak` (queues FIFO; `interrupt:true`
+flushes), `/skip`, `/stop` (drains queue), `/pause`, `/resume`, `/cast` (text
+seam into the spellbook — same gates as spoken casts), `GET /status`, `/queue`
+(pending + per-item outcomes: done/canceled/interrupted/error), `/voices`.
 
 ## D-Bus Interface
 
@@ -83,6 +92,8 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 | Terminal | Lowercase, no punctuation, lexical output |
 | Talk | D-Bus API for external apps (blocking call) |
 | Half/Full Duplex | Auto-detected speaker vs headphone routing |
+| Wake word | Idle-only mic stream to LAN openwakeword; detection = dictation hotkey. Toggle: "cast wake word" |
+| Spellbook | "cast …"/"invoke …" transcripts run local spells (never typed/LLM'd); `POST /cast` is the text seam |
 
 ## Coding Conventions
 
@@ -100,6 +111,10 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 - **Schema compilation**: After editing the `.gschema.xml`, must run `glib-compile-schemas` on the install directory.
 - **Disposed notification sources**: During shell init/restart, `MessageTray` `source-added` can fire with already-disposed `FdoNotificationDaemonSource` objects. Any signal connection on them crashes the shell. Always wrap `source.connect()` in try-catch and listen for `source-removed` to drop references before GC disposes them.
 - **Azure content filter**: Avoid `[SYSTEM:]` prefix in system prompts -- Azure GPT content filter blocks it.
+- **speech-to-cli `load_config()` whitelists keys**: unknown config.json keys are silently dropped. Adding a config key means adding it to the whitelist in `state.py` too, or the feature reads a default forever.
+- **`Shell.Eval` is dead** (returns `(false,'')`; Introspect/Screenshot are AccessDenied) -- `_get_focused_app()` is silently a no-op (#7). Desktop actuation needs D-Bus methods exported from extension.js.
+- **Public repo**: LAN hostnames/IPs, the HA domain, and the wake-word model name (it's the wake phrase) never enter git -- they live in `~/.config/speech-to-cli/config.json` and the user spellbook overlay. Scan patch history before pushing.
+- **Speech-queue state ownership**: `_speak_token` fences playback cleanup -- a preempted worker must not reset state it no longer owns. Keep the token claims when adding new speech paths.
 
 ## Testing
 
