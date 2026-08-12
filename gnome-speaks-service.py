@@ -78,6 +78,7 @@ else:
 
 import state  # noqa: E402
 from state import CONFIG, HAS_VAD, HAS_WS, HAS_WHISPER, FRAME_BYTES, FRAME_MS, SAMPLE_RATE  # noqa: E402
+import wyoming as wyoming_mod  # noqa: E402  (speech-to-cli engine module)
 from audio import (  # noqa: E402
     _take_prewarmed_rec, _build_rec_cmd, calibrate_noise,
     is_speech_energy, rms_energy, _schedule_warmup, _prewarm_recorder,
@@ -734,6 +735,10 @@ class GnomeSpeaksService:
             dbus_self=self._spell_ctx_dbus, confirm=self.talk,
             ha_token=_get_ha_token)
 
+        # Wake word watcher (idle-only; no-op until wake_word is enabled)
+        threading.Thread(target=self._wake_watcher, daemon=True,
+                         name="wake-watcher").start()
+
     # -- Config sync -------------------------------------------------------
 
     # Boolean flags that prefs.js can change on disk while the service runs.
@@ -741,6 +746,7 @@ class GnomeSpeaksService:
         # Mode flags
         "conversation_mode", "continuous_dictation", "dictation_mode",
         "terminal_mode", "skip_final_paste", "read_notifications",
+        "wake_word", "wake_word_model",
         # LLM provider config
         "llm_provider", "llm_model", "llm_api_key", "llm_system_prompt",
         # Chimes
@@ -1885,8 +1891,62 @@ class GnomeSpeaksService:
             self._save_config_flag(
                 "read_notifications",
                 not CONFIG.get("read_notifications", False))
+        elif op == "wake_word_toggle":
+            self._save_config_flag("wake_word",
+                                   not CONFIG.get("wake_word", False))
         else:
             raise ValueError(f"unknown dbus_self op: {op}")
+
+    def _wake_watcher(self):
+        """Daemon thread: streams mic audio to the Wyoming wake-word server
+        while idle; a detection acts like the dictation hotkey."""
+        last_fail_log = 0.0
+        while True:
+            if (not CONFIG.get("wake_word", False)
+                    or not CONFIG.get("wyoming_host", "")
+                    or not CONFIG.get("wake_word_model", "")
+                    or self.current_state != "idle"):
+                time.sleep(0.5)
+                continue
+            host = CONFIG.get("wyoming_host", "")
+            port = int(CONFIG.get("wyoming_wake_port", 10400))
+            model = CONFIG.get("wake_word_model", "")
+            proc = None
+            try:
+                proc = subprocess.Popen(_build_rec_cmd(),
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL)
+
+                def _chunks():
+                    while (CONFIG.get("wake_word", False)
+                           and self.current_state == "idle"):
+                        data = proc.stdout.read(3200)  # ~100 ms @ 16 kHz s16
+                        if not data:
+                            return
+                        yield data
+
+                name = wyoming_mod.detect_stream(host, port, model, _chunks())
+                if name and self.current_state == "idle":
+                    log.info("Wake word detected (%s) — opening mic", name)
+                    GLib.idle_add(lambda: (self.start_listening(quick=True),
+                                           False)[-1])
+                    time.sleep(2.0)  # cooldown; state flips to listening anyway
+            except wyoming_mod.WyomingError as e:
+                now = time.time()
+                if now - last_fail_log > 300:
+                    log.warning("Wake watcher: %s (retrying every 60s)", e)
+                    last_fail_log = now
+                time.sleep(60)
+            except Exception:
+                log.exception("Wake watcher error")
+                time.sleep(10)
+            finally:
+                if proc is not None:
+                    proc.kill()  # pw-record ignores SIGTERM
+                    try:
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
 
     def _spellbook_stat(self):
         return tuple(os.path.getmtime(p) if os.path.isfile(p) else 0

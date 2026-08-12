@@ -33,6 +33,12 @@
      "patterns": ["read notifications", "notifications"],
      "action": {"type": "dbus_self", "op": "read_notifications_toggle", "reply": "Notification herald toggled."},
      "chime": "xp_gain",
+     "gate": "instant"},
+
+    {"name": "wake-word",
+     "patterns": ["wake word", "waking watch"],
+     "action": {"type": "dbus_self", "op": "wake_word_toggle", "reply": "The waking watch is toggled."},
+     "chime": "xp_gain",
      "gate": "instant"}
   ]
 }
