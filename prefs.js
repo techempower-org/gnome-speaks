@@ -140,6 +140,7 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
             'conversation_mode', false);
 
         this._addComboRow(aiGroup, 'LLM Provider', 'llm_provider', [
+            ['local', 'Local (OpenAI-compatible)'],
             ['anthropic', 'Anthropic (Claude)'],
             ['openai', 'OpenAI (GPT)'],
             ['digitalocean', 'DigitalOcean'],
@@ -151,6 +152,7 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         ], 'anthropic');
 
         this._addComboRow(aiGroup, 'LLM Model', 'llm_model', [
+            ['qwen36-coder', 'Qwen (local)'],
             ['claude-opus-4.6', 'Claude Opus 4.6'],
             ['claude-sonnet-4.6', 'Claude Sonnet 4.6'],
             ['claude-haiku-4.5', 'Claude Haiku 4.5'],

@@ -79,7 +79,7 @@ dbus-send --session --dest=org.gnome.Speaks --print-reply /org/gnome/Speaks org.
 
 8 providers configured via prefs. `MODEL_MAP` dict in gnome-speaks-service.py translates canonical model names to provider-specific IDs.
 
-Streaming (sentence-level TTS): Anthropic, OpenAI, Azure AI, Google, DigitalOcean, Puter
+Streaming (sentence-level TTS): local (OpenAI-compatible LAN server, e.g. Qwen via llm_stream `local_endpoint`), Anthropic, OpenAI, Azure AI, Google, DigitalOcean, Puter
 Synchronous fallback: cloud-chat-assistant, Bedrock
 
 ## Modes
