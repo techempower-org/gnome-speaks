@@ -595,6 +595,10 @@ def apply_voice_commands(text):
     return result
 
 
+_SERVICE_START_TIME = time.time()
+_SERVICE_START_ISO = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
 def _get_ha_token():
     """Home Assistant long-lived token: env → cache file → Vaultwarden.
     Returns None when unavailable. The value is never logged."""
@@ -2706,7 +2710,9 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
-        if path == "/status":
+        if path == "/api/version":
+            self._handle_version()
+        elif path == "/status":
             self._handle_status()
         elif path == "/voices":
             self._handle_voices()
@@ -2861,6 +2867,46 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
                 svc._http_progress["pause_accumulated"] += time.time() - ps
                 svc._http_progress["pause_started"] = 0.0
         self._send_json({"ok": True, "paused": False})
+
+    def _handle_version(self):
+        """GET /api/version — realm-sigil version contract (falls back to a
+        minimal payload when realm-sigil isn't installed)."""
+        import socket as _socket
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+
+        def _git(*args):
+            try:
+                return subprocess.run(
+                    ["git", "-C", repo_dir] + list(args),
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+            except Exception:
+                return ""
+
+        hash_ = _git("rev-parse", "--short", "HEAD") or "dev"
+        branch = _git("rev-parse", "--abbrev-ref", "HEAD") or "unknown"
+        dirty = bool(_git("status", "--porcelain"))
+        uptime = int(time.time() - _SERVICE_START_TIME)
+        try:
+            sys.path.insert(0, os.path.expanduser("~/Projects/realm-sigil/python"))
+            try:
+                from realm_sigil import version_dict
+            finally:
+                sys.path.pop(0)
+            payload = version_dict(
+                "gnome-speaks", "GNOME Shell voice extension service",
+                "fantasy", "https://github.com/techempower-org/gnome-speaks",
+                hash=hash_, branch=branch, dirty=dirty,
+                built=_SERVICE_START_ISO, started=_SERVICE_START_ISO,
+                uptime=uptime,
+                runtime="python%d.%d" % sys.version_info[:2],
+                host=_socket.gethostname(), pid=os.getpid(),
+            )
+        except ImportError:
+            payload = {"name": "gnome-speaks", "version": hash_,
+                       "hash": hash_, "branch": branch, "dirty": dirty,
+                       "uptime": uptime}
+        self._send_json(payload)
 
     def _handle_status(self):
         svc = self.service
