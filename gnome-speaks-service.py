@@ -79,6 +79,7 @@ else:
 import state  # noqa: E402
 from state import CONFIG, HAS_VAD, HAS_WS, HAS_WHISPER, FRAME_BYTES, FRAME_MS, SAMPLE_RATE  # noqa: E402
 import wyoming as wyoming_mod  # noqa: E402  (speech-to-cli engine module)
+import spiel_provider  # noqa: E402  (imports state/wyoming — needs sys.path above)
 from audio import (  # noqa: E402
     _take_prewarmed_rec, _build_rec_cmd, calibrate_noise,
     is_speech_energy, rms_energy, _schedule_warmup, _prewarm_recorder,
@@ -3289,6 +3290,67 @@ class DBusHandler:
 # Bus ownership callbacks
 # ---------------------------------------------------------------------------
 
+SPIEL_BUS_NAME = "org.gnome.Speaks.Speech.Provider"
+SPIEL_OBJECT_PATH = "/org/gnome/Speaks/Speech/Provider"
+SPIEL_INTERFACE_XML = """
+<node>
+  <interface name="org.freedesktop.Speech.Provider">
+    <method name="Synthesize">
+      <arg direction="in" type="h" name="pipe_fd"/>
+      <arg direction="in" type="s" name="text"/>
+      <arg direction="in" type="s" name="voice_id"/>
+      <arg direction="in" type="d" name="pitch"/>
+      <arg direction="in" type="d" name="rate"/>
+      <arg direction="in" type="b" name="is_ssml"/>
+      <arg direction="in" type="s" name="language"/>
+    </method>
+    <property name="Name" type="s" access="read"/>
+    <property name="Voices" type="a(ssstas)" access="read"/>
+  </interface>
+</node>"""
+
+
+def _spiel_method_call(connection, sender, object_path, interface_name,
+                       method_name, parameters, invocation):
+    """Synthesize: pull the pipe fd out of the fd list, ACK the call, and
+    write PCM on a per-request thread (the contract expects concurrency)."""
+    if method_name != "Synthesize":
+        invocation.return_dbus_error(
+            "org.freedesktop.DBus.Error.UnknownMethod", "Unknown method")
+        return
+    handle, text, voice_id, _pitch, _rate, _is_ssml, _lang = \
+        parameters.unpack()
+    fd_list = invocation.get_message().get_unix_fd_list()
+    if fd_list is None or handle >= fd_list.get_length():
+        invocation.return_dbus_error(
+            "org.freedesktop.DBus.Error.InvalidArgs", "missing pipe fd")
+        return
+    fd = fd_list.get(handle)  # returns a dup we own
+    invocation.return_value(None)
+    threading.Thread(target=spiel_provider.synthesize_to_fd,
+                     args=(fd, text, voice_id, CONFIG), daemon=True,
+                     name="spiel-synth").start()
+
+
+def _spiel_get_property(connection, sender, object_path, interface_name,
+                        property_name):
+    if property_name == "Name":
+        return GLib.Variant("s", "GNOME Speaks")
+    if property_name == "Voices":
+        return GLib.Variant("a(ssstas)",
+                            spiel_provider.build_voices(CONFIG))
+    return None
+
+
+def _on_spiel_bus_acquired(connection, name):
+    node = Gio.DBusNodeInfo.new_for_xml(SPIEL_INTERFACE_XML)
+    connection.register_object(
+        SPIEL_OBJECT_PATH,
+        node.lookup_interface("org.freedesktop.Speech.Provider"),
+        _spiel_method_call, _spiel_get_property, None)
+    log.info("Spiel provider registered as %s", name)
+
+
 def on_bus_acquired(connection, name, service, handler):
     """Called when we have a connection to the session bus."""
     log.info("Bus acquired: %s", name)
@@ -3399,6 +3461,15 @@ def main():
     flags = Gio.BusNameOwnerFlags.NONE
     if args.replace:
         flags = Gio.BusNameOwnerFlags.REPLACE
+
+    # Spiel speech provider: second bus name, config-gated. The ".Speech.
+    # Provider" suffix is how libspiel clients discover providers.
+    if CONFIG.get("spiel_provider", False):
+        Gio.bus_own_name(
+            Gio.BusType.SESSION, SPIEL_BUS_NAME,
+            Gio.BusNameOwnerFlags.NONE,
+            _on_spiel_bus_acquired, None,
+            lambda conn, name: log.warning("Spiel name lost: %s", name))
 
     owner_id = Gio.bus_own_name(
         Gio.BusType.SESSION,

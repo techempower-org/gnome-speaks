@@ -65,6 +65,7 @@ do_uninstall() {
         warn "Could not reload systemd daemon."
 
     # Remove the DBus service file
+    rm -f "$DBUS_DIR/org.gnome.Speaks.Speech.Provider.service"
     if [[ -f "$DBUS_FILE" ]]; then
         info "Removing DBus service file..."
         rm -f "$DBUS_FILE"
@@ -210,6 +211,15 @@ mkdir -p "$DBUS_DIR"
 cat > "$DBUS_FILE" <<DBUS_EOF
 [D-BUS Service]
 Name=org.gnome.Speaks
+Exec=$SERVICE_EXEC
+SystemdService=$SYSTEMD_SERVICE
+DBUS_EOF
+
+# Spiel speech provider activation (inert unless spiel_provider is enabled
+# in config — the name is only owned by a running service when configured).
+cat > "$DBUS_DIR/org.gnome.Speaks.Speech.Provider.service" <<DBUS_EOF
+[D-BUS Service]
+Name=org.gnome.Speaks.Speech.Provider
 Exec=$SERVICE_EXEC
 SystemdService=$SYSTEMD_SERVICE
 DBUS_EOF
