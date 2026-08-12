@@ -256,7 +256,18 @@ class SpellExecutor:
         url = action["url"]
         data = None
         if action.get("method", "GET").upper() == "POST":
-            data = json.dumps(action.get("body", {})).encode()
+            body_dict = dict(action.get("body") or {})
+            # remainder_field: inject the words spoken after the pattern
+            # into this POST body field ("cast ember note bring back the
+            # thief" → body[field] = "bring back the thief").
+            rf = action.get("remainder_field")
+            if rf:
+                if not remainder:
+                    self._speak("Speak the words to send.",
+                                spell.get("speak_as"))
+                    return "fizzle"
+                body_dict[rf] = remainder
+            data = json.dumps(body_dict).encode()
         req = urllib.request.Request(
             url, data=data, headers={"Content-Type": "application/json"})
         try:
@@ -273,6 +284,10 @@ class SpellExecutor:
                 text = ""
         else:
             text = _extract(payload, action.get("speak"))
+        if not text:
+            # Static success line for write-shaped spells whose response
+            # JSON isn't worth reading aloud ("The note is inscribed.").
+            text = action.get("reply", "")
         if text:
             self._speak(text, spell.get("speak_as"))
         return "done"

@@ -307,7 +307,9 @@ speaks "The spell fizzles" instead of silently typing.
 
 Spells are data: the repo ships `spellbook.json` with the self-control spells;
 a user overlay at `~/.config/speech-to-cli/spellbook.json` merges over it by
-spell name and hot-reloads on save. The realm/oracle/home spells below are
+spell name and hot-reloads on save. POST spells can carry dictated
+text: `"remainder_field": "body"` injects the words spoken after the pattern
+into that body field, and `"reply"` speaks a fixed success line. The realm/oracle/home spells below are
 overlay examples — their endpoints are site-specific and never live in the repo.
 
 | Incantation | Effect |
