@@ -817,11 +817,12 @@ export default class GnomeSpeaksExtension extends Extension {
             x_align: Clutter.ActorAlign.CENTER,
         });
 
-        // Enable word wrap on the underlying ClutterText
+        // Single-line ticker: no wrapping — Pango START ellipsizing keeps
+        // the TAIL of the transcript visible, so long dictation scrolls
+        // past a leading "…" instead of wrapping into an ever-taller block.
         let clutterText = this._subtitleLabel.get_clutter_text();
-        clutterText.set_line_wrap(true);
-        clutterText.set_line_wrap_mode(0); // PANGO_WRAP_WORD
-        clutterText.set_ellipsize(0); // PANGO_ELLIPSIZE_NONE
+        clutterText.set_line_wrap(false);
+        clutterText.set_ellipsize(1); // PANGO_ELLIPSIZE_START
 
         this._subtitleOverlay.add_child(this._subtitleLabel);
 
