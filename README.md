@@ -344,6 +344,13 @@ The provider writes raw S16LE PCM to the client's pipe (the client owns
 playback, per Spiel's design), handles concurrent requests, and treats a
 closed pipe as cancellation. No SSML or word-event support is advertised.
 
+**Pointing Orca at it:** Orca ≥46 ships a Spiel backend, but note two traps:
+libspiel is not packaged on Ubuntu (build from source; make its typelib
+visible session-wide via `~/.config/environment.d/`), and Orca initializes
+speech *before* applying `speechServerFactory` from user settings — the
+reliable switch is `orca.settings.speechSystemOverride = "spiel"` in
+`~/.local/share/orca/orca-customizations.py`.
+
 ## Voice Spellbook
 
 Utterances beginning with a trigger word (`cast` or `invoke`) are **incantations**:
