@@ -87,6 +87,7 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         this._addVoicePage(window);
         this._addListeningPage(window);
         this._addAudioPage(window);
+        this._addSpellcraftPage(window);
         this._addFeedbackPage(window);
         this._addExtensionPage(window);
         this._addAdvancedPage(window);
@@ -737,6 +738,84 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         } catch (e) {
             return false;
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Page — Spellcraft (wake word, spellbook, offline fallback)
+    // ═══════════════════════════════════════════════════════════════════
+    _addSpellcraftPage(window) {
+        const page = new Adw.PreferencesPage({
+            title: 'Spellcraft',
+            icon_name: 'weather-clear-night-symbolic',
+        });
+
+        // ── Wake Word ──
+        const wakeGroup = new Adw.PreferencesGroup({
+            title: 'Wake Word',
+            description: 'Hands-free activation via a Wyoming openwakeword server on your LAN. ' +
+                'Speaking your wake phrase while idle opens the mic exactly like the keyboard shortcut. ' +
+                'Never armed during dictation or TTS playback.',
+        });
+        page.add(wakeGroup);
+
+        this._addSwitchRow(wakeGroup, 'Enable Wake Word',
+            'Stream mic audio to the wake server while idle ("cast wake word" toggles this by voice)',
+            'wake_word', false);
+
+        this._addEntryRow(wakeGroup, 'Wake Model', 'wake_word_model', '',
+            'openwakeword model name — effectively your wake phrase; treat it as private');
+
+        this._addSpinRow(wakeGroup, 'Wake Server Port', 'wyoming_wake_port',
+            1, 65535, 1, 0, 10400,
+            'Wyoming openwakeword port on the fallback host below');
+
+        // ── Voice Spellbook ──
+        const spellGroup = new Adw.PreferencesGroup({
+            title: 'Voice Spellbook',
+            description: 'Utterances starting with "cast" or "invoke" run local spells instead of ' +
+                'being typed or sent to the LLM: mode switching, realm scrying, home rituals, oracle ' +
+                'consultations. Spells are JSON — the extension ships the self-control set; add your ' +
+                'own in the overlay below (hot-reloads on save). Test without a mic: ' +
+                'POST /cast on localhost:7710.',
+        });
+        page.add(spellGroup);
+
+        const overlayRow = new Adw.ActionRow({
+            title: 'User Spell Overlay',
+            subtitle: '~/.config/speech-to-cli/spellbook.json',
+        });
+        overlayRow.add_suffix(new Gtk.Image({ icon_name: 'document-edit-symbolic' }));
+        overlayRow.activatable = true;
+        overlayRow.connect('activated', () => {
+            const path = GLib.get_home_dir() + '/.config/speech-to-cli/spellbook.json';
+            Gio.AppInfo.launch_default_for_uri(`file://${path}`, null);
+        });
+        spellGroup.add(overlayRow);
+
+        // ── Offline Fallback ──
+        const offlineGroup = new Adw.PreferencesGroup({
+            title: 'Offline Fallback',
+            description: 'When Azure is unreachable, speech falls back to a Wyoming server on your ' +
+                'LAN (Piper TTS + local STT). A 60-second circuit breaker skips Azure while it is ' +
+                'down. Leave the host empty to disable.',
+        });
+        page.add(offlineGroup);
+
+        this._addEntryRow(offlineGroup, 'Wyoming Host', 'wyoming_host', '',
+            'LAN hostname or IP of the Wyoming server (empty = feature off)');
+
+        this._addSpinRow(offlineGroup, 'TTS Port', 'wyoming_tts_port',
+            1, 65535, 1, 0, 10200,
+            'Wyoming TTS service (e.g. wyoming-piper)');
+
+        this._addSpinRow(offlineGroup, 'STT Port', 'wyoming_stt_port',
+            1, 65535, 1, 0, 10300,
+            'Wyoming STT service (e.g. wyoming-onnx-asr)');
+
+        this._addEntryRow(offlineGroup, 'Offline Voice', 'wyoming_tts_voice', '',
+            'Piper voice name (empty = server default)');
+
+        window.add(page);
     }
 
     // ═══════════════════════════════════════════════════════════════════
