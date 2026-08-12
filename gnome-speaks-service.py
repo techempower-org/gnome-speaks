@@ -758,6 +758,7 @@ class GnomeSpeaksService:
         "conversation_mode", "continuous_dictation", "dictation_mode",
         "terminal_mode", "skip_final_paste", "read_notifications",
         "wake_word", "wake_word_model", "llm_thinking",
+        "speed", "pitch", "volume",
         # LLM provider config
         "llm_provider", "llm_model", "llm_api_key", "llm_system_prompt",
         # Chimes
@@ -1830,6 +1831,9 @@ class GnomeSpeaksService:
             try:
                 result = speech_tts.tts(text, quality=q, progress_token=None,
                                         voice=voice,
+                                        speed=CONFIG.get("speed", 1.0),
+                                        pitch=CONFIG.get("pitch", "default"),
+                                        volume=CONFIG.get("volume", "default"),
                                         audio_level_cb=self._tts_level_cb,
                                         output_file=output_file)
                 if result.get("error"):
@@ -2643,6 +2647,9 @@ class GnomeSpeaksService:
                     _ss = threading.Event()
                     subtitle_q.put((sentence, _sd, _ss))
                     speech_tts.tts(sentence, quality=self._voice_quality,
+                                   speed=CONFIG.get("speed", 1.0),
+                                   pitch=CONFIG.get("pitch", "default"),
+                                   volume=CONFIG.get("volume", "default"),
                                    audio_level_cb=self._tts_level_cb)
                     _ss.set()
 
@@ -2667,6 +2674,9 @@ class GnomeSpeaksService:
                 _ss = threading.Event()
                 subtitle_q.put((remainder, _sd, _ss))
                 speech_tts.tts(remainder, quality=self._voice_quality,
+                               speed=CONFIG.get("speed", 1.0),
+                               pitch=CONFIG.get("pitch", "default"),
+                               volume=CONFIG.get("volume", "default"),
                                audio_level_cb=self._tts_level_cb)
                 _ss.set()
 

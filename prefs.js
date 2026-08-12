@@ -349,6 +349,29 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         this._addEntryRow(voiceGroup, 'Offline Voice', 'wyoming_tts_voice', 'en_GB-cori-high',
             'Piper voice used when the cloud is unreachable. Default: en_GB-cori-high');
 
+        this._addSpinRow(voiceGroup, 'Speed', 'speed',
+            0.5, 3.0, 0.1, 1, 1.0,
+            'Speaking rate for cloud voices. Default: 1.0');
+
+        this._addComboRow(voiceGroup, 'Pitch', 'pitch', [
+            ['default', 'Default'],
+            ['x-low', 'Extra Low'],
+            ['low', 'Low'],
+            ['medium', 'Medium'],
+            ['high', 'High'],
+            ['x-high', 'Extra High'],
+        ], 'default');
+
+        this._addComboRow(voiceGroup, 'Volume', 'volume', [
+            ['default', 'Default'],
+            ['silent', 'Silent'],
+            ['x-soft', 'Extra Soft'],
+            ['soft', 'Soft'],
+            ['medium', 'Medium'],
+            ['loud', 'Loud'],
+            ['x-loud', 'Extra Loud'],
+        ], 'default');
+
         // ── Subtitles — ONE switch, both layers ──
         const subGroup = new Adw.PreferencesGroup({title: 'Subtitles'});
         page.add(subGroup);
@@ -1208,20 +1231,44 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
             GLib.get_home_dir(), '.config', 'speech-to-cli',
         ]);
         GLib.mkdir_with_parents(dir, 0o755);
-
         const path = GLib.build_filenamev([dir, 'config.json']);
-        const json = JSON.stringify(this._config, null, 2) + '\n';
+
+        // Merge-on-write (#16): re-read the file and apply only OUR edits
+        // on top — the service (spells, quality toggle) writes this file
+        // too, and dumping a stale full object would erase its changes.
+        let onDisk = {};
+        try {
+            const [ok, contents] = GLib.file_get_contents(path);
+            if (ok)
+                onDisk = JSON.parse(new TextDecoder('utf-8').decode(contents));
+        } catch (e) {
+            // Missing/corrupt file — our object is the best we have
+            onDisk = {};
+        }
+        for (const key of this._dirtyKeys ?? [])
+            onDisk[key] = this._config[key];
+        for (const key of this._deletedKeys ?? [])
+            delete onDisk[key];
+        this._config = onDisk;
+        this._dirtyKeys = new Set();
+        this._deletedKeys = new Set();
+
+        const json = JSON.stringify(onDisk, null, 2) + '\n';
         const encoder = new TextEncoder();
         GLib.file_set_contents(path, encoder.encode(json));
     }
 
     _setConfigValue(key, value) {
         this._config[key] = value;
+        (this._dirtyKeys ??= new Set()).add(key);
+        (this._deletedKeys ??= new Set()).delete(key);
         this._scheduleConfigSave();
     }
 
     _deleteConfigKey(key) {
         delete this._config[key];
+        (this._deletedKeys ??= new Set()).add(key);
+        (this._dirtyKeys ??= new Set()).delete(key);
         this._scheduleConfigSave();
     }
 
@@ -1270,20 +1317,41 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
             GLib.get_home_dir(), '.config', 'cloud-chat-assistant',
         ]);
         GLib.mkdir_with_parents(dir, 0o755);
-
         const path = GLib.build_filenamev([dir, 'config.json']);
-        const json = JSON.stringify(this._ccaConfig, null, 2) + '\n';
+
+        // Merge-on-write, same rationale as _saveConfig (#16).
+        let onDisk = {};
+        try {
+            const [ok, contents] = GLib.file_get_contents(path);
+            if (ok)
+                onDisk = JSON.parse(new TextDecoder('utf-8').decode(contents));
+        } catch (e) {
+            onDisk = {};
+        }
+        for (const key of this._ccaDirtyKeys ?? [])
+            onDisk[key] = this._ccaConfig[key];
+        for (const key of this._ccaDeletedKeys ?? [])
+            delete onDisk[key];
+        this._ccaConfig = onDisk;
+        this._ccaDirtyKeys = new Set();
+        this._ccaDeletedKeys = new Set();
+
+        const json = JSON.stringify(onDisk, null, 2) + '\n';
         const encoder = new TextEncoder();
         GLib.file_set_contents(path, encoder.encode(json));
     }
 
     _setCcaConfigValue(key, value) {
         this._ccaConfig[key] = value;
+        (this._ccaDirtyKeys ??= new Set()).add(key);
+        (this._ccaDeletedKeys ??= new Set()).delete(key);
         this._scheduleCcaConfigSave();
     }
 
     _deleteCcaConfigKey(key) {
         delete this._ccaConfig[key];
+        (this._ccaDeletedKeys ??= new Set()).add(key);
+        (this._ccaDirtyKeys ??= new Set()).delete(key);
         this._scheduleCcaConfigSave();
     }
 
