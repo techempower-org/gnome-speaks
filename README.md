@@ -283,11 +283,11 @@ current utterance immediately and holds the queue until you finish.
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /speak` | Queue text for speech. Body: `text` (required), `voice` (Azure ShortName), `quality` (`fast`/`hd`), `output_file` (save WAV instead of playing), `interrupt` (`true` = flush everything and speak now). Returns `{ok, id, position, state}` — plus `flushed` (how many queued items an interrupt deleted); `429` when the queue (depth 32) is full. |
-| `POST /skip` | Cancel the current utterance; the next queued one plays. Returns `{ok, skipped}`. (SSIP calls this `STOP`.) |
+| `POST /speak` | Queue text for speech. Body: `text` (required), `voice` (Azure ShortName), `quality` (`fast`/`hd`), `output_file` (save WAV instead of playing), `interrupt` (`true` = flush everything and speak now), `source` + `coalesce`/`kind` (see [coalescing](#coalescing-only-my-latest-matters)). Returns `{ok, id, position, state}` — plus `flushed` (how many queued items an interrupt deleted) and `coalesced` (ids your own coalesce dropped); `429` when the queue (depth 32) is full. |
+| `POST /skip` | Cancel the current utterance; the next queued one plays. Returns `{ok, skipped}` — the id that was skipped, or `null`. Optional body `{"id": N}` skips **only if** item `N` is the one playing, so a late "skip mine" can't kill somebody else's utterance. (SSIP calls this `STOP`.) |
 | `POST /stop` | Panic button: stop playback and drain the queue. Returns `{ok, cleared}`. (SSIP calls this `CANCEL` — note the inverted verbs if you have speech-dispatcher reflexes.) |
 | `POST /pause` / `POST /resume` | Pause/resume. Queue-level: while paused, the next queued item won't start either. |
-| `GET /queue` | Queue introspection: `{current, pending, depth, recent}`. `recent` holds the last 16 terminal outcomes — `done`, `canceled` (dropped before starting), `interrupted` (cut off mid-play), or `error` — so callers can learn the fate of a submitted `id`. |
+| `GET /queue` | Queue introspection: `{current, pending, depth, recent}`. Each entry carries its `source` (`null` when unset). `recent` holds the last 16 terminal outcomes — `done`, `canceled` (dropped before starting), `interrupted` (cut off mid-play), or `error` — so callers can learn the fate of a submitted `id`. |
 | `GET /status` | Service state, pause flag, `queue_depth`, playback progress. |
 | `GET /voices` | Available Azure voices (cached 5 min). |
 
@@ -295,6 +295,37 @@ current utterance immediately and holds the queue until you finish.
 curl -X POST localhost:7710/speak -H 'Content-Type: application/json' \
   -d '{"text": "Hello from the queue", "voice": "en-US-JennyNeural"}'
 ```
+
+### Coalescing: "only my latest matters"
+
+With several agents narrating at once, a deep FIFO guarantees you hear **stale**
+speech — forty queued *still working…* before the *done* you actually wanted.
+Tag your requests with a `source` and set `coalesce: true`, and each new request
+drops that source's own **unspoken** backlog:
+
+```bash
+curl -X POST localhost:7710/speak -H 'Content-Type: application/json' \
+  -d '{"text": "Build 80 percent", "source": "ci", "coalesce": true}'
+# -> {"ok":true,"id":7,"position":0,"state":"queued","coalesced":[5,6]}
+```
+
+Coalescing is deliberately narrow, so it is safe to use without coordinating
+with anyone:
+
+- It only ever drops items sharing **your** `source` — never another caller's.
+- It never cuts off the utterance that is **already playing**; use `/skip` or
+  `interrupt` for that.
+- Dropped items are reported in `coalesced`, land in `GET /queue`'s `recent`
+  ring as `canceled`, and log one INFO line with the ids.
+- `coalesce`/`kind` without a `source` is a `400` — silently coalescing nothing
+  would be worse than failing loudly.
+
+`kind: "progress"` is accepted as an alias. Speech Dispatcher's SSIP protocol has
+a dedicated `progress` class that drops intermediate updates but promotes the
+*last* message of a burst so the final "100%" is always heard. In a strict FIFO
+that promotion is free — dropping older same-source items always leaves the
+newest, and the newest always gets spoken — so `kind: "progress"` is the same
+machinery under a name that reads better at the call site.
 
 ## Voice Spellbook
 

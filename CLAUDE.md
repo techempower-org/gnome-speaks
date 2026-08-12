@@ -58,9 +58,12 @@ journalctl --user -u gnome-speaks.service -f    # live logs
 ```
 
 HTTP REST API on `localhost:7710`: `POST /speak` (queues FIFO; `interrupt:true`
-flushes), `/skip`, `/stop` (drains queue), `/pause`, `/resume`, `/cast` (text
-seam into the spellbook — same gates as spoken casts), `GET /status`, `/queue`
-(pending + per-item outcomes: done/canceled/interrupted/error), `/voices`.
+flushes; `source` + `coalesce`/`kind:"progress"` drops that source's own
+unspoken backlog so agents never narrate stale status), `/skip` (optional
+`{"id":N}` scopes it to that item), `/stop` (drains queue), `/pause`,
+`/resume`, `/cast` (text seam into the spellbook — same gates as spoken casts),
+`GET /status`, `/queue` (pending + `source` + per-item outcomes:
+done/canceled/interrupted/error), `/voices`.
 
 ## D-Bus Interface
 

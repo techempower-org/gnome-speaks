@@ -97,6 +97,7 @@ cross-platform API survey — reports in
 Deliberately deferred (filed as follow-up): per-source coalescing keys and a
 `progress`-style drop-intermediate-keep-final class (SSIP's best ideas — real design
 work, separate cycle), id-scoped `/skip` (1/5 precedent).
+**Both landed 2026-08-12 — see "Coalescing + id-scoped skip" below.**
 
 **Overflow policy — explicit decision (post-research):** the queue keeps
 reject-newest (429) rather than drop-oldest. The SSIP thesis ("fresh speech beats
@@ -114,6 +115,52 @@ Also: "Ubuntu looking into it" = **Myna**, Canonical's speech-to-TEXT project
 (17 Jun 2026, Ubuntu 26.10) — relevant to Type mode, not this queue. Spiel is a
 per-app synthesis API with no cross-app arbitration — aligning with it would
 recreate the stomping problem; not a fit.
+
+## Coalescing + id-scoped skip (2026-08-12, issues #4 / #5)
+
+The two deferred items above, implemented. Decisions worth recording:
+
+1. **Coalescing is opt-in and source-scoped.** `POST /speak` takes `source`
+   (string, truncated to 64 chars) and `coalesce: true`; enqueueing drops that
+   source's own **unspoken** items and returns their ids as `coalesced`. It can
+   never touch another caller's speech, which is what makes it safe to use
+   without coordination — unlike `interrupt`, it needs no blast-radius warning.
+2. **The playing item is never coalesced.** Only queued-but-unstarted items are
+   dropped. Killing audio mid-word is `/skip`'s job, and conflating the two
+   would make "post my latest status" occasionally chop a sentence in half.
+3. **`kind: "progress"` is an alias, not a second mechanism.** SSIP's `progress`
+   class drops intermediates but promotes the *last* of a burst so the final
+   "100%" is always heard. Under our strict FIFO that promotion is free:
+   drop-older-same-source always leaves the newest, and the newest is always
+   spoken. Documented as equivalent rather than built twice (YAGNI).
+4. **`coalesce`/`kind` without `source` is a 400.** Consistent with the 429
+   reasoning: give the producer a synchronous, actionable failure instead of
+   silently doing nothing.
+5. **Overflow policy unchanged.** Reject-newest (429) stays. Coalescing is now
+   the recommended fix for backlog pressure — it removes staleness at the root,
+   so the overflow victim question mostly stops arising.
+6. **`/skip` id scoping closes the race properly.** The id check and
+   `cancel_active()` happen together under `_queue_current_lock`; the dispatcher
+   takes that same lock to claim and clear the current item, so a verified item
+   cannot be swapped out from under the cancel. Bodyless `/skip` keeps the old
+   positional behaviour — when a human says "move on", positional is correct.
+
+Concurrency notes: coalescing edits the `queue.Queue`'s underlying deque under
+its `mutex` (the access pattern `GET /queue` already used). Safe because every
+producer uses `put_nowait` (no blocked putter to wake) and `qsize()`/`maxsize`
+read `len(queue)` live, so freed slots are real — verified by a test that fills
+to 32, confirms `Full`, coalesces, and successfully puts again. A new
+`_enqueue_lock` serializes coalesce-then-put so two concurrent same-source
+bursts can't interleave into two survivors. Lock order is always
+`_enqueue_lock → _tts_queue.mutex`.
+
+Validation: `py_compile`, plus 60 assertions in
+`~/.claude/projects/-home-jp/scratch/queue-coalescing/test_queue_logic.py`,
+which AST-extracts the real `enqueue_speech` / `_coalesce_source` /
+`skip_current` / `_handle_speak` / `_handle_skip` / `_handle_queue` bodies from
+the service and execs them against stubs — the service itself can't be imported
+(module-level `gi`/D-Bus/Azure side effects, hyphenated filename). Live curl
+battery run at merge time.
 
 ## Docs Ripple (at ship time)
 
