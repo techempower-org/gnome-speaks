@@ -243,9 +243,13 @@ class SpellExecutor:
         return "done"
 
     def _do_dbus_self(self, action, remainder, spell):
-        self._dbus_self(action["op"])
-        if action.get("reply"):
-            self._speak(action["reply"], spell.get("speak_as"))
+        # Ops may return state-aware text ("Deep thought engaged — …") which
+        # beats the spellbook's static reply — a toggle must SAY which way
+        # it flipped, not just that it flipped.
+        ret = self._dbus_self(action["op"])
+        reply = ret if isinstance(ret, str) and ret else action.get("reply")
+        if reply:
+            self._speak(reply, spell.get("speak_as"))
         return "done"
 
     def _do_http(self, action, remainder, spell):

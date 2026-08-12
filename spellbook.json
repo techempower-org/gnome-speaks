@@ -45,6 +45,12 @@
      "patterns": ["deep thought", "think deeply", "ponder"],
      "action": {"type": "dbus_self", "op": "thinking_toggle", "reply": "Deep thought toggled."},
      "chime": "level_up",
+     "gate": "instant"},
+
+    {"name": "subtitles",
+     "patterns": ["subtitles", "captions", "show the words"],
+     "action": {"type": "dbus_self", "op": "subtitles_toggle"},
+     "chime": "xp_gain",
      "gate": "instant"}
   ]
 }

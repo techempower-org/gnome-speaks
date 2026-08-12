@@ -1423,17 +1423,8 @@ class GnomeSpeaksService:
                 GLib.idle_add(self._emit_transcription_ready, user_text)
                 if (is_loop and not self._stop_event.is_set()
                         and CONFIG.get("continuous_dictation", False)):
-                    # Let the spell's spoken reply play before re-opening the
-                    # mic — the queue never speaks over an open mic, so
-                    # re-listening instantly starves replies forever.
-                    self._set_state("idle")
-                    deadline = time.time() + 20
-                    while time.time() < deadline and not self._stop_event.is_set():
-                        with self._queue_current_lock:
-                            busy = self._queue_current is not None
-                        if not busy and self._tts_queue.empty():
-                            break
-                        time.sleep(0.2)
+                    # Let the spell's spoken reply play before re-opening the mic
+                    self._drain_speech_gap()
                     if self._stop_event.is_set():
                         break
                     self._set_state("listening")
@@ -1452,6 +1443,9 @@ class GnomeSpeaksService:
                 if live_typing and typed_partial[0]:
                     _send_backspaces(len(typed_partial[0]))
                 _log("no speech in loop cycle, continuing")
+                # Quiet cycle = natural gap for starved queue items (agent
+                # messages, spell replies) to play before the mic reopens.
+                self._drain_speech_gap()
                 self._set_state("listening")
                 continue
 
@@ -1502,6 +1496,7 @@ class GnomeSpeaksService:
                 if not CONFIG.get("continuous_dictation", False):
                     _log("continuous_dictation toggled off, exiting loop")
                     break
+                self._drain_speech_gap()
                 # Reset state to "listening" for the next cycle
                 self._set_state("listening")
                 _log(f"cycle {cycle} done, continuing loop")
@@ -1905,17 +1900,40 @@ class GnomeSpeaksService:
             self._save_config_flag("conversation_mode", False)
             self._save_config_flag("terminal_mode", False)
         elif op == "read_notifications_toggle":
-            self._save_config_flag(
-                "read_notifications",
-                not CONFIG.get("read_notifications", False))
+            new = not CONFIG.get("read_notifications", False)
+            self._save_config_flag("read_notifications", new)
+            return "The notification herald is %s." % ("on" if new else "off")
         elif op == "wake_word_toggle":
-            self._save_config_flag("wake_word",
-                                   not CONFIG.get("wake_word", False))
+            new = not CONFIG.get("wake_word", False)
+            self._save_config_flag("wake_word", new)
+            return "The waking watch is %s." % ("on" if new else "off")
         elif op == "thinking_toggle":
-            self._save_config_flag("llm_thinking",
-                                   not CONFIG.get("llm_thinking", False))
+            new = not CONFIG.get("llm_thinking", False)
+            self._save_config_flag("llm_thinking", new)
+            if new:
+                return ("Deep thought engaged — replies will be slow "
+                        "and thorough.")
+            return "Deep thought off — fast replies."
+        elif op == "subtitles_toggle":
+            new = not CONFIG.get("live_subtitles", True)
+            self._save_config_flag("live_subtitles", new)
+            # Dual-write: the extension gates its overlay on GSettings —
+            # keep both layers in sync (see the config dual-write gotcha).
+            schema_dir = os.path.expanduser(
+                "~/.local/share/gnome-shell/extensions/"
+                "gnome-speaks@jphein/schemas")
+            try:
+                subprocess.run(
+                    ["gsettings", "--schemadir", schema_dir,
+                     "set", "org.gnome.shell.extensions.gnome-speaks",
+                     "live-subtitles", "true" if new else "false"],
+                    capture_output=True, timeout=5)
+            except Exception:
+                log.warning("Subtitles gsettings sync failed")
+            return "Subtitles %s." % ("on" if new else "off")
         else:
             raise ValueError(f"unknown dbus_self op: {op}")
+        return None
 
     def _wake_watcher(self):
         """Daemon thread: streams mic audio to the Wyoming wake-word server
@@ -1967,6 +1985,26 @@ class GnomeSpeaksService:
                         proc.wait(timeout=1)
                     except Exception:
                         pass
+
+    def _drain_speech_gap(self, max_seconds=20):
+        """Loop-mode gap: hold the mic closed until queued speech plays out.
+
+        Without this, continuous listening keeps state==listening ~100% of
+        the time and the queue's never-speak-over-an-open-mic rule starves
+        spell replies and agent messages forever. No-op when the queue is
+        empty; bails immediately on stop."""
+        with self._queue_current_lock:
+            busy = self._queue_current is not None
+        if not busy and self._tts_queue.empty():
+            return
+        self._set_state("idle")
+        deadline = time.time() + max_seconds
+        while time.time() < deadline and not self._stop_event.is_set():
+            with self._queue_current_lock:
+                busy = self._queue_current is not None
+            if not busy and self._tts_queue.empty():
+                return
+            time.sleep(0.2)
 
     def _spellbook_stat(self):
         return tuple(os.path.getmtime(p) if os.path.isfile(p) else 0
