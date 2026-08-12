@@ -39,6 +39,12 @@
      "patterns": ["wake word", "waking watch"],
      "action": {"type": "dbus_self", "op": "wake_word_toggle", "reply": "The waking watch is toggled."},
      "chime": "xp_gain",
+     "gate": "instant"},
+
+    {"name": "deep-thought",
+     "patterns": ["deep thought", "think deeply", "ponder"],
+     "action": {"type": "dbus_self", "op": "thinking_toggle", "reply": "Deep thought toggled."},
+     "chime": "level_up",
      "gate": "instant"}
   ]
 }

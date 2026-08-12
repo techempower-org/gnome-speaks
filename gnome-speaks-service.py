@@ -750,7 +750,7 @@ class GnomeSpeaksService:
         # Mode flags
         "conversation_mode", "continuous_dictation", "dictation_mode",
         "terminal_mode", "skip_final_paste", "read_notifications",
-        "wake_word", "wake_word_model",
+        "wake_word", "wake_word_model", "llm_thinking",
         # LLM provider config
         "llm_provider", "llm_model", "llm_api_key", "llm_system_prompt",
         # Chimes
@@ -1898,6 +1898,9 @@ class GnomeSpeaksService:
         elif op == "wake_word_toggle":
             self._save_config_flag("wake_word",
                                    not CONFIG.get("wake_word", False))
+        elif op == "thinking_toggle":
+            self._save_config_flag("llm_thinking",
+                                   not CONFIG.get("llm_thinking", False))
         else:
             raise ValueError(f"unknown dbus_self op: {op}")
 
@@ -2416,6 +2419,16 @@ class GnomeSpeaksService:
             messages = list(history) + [{"role": "user", "content": user_text}]
             cfg = {"api_key": CONFIG.get("llm_api_key", "")}
             cfg.update(self._load_cca_config())
+            if provider == "local":
+                # llm_thinking (config + "cast deep thought") decides whether
+                # a reasoning model may think before answering — off = fast
+                # voice replies, on = slower but deeper. Overrides only the
+                # enable_thinking key; other local_extra_body fields survive.
+                extra = dict(cfg.get("local_extra_body") or {})
+                ctk = dict(extra.get("chat_template_kwargs") or {})
+                ctk["enable_thinking"] = bool(CONFIG.get("llm_thinking", False))
+                extra["chat_template_kwargs"] = ctk
+                cfg["local_extra_body"] = extra
 
             try:
                 token_iter = stream_chat(

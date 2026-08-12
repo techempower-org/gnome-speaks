@@ -172,6 +172,10 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         this._addPasswordRow(aiGroup, 'LLM API Key', 'llm_api_key',
             'API key for the selected LLM provider');
 
+        this._addSwitchRow(aiGroup, 'Deep Thought',
+            'Let local reasoning models think before answering — deeper replies, much slower first word ("cast deep thought" toggles by voice)',
+            'llm_thinking', false);
+
         this._addEntryRow(aiGroup, 'System Prompt', 'llm_system_prompt',
             'You are a helpful voice assistant. Keep responses concise and conversational.',
             'Instructions for the LLM persona');
