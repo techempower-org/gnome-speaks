@@ -313,6 +313,19 @@ overlay examples — their endpoints are site-specific and never live in the rep
 | "cast consult the oracle \<question\>" | ask the realm Oracle; streamed reply |
 | "cast torches \<request\>" | natural-language pass-through to Home Assistant Assist |
 
+### Wake word
+
+With a [Wyoming openwakeword](https://github.com/rhasspy/wyoming-openwakeword)
+server on your LAN, the service can open the mic hands-free. Configure in
+`~/.config/speech-to-cli/config.json`: `wake_word: true`, `wake_word_model`
+(your openwakeword model name — effectively your wake phrase, so keep it out
+of public places), `wyoming_wake_port` (default 10400), plus the same
+`wyoming_host` used by the offline fallback. Armed **only while idle** — never
+during dictation or TTS playback — and a detection behaves exactly like the
+dictation keybinding (chime, current mode applies, "cast …" spells work).
+Toggle by voice with "cast wake word". If the wake server is unreachable the
+watcher backs off quietly and everything else keeps working.
+
 Safety: spells are gated `instant` (read-only/reversible) or `confirm` (the service
 speaks a challenge and requires a spoken "confirm"); a hardcoded executor denylist
 refuses to load any spell touching destructive surfaces (grid transfer, locks,
