@@ -240,13 +240,19 @@
 
 /* Shared geometry: every pill is the same object, only the tint
  * changes. Radius/typography/padding identical across all pills so
- * the row reads as one instrument, not four stickers. */
+ * the row reads as one instrument, not five stickers.
+ *
+ * "Magical" here = lit runes: each active pill carries a faint vertical
+ * gradient (light falling on glass) and a soft outer glow in its own
+ * tint that blooms on hover. St has no keyframes, so the enchantment is
+ * material, not motion — the 200ms transition does the breathing. */
 .gnome-speaks-quality-hd,
 .gnome-speaks-quality-fast,
 .gnome-speaks-mode-dict,
 .gnome-speaks-mode-chat,
 .gnome-speaks-pill-off,
-.gnome-speaks-pill-on {
+.gnome-speaks-pill-on,
+.gnome-speaks-pill-chronicle {
     font-size: 11px;
     font-weight: 700;
     border-radius: 999px;
@@ -261,24 +267,34 @@
 
 /* ── Quality: HD — warm gold, "premium & metered" ── */
 .gnome-speaks-quality-hd {
-    background-color: rgba(255, 190, 40, 0.20);
-    color: rgba(255, 222, 130, 1.0);
-    border: 1px solid rgba(255, 200, 60, 0.4);
+    background-gradient-direction: vertical;
+    background-gradient-start: rgba(255, 208, 74, 0.30);
+    background-gradient-end: rgba(224, 150, 20, 0.16);
+    color: rgba(255, 226, 140, 1.0);
+    border: 1px solid rgba(255, 205, 80, 0.48);
+    box-shadow: 0 0 10px rgba(255, 190, 40, 0.22);
 }
 .gnome-speaks-quality-hd:hover {
-    background-color: rgba(255, 190, 40, 0.34);
-    border: 1px solid rgba(255, 200, 60, 0.6);
+    background-gradient-start: rgba(255, 214, 92, 0.44);
+    background-gradient-end: rgba(230, 158, 26, 0.26);
+    border: 1px solid rgba(255, 214, 100, 0.72);
+    box-shadow: 0 0 16px rgba(255, 196, 50, 0.42);
 }
 
 /* ── Quality: Fast — cool green, "snappy & free-ish" ── */
 .gnome-speaks-quality-fast {
-    background-color: rgba(94, 226, 140, 0.18);
-    color: rgba(150, 245, 185, 1.0);
-    border: 1px solid rgba(94, 226, 140, 0.4);
+    background-gradient-direction: vertical;
+    background-gradient-start: rgba(120, 235, 160, 0.26);
+    background-gradient-end: rgba(52, 180, 105, 0.14);
+    color: rgba(158, 248, 192, 1.0);
+    border: 1px solid rgba(94, 226, 140, 0.46);
+    box-shadow: 0 0 10px rgba(94, 226, 140, 0.20);
 }
 .gnome-speaks-quality-fast:hover {
-    background-color: rgba(94, 226, 140, 0.3);
-    border: 1px solid rgba(94, 226, 140, 0.6);
+    background-gradient-start: rgba(130, 240, 170, 0.38);
+    background-gradient-end: rgba(58, 190, 112, 0.22);
+    border: 1px solid rgba(110, 236, 154, 0.68);
+    box-shadow: 0 0 16px rgba(94, 226, 140, 0.38);
 }
 
 /* ── Mode: Type — muted, the default state of the world ── */
@@ -290,17 +306,23 @@
 .gnome-speaks-mode-dict:hover {
     background-color: rgba(255, 255, 255, 0.12);
     color: rgba(255, 255, 255, 0.75);
+    box-shadow: 0 0 10px rgba(255, 255, 255, 0.10);
 }
 
 /* ── Mode: AI Chat — violet, same accent as the speaking ring ── */
 .gnome-speaks-mode-chat {
-    background-color: rgba(178, 122, 255, 0.22);
-    color: rgba(206, 168, 255, 1.0);
-    border: 1px solid rgba(178, 122, 255, 0.45);
+    background-gradient-direction: vertical;
+    background-gradient-start: rgba(196, 148, 255, 0.32);
+    background-gradient-end: rgba(140, 84, 226, 0.18);
+    color: rgba(212, 176, 255, 1.0);
+    border: 1px solid rgba(184, 132, 255, 0.52);
+    box-shadow: 0 0 10px rgba(178, 122, 255, 0.24);
 }
 .gnome-speaks-mode-chat:hover {
-    background-color: rgba(178, 122, 255, 0.36);
-    border: 1px solid rgba(178, 122, 255, 0.65);
+    background-gradient-start: rgba(204, 160, 255, 0.46);
+    background-gradient-end: rgba(148, 92, 234, 0.28);
+    border: 1px solid rgba(196, 152, 255, 0.75);
+    box-shadow: 0 0 16px rgba(178, 122, 255, 0.44);
 }
 
 /* ── Toggle pills: off = ghost, on = cyan-lit ── */
@@ -312,16 +334,100 @@
 .gnome-speaks-pill-off:hover {
     background-color: rgba(255, 255, 255, 0.12);
     color: rgba(255, 255, 255, 0.65);
+    box-shadow: 0 0 10px rgba(255, 255, 255, 0.10);
 }
 
 .gnome-speaks-pill-on {
-    background-color: rgba(64, 196, 232, 0.2);
-    color: rgba(140, 226, 255, 1.0);
-    border: 1px solid rgba(64, 196, 232, 0.45);
+    background-gradient-direction: vertical;
+    background-gradient-start: rgba(96, 214, 244, 0.28);
+    background-gradient-end: rgba(38, 156, 196, 0.15);
+    color: rgba(150, 230, 255, 1.0);
+    border: 1px solid rgba(80, 205, 240, 0.5);
+    box-shadow: 0 0 10px rgba(64, 196, 232, 0.22);
 }
 .gnome-speaks-pill-on:hover {
-    background-color: rgba(64, 196, 232, 0.34);
-    border: 1px solid rgba(64, 196, 232, 0.65);
+    background-gradient-start: rgba(110, 222, 248, 0.42);
+    background-gradient-end: rgba(44, 166, 206, 0.24);
+    border: 1px solid rgba(100, 214, 245, 0.72);
+    box-shadow: 0 0 16px rgba(64, 196, 232, 0.42);
+}
+
+/* ── The Chronicle rune — parchment-quiet until touched ── */
+.gnome-speaks-pill-chronicle {
+    padding: 3px 8px;
+    background-color: rgba(255, 255, 255, 0.04);
+    color: rgba(255, 255, 255, 0.55);
+    border: 1px solid rgba(255, 220, 150, 0.14);
+}
+.gnome-speaks-pill-chronicle:hover {
+    background-gradient-direction: vertical;
+    background-gradient-start: rgba(255, 216, 130, 0.24);
+    background-gradient-end: rgba(210, 158, 60, 0.12);
+    color: rgba(255, 236, 190, 1.0);
+    border: 1px solid rgba(255, 216, 120, 0.55);
+    box-shadow: 0 0 14px rgba(255, 200, 90, 0.35);
+}
+
+/* ============================================================
+ * THE CHRONICLE SCROLL — the ledger, unfurled off the 📜 rune
+ * ============================================================ */
+
+.gnome-speaks-chronicle-scroll {
+    border-radius: 18px;
+    padding: 10px 8px 8px 8px;
+    min-width: 300px;
+    max-width: 560px;
+    background-gradient-direction: vertical;
+    background-gradient-start: rgba(24, 25, 34, 0.94);
+    background-gradient-end: rgba(14, 15, 22, 0.94);
+    border: 1px solid rgba(255, 216, 130, 0.22);
+    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55);
+}
+
+.gnome-speaks-chronicle-header {
+    font-size: 12px;
+    font-weight: 700;
+    padding: 2px 12px 8px 12px;
+    color: rgba(255, 226, 150, 0.9);
+}
+
+.gnome-speaks-chronicle-line {
+    font-size: 13px;
+    border-radius: 10px;
+    padding: 6px 12px;
+    margin: 1px 2px;
+    transition-duration: 150ms;
+    color: rgba(236, 232, 224, 0.92);
+}
+
+/* Same voice vocabulary as the subtitles: green = you, violet = it */
+.gnome-speaks-chronicle-line-you {
+    color: rgba(178, 236, 196, 0.95);
+}
+.gnome-speaks-chronicle-line-it {
+    color: rgba(214, 190, 250, 0.95);
+}
+
+.gnome-speaks-chronicle-line:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 216, 130, 0.25);
+    padding: 5px 11px;
+}
+
+/* Cast flash — the chosen line flares gold as it is spoken again */
+.gnome-speaks-chronicle-line-cast {
+    background-gradient-direction: vertical;
+    background-gradient-start: rgba(255, 214, 110, 0.38);
+    background-gradient-end: rgba(224, 160, 40, 0.22);
+    color: rgba(255, 240, 200, 1.0);
+    box-shadow: 0 0 18px rgba(255, 200, 90, 0.5);
+}
+
+.gnome-speaks-chronicle-hint {
+    font-size: 10px;
+    padding: 8px 12px 2px 12px;
+    color: rgba(255, 255, 255, 0.38);
+    font-style: italic;
 }
 
 /* ============================================================

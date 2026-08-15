@@ -520,6 +520,13 @@ export default class GnomeSpeaksExtension extends Extension {
         this._badge.add_child(this._continuousPill);
         this._badge.add_child(this._terminalPill);
 
+        // The Chronicle rune — deliberately NOT in this._pills: the mode
+        // pills come and go with activity, but the ledger of what was said
+        // is exactly what you reach for while idle, so it never hides.
+        this._chroniclePill = this._createPill('📜', 'gnome-speaks-pill-chronicle',
+            () => this._toggleChronicleScroll());
+        this._badge.add_child(this._chroniclePill);
+
         this._pills = [this._qualityPill, this._modePill, this._continuousPill, this._terminalPill];
         for (let pill of this._pills)
             pill.hide();
@@ -1083,6 +1090,7 @@ export default class GnomeSpeaksExtension extends Extension {
         this._signals = [];
 
         this._destroyContextMenu();
+        this._destroyChronicleScroll();
 
         if (this._vadDot) {
             this._vadDot.remove_all_transitions();
@@ -1211,11 +1219,20 @@ export default class GnomeSpeaksExtension extends Extension {
 
         // The Chronicle — everything said, newest first; click to respeak.
         this._chronicleSubMenu = new PopupMenu.PopupSubMenuMenuItem('Chronicle');
-        this._chronicleSubMenu.menu.connect('open-state-changed', (_m, open) => {
-            if (open)
+        // PopupSubMenu.open() refuses to open when empty (popupMenu.js:
+        // `if (this.isEmpty()) return;`), so an empty submenu is a dead
+        // row that can never fire open-state-changed to fill itself.
+        // Seed a placeholder so it can always open, and refresh from the
+        // PARENT menu's open — content is ready before the row is clicked.
+        let seedItem = new PopupMenu.PopupMenuItem('Nothing recorded yet');
+        seedItem.setSensitive(false);
+        this._chronicleSubMenu.menu.addMenuItem(seedItem);
+        menu.addMenuItem(this._chronicleSubMenu);
+        let menuOpenId = menu.connect('open-state-changed', (_m, open) => {
+            if (open && !this._destroyed)
                 this._populateChronicleMenu();
         });
-        menu.addMenuItem(this._chronicleSubMenu);
+        this._signals.push({obj: menu, id: menuOpenId});
 
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
@@ -2396,6 +2413,174 @@ export default class GnomeSpeaksExtension extends Extension {
             Main.layoutManager.removeChrome(this._contextMenu);
             this._contextMenu.destroy();
             this._contextMenu = null;
+        }
+    }
+
+    // -- The Chronicle scroll (OSD popup off the 📜 pill) -------------------
+
+    _toggleChronicleScroll() {
+        if (this._chronicleScroll)
+            this._destroyChronicleScroll();
+        else
+            this._showChronicleScroll();
+    }
+
+    _showChronicleScroll() {
+        if (!this._badge || this._destroyed)
+            return;
+        this._destroyContextMenu();
+
+        let scroll = new St.BoxLayout({
+            vertical: true,
+            style_class: 'gnome-speaks-chronicle-scroll',
+            reactive: true,
+        });
+        this._chronicleScroll = scroll;
+
+        let header = new St.Label({
+            text: '📜  The Chronicle',
+            style_class: 'gnome-speaks-chronicle-header',
+        });
+        scroll.add_child(header);
+
+        let addQuietLine = text => {
+            let line = new St.Label({
+                text,
+                style_class: 'gnome-speaks-chronicle-hint',
+            });
+            scroll.add_child(line);
+        };
+
+        if (!this._proxy) {
+            addQuietLine('The voice service is not connected');
+            this._presentChronicleScroll();
+            return;
+        }
+
+        this._proxy.GetChronicleRemote(8, (result, error) => {
+            if (this._destroyed || this._chronicleScroll !== scroll)
+                return;
+
+            let entries = [];
+            if (!error && result) {
+                try {
+                    entries = JSON.parse(result[0]);
+                } catch (e) {
+                    entries = [];
+                }
+            }
+
+            if (entries.length === 0) {
+                addQuietLine(error ? 'The chronicle is unreachable'
+                    : 'Nothing recorded yet — speak, and it will remember');
+                this._presentChronicleScroll();
+                return;
+            }
+
+            entries.reverse();  // newest first
+            for (let entry of entries) {
+                let isYou = entry.kind === 'you';
+                let text = entry.text.replace(/\s+/g, ' ');
+                if (text.length > 64)
+                    text = `${text.substring(0, 64)}…`;
+                let line = new St.Label({
+                    text: `${isYou ? '🗣' : '✨'}  ${text}`,
+                    style_class: `gnome-speaks-chronicle-line gnome-speaks-chronicle-line-${isYou ? 'you' : 'it'}`,
+                    reactive: true,
+                    track_hover: true,
+                });
+                line.connect('button-press-event', () => Clutter.EVENT_STOP);
+                line.connect('button-release-event', (actor, ev) => {
+                    if (ev.get_button() !== 1)
+                        return Clutter.EVENT_PROPAGATE;
+                    this._proxy.RespeakRemote(entry.id, () => {});
+                    // Cast flash: the line lights gold, then the scroll furls.
+                    actor.add_style_class_name('gnome-speaks-chronicle-line-cast');
+                    let closeId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 240, () => {
+                        this._removeTimeout('chronicle-cast-close');
+                        if (!this._destroyed)
+                            this._destroyChronicleScroll();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                    this._trackTimeout(closeId, 'chronicle-cast-close');
+                    return Clutter.EVENT_STOP;
+                });
+                scroll.add_child(line);
+            }
+
+            addQuietLine('a line, spoken again ✦ click to recast');
+            this._presentChronicleScroll();
+        });
+    }
+
+    _presentChronicleScroll() {
+        let scroll = this._chronicleScroll;
+        if (!scroll || this._destroyed || !this._badge)
+            return;
+
+        Main.layoutManager.addTopChrome(scroll);
+
+        let [badgeX, badgeY] = this._badge.get_transformed_position();
+        let badgeWidth = this._badge.get_width();
+
+        // Unfurl: rise + fade once allocated (size unknown until then).
+        scroll.opacity = 0;
+        let posId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            if (!this._chronicleScroll || this._chronicleScroll !== scroll)
+                return GLib.SOURCE_REMOVE;
+
+            let w = scroll.get_width();
+            let h = scroll.get_height();
+            let x = badgeX + (badgeWidth - w) / 2;
+            let y = badgeY - h - 12;
+
+            let monitor = Main.layoutManager.primaryMonitor;
+            if (monitor) {
+                x = Math.max(monitor.x + 8,
+                    Math.min(x, monitor.x + monitor.width - w - 8));
+                if (y < monitor.y + 8)
+                    y = badgeY + this._badge.get_height() + 12;
+            }
+
+            scroll.set_position(Math.round(x), Math.round(y + 8));
+            scroll.ease({
+                opacity: 255,
+                y: Math.round(y),
+                duration: 220,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            });
+            return GLib.SOURCE_REMOVE;
+        });
+        this._trackTimeout(posId);
+
+        this._chronicleGrabId = global.stage.connect('button-press-event', (a, ev) => {
+            if (!this._chronicleScroll)
+                return Clutter.EVENT_PROPAGATE;
+            let [px, py] = ev.get_coords();
+            let [mx, my] = this._chronicleScroll.get_transformed_position();
+            let mw = this._chronicleScroll.get_width();
+            let mh = this._chronicleScroll.get_height();
+            if (px < mx || px > mx + mw || py < my || py > my + mh) {
+                this._destroyChronicleScroll();
+                // Don't swallow: a click on the badge/pill should still land,
+                // so the 📜 pill acts as a true toggle.
+                return Clutter.EVENT_PROPAGATE;
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
+    }
+
+    _destroyChronicleScroll() {
+        if (this._chronicleGrabId) {
+            global.stage.disconnect(this._chronicleGrabId);
+            this._chronicleGrabId = null;
+        }
+        if (this._chronicleScroll) {
+            let scroll = this._chronicleScroll;
+            this._chronicleScroll = null;
+            scroll.remove_all_transitions();
+            Main.layoutManager.removeChrome(scroll);
+            scroll.destroy();
         }
     }
 
