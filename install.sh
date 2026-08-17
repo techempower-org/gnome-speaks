@@ -242,12 +242,17 @@ echo
 # ---- 7. Python dependencies ---------------------------------
 step "Checking Python dependencies"
 
-PIP_DEPS=("requests" "webrtcvad" "websocket-client")
+# Check by IMPORT, not `pip show`: distro packages (python3-requests) and
+# a distro python upgrade that orphans old C extensions both make pip's
+# metadata lie in opposite directions. The import is the ground truth.
+declare -A PIP_IMPORTS=(
+    [requests]="requests" [webrtcvad]="webrtcvad"
+    [websocket-client]="websocket")
 NEED_INSTALL=()
 
-for dep in "${PIP_DEPS[@]}"; do
-    if python3 -m pip show "$dep" &>/dev/null; then
-        success "$dep is installed."
+for dep in "${!PIP_IMPORTS[@]}"; do
+    if python3 -c "import ${PIP_IMPORTS[$dep]}" &>/dev/null; then
+        success "$dep is importable."
     else
         warn "$dep is missing."
         NEED_INSTALL+=("$dep")
@@ -256,9 +261,12 @@ done
 
 if [[ ${#NEED_INSTALL[@]} -gt 0 ]]; then
     info "Installing: ${NEED_INSTALL[*]}"
-    python3 -m pip install --user "${NEED_INSTALL[@]}" && \
+    # PEP 668 (Ubuntu 23.04+) blocks bare pip into the system python;
+    # --break-system-packages scopes to --user, which is safe here.
+    python3 -m pip install --user "${NEED_INSTALL[@]}" 2>/dev/null || \
+        python3 -m pip install --user --break-system-packages "${NEED_INSTALL[@]}" && \
         success "Python dependencies installed." || \
-        warn "pip install failed — you may need to install them manually."
+        warn "pip install failed — try: sudo apt install python3-requests python3-websocket && pip install --user --break-system-packages webrtcvad"
 fi
 echo
 

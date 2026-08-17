@@ -660,8 +660,10 @@ export default class GnomeSpeaksExtension extends Extension {
         });
         Main.uiGroup.add_child(this._vadDot);
 
+        // No affectsInputRegion: GNOME 49+ tracks input regions from
+        // reactive actors automatically and 50 REJECTS the param; on 46-48
+        // it defaulted to true anyway, so omitting it changes nothing.
         Main.layoutManager.addTopChrome(this._badge, {
-            affectsInputRegion: true,
             trackFullscreen: false,
         });
     }
