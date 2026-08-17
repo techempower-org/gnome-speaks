@@ -1,7 +1,7 @@
 {
   "uuid": "gnome-speaks@jphein",
   "name": "GNOME Speaks",
-  "description": "Voice for your desktop \u2014 dictation, AI conversation, spellbook commands, wake word, and offline fallback",
+  "description": "Voice for your desktop \u2014 dictation, AI conversation, spellbook commands, wake word, and offline fallback. Requires the companion gnome-speaks service (audio/STT/TTS run outside the shell): setup at https://github.com/techempower-org/gnome-speaks",
   "shell-version": [
     "46",
     "47",

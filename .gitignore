@@ -5,3 +5,4 @@ schemas/gschemas.compiled
 .claude/
 build/
 builddir/
+dist/

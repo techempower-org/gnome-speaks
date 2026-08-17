@@ -189,7 +189,7 @@ export default class GnomeSpeaksExtension extends Extension {
         try {
             this._enable();
         } catch (e) {
-            log(`[GNOME Speaks] enable() failed: ${e.message}\n${e.stack}`);
+            console.error(`[GNOME Speaks] enable() failed: ${e.message}\n${e.stack}`);
         }
     }
 
@@ -268,7 +268,7 @@ export default class GnomeSpeaksExtension extends Extension {
         try {
             this._disable();
         } catch (e) {
-            log(`[GNOME Speaks] disable() failed: ${e.message}\n${e.stack}`);
+            console.error(`[GNOME Speaks] disable() failed: ${e.message}\n${e.stack}`);
         }
     }
 
@@ -316,7 +316,7 @@ export default class GnomeSpeaksExtension extends Extension {
                 'org.gnome.Speaks.Desktop',
                 Gio.BusNameOwnerFlags.NONE, null, null);
         } catch (e) {
-            log(`[GNOME Speaks] Desktop D-Bus export failed: ${e.message}`);
+            console.warn(`[GNOME Speaks] Desktop D-Bus export failed: ${e.message}`);
             this._desktopDbus = null;
             this._desktopNameId = 0;
         }
@@ -1472,7 +1472,7 @@ export default class GnomeSpeaksExtension extends Extension {
                     this._proxyPending = false;
                     if (this._destroyed) return;
                     if (error) {
-                        log(`[GNOME Speaks] DBus proxy creation failed: ${error.message}`);
+                        console.warn(`[GNOME Speaks] DBus proxy creation failed: ${error.message}`);
                         this._proxy = null;
                         this._proxyReady = false;
                         return;
@@ -1484,7 +1484,7 @@ export default class GnomeSpeaksExtension extends Extension {
                 }
             );
         } catch (e) {
-            log(`[GNOME Speaks] Failed to create DBus proxy: ${e.message}`);
+            console.warn(`[GNOME Speaks] Failed to create DBus proxy: ${e.message}`);
             this._proxyPending = false;
             this._proxy = null;
             this._proxyReady = false;
@@ -1569,7 +1569,7 @@ export default class GnomeSpeaksExtension extends Extension {
         this._proxy.GetStateRemote((result, error) => {
             if (this._destroyed || !this._proxy) return;
             if (error) {
-                log(`[GNOME Speaks] GetState failed: ${error.message}`);
+                console.debug(`[GNOME Speaks] GetState failed: ${error.message}`);
                 return;
             }
             if (result && result[0])
@@ -1907,14 +1907,14 @@ export default class GnomeSpeaksExtension extends Extension {
 
         let remoteName = `${methodName}Remote`;
         if (typeof this._proxy[remoteName] !== 'function') {
-            log(`[GNOME Speaks] Unknown method: ${methodName}`);
+            console.warn(`[GNOME Speaks] Unknown method: ${methodName}`);
             return;
         }
 
         let callback = (result, error) => {
             if (this._destroyed) return;
             if (error) {
-                log(`[GNOME Speaks] ${methodName} failed: ${error.message}`);
+                console.debug(`[GNOME Speaks] ${methodName} failed: ${error.message}`);
                 this._showError(`${methodName} failed`);
             }
         };
@@ -2107,7 +2107,7 @@ export default class GnomeSpeaksExtension extends Extension {
     }
 
     _showError(message) {
-        log(`[GNOME Speaks] Error: ${message}`);
+        console.warn(`[GNOME Speaks] Error: ${message}`);
 
         if (this._destroyed || !this._badge)
             return;
@@ -2596,7 +2596,11 @@ export default class GnomeSpeaksExtension extends Extension {
     _cancelTimeout(name) {
         let idx = this._timeouts.findIndex(t => t.name === name);
         if (idx >= 0) {
-            try { GLib.Source.remove(this._timeouts[idx].id); } catch (e) { /* already fired */ }
+            // One-shot sources that already fired are gone from the main
+            // context; removing them again logs a GLib-CRITICAL (it does
+            // NOT throw, so try/catch can't silence it). Probe first.
+            if (GLib.MainContext.default().find_source_by_id(this._timeouts[idx].id))
+                GLib.Source.remove(this._timeouts[idx].id);
             this._timeouts.splice(idx, 1);
         }
     }
@@ -2609,11 +2613,10 @@ export default class GnomeSpeaksExtension extends Extension {
 
     _cancelAllTimeouts() {
         for (let t of this._timeouts) {
-            try {
+            // Same probe as _cancelTimeout: fired one-shots are already
+            // gone and a blind remove logs a GLib-CRITICAL at disable.
+            if (GLib.MainContext.default().find_source_by_id(t.id))
                 GLib.Source.remove(t.id);
-            } catch (e) {
-                // Source already removed
-            }
         }
         this._timeouts = [];
     }
