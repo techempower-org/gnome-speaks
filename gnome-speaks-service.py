@@ -777,8 +777,10 @@ class GnomeSpeaksService:
         # STT mode selection (auto, streaming, whisper, vad, fixed)
         self._stt_mode = "auto"
 
-        # Inactivity timer
+        # Inactivity timer (touched from every worker thread via _set_state)
         self._inactivity_source_id = None
+        self._inactivity_lock = threading.Lock()
+        self._inactivity_gen = 0
         self._main_loop = None
 
         # DBus connection (set after registration)
@@ -1073,22 +1075,41 @@ class GnomeSpeaksService:
     # -- Inactivity timer --------------------------------------------------
 
     def _reset_inactivity_timer(self):
-        if self._inactivity_source_id is not None:
-            GLib.source_remove(self._inactivity_source_id)
-            self._inactivity_source_id = None
-        if INACTIVITY_TIMEOUT_SEC <= 0:
-            return
-        self._inactivity_source_id = GLib.timeout_add_seconds(
-            INACTIVITY_TIMEOUT_SEC, self._on_inactivity_timeout,
-        )
+        """Restart the idle-exit timer. Called from every _set_state, i.e.
+        from worker threads that transition state concurrently.
 
-    def _on_inactivity_timeout(self):
+        Serialized: read-remove-add on _inactivity_source_id used to race,
+        and two threads landing on the same id both removed it (GLib
+        "Source ID N was not found") and then both stored theirs — orphaning
+        a live 10-minute timer per collision. Each orphan later fires, and
+        a fire that finds the service idle quits the main loop, so the
+        service exits while it is still in use. Measured: 1144 orphaned
+        timers from 3s of two-thread state churn.
+        """
+        with self._inactivity_lock:
+            if self._inactivity_source_id is not None:
+                GLib.source_remove(self._inactivity_source_id)
+                self._inactivity_source_id = None
+            if INACTIVITY_TIMEOUT_SEC <= 0:
+                return
+            self._inactivity_gen += 1
+            self._inactivity_source_id = GLib.timeout_add_seconds(
+                INACTIVITY_TIMEOUT_SEC, self._on_inactivity_timeout,
+                self._inactivity_gen,
+            )
+
+    def _on_inactivity_timeout(self, gen):
+        with self._inactivity_lock:
+            if gen != self._inactivity_gen:
+                # Superseded while we sat in the main-loop dispatch queue:
+                # not ours to act on, and must not clobber the live handle.
+                return False
+            self._inactivity_source_id = None  # one-shot; already spent
         if self.current_state == "idle":
             log.info("Inactivity timeout reached, quitting.")
             if self._main_loop is not None:
                 self._main_loop.quit()
             return False
-        self._inactivity_source_id = None
         self._reset_inactivity_timer()
         return False
 
