@@ -247,7 +247,8 @@ step "Checking Python dependencies"
 # metadata lie in opposite directions. The import is the ground truth.
 declare -A PIP_IMPORTS=(
     [requests]="requests" [webrtcvad]="webrtcvad"
-    [websocket-client]="websocket")
+    [websocket-client]="websocket"
+    [numpy]="numpy")  # optional in audio.py but its absence is a silent slow path
 NEED_INSTALL=()
 
 for dep in "${!PIP_IMPORTS[@]}"; do
