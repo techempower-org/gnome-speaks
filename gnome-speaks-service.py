@@ -808,7 +808,14 @@ class GnomeSpeaksService:
         self._tts_queue_seq = itertools.count(1)  # next() is atomic in CPython
         self._queue_current = None                # TTSQueueItem now playing
         self._queue_current_lock = threading.Lock()
+        # Refcounted, NOT a plain flag: user-speech paths overlap (a second
+        # Speak preempting the first, a spell's Talk during an AI reply), and
+        # a boolean would let the first one to finish unhold the queue while
+        # the other is still playing. The Event is the dispatcher's cheap
+        # read; _user_speech_depth is the truth. See _hold_user_speech.
         self._user_speech_active = threading.Event()
+        self._user_speech_depth = 0
+        self._user_speech_lock = threading.Lock()
         # Playback ownership token: each playback claims a fresh object();
         # a preempted worker's cleanup must not reset state it no longer owns.
         self._speak_token = None
@@ -1777,6 +1784,26 @@ class GnomeSpeaksService:
                              cleared, ids)
                 return cleared
 
+    def _hold_user_speech(self):
+        """Claim the agent-queue hold for one user-speech path (refcounted).
+
+        Every claim must be matched by exactly one _release_user_speech, or
+        the queue stays silent forever / starts narrating too early.
+        """
+        with self._user_speech_lock:
+            self._user_speech_depth += 1
+            self._user_speech_active.set()
+
+    def _release_user_speech(self):
+        """Drop one claim; the hold lifts only when the last one is gone."""
+        with self._user_speech_lock:
+            if self._user_speech_depth > 0:
+                self._user_speech_depth -= 1
+            else:
+                log.warning("User-speech hold released more often than held")
+            if self._user_speech_depth == 0:
+                self._user_speech_active.clear()
+
     def _queue_hold_reason(self):
         """Why the dispatcher must not start an item right now (or None).
 
@@ -1875,8 +1902,8 @@ class GnomeSpeaksService:
             return False
 
         # Hold the queue dispatcher before preempting (user outranks agents).
-        # The worker's finally clears this; early exits must clear it here.
-        self._user_speech_active.set()
+        # The worker's finally releases this; early exits must release here.
+        self._hold_user_speech()
 
         # Stop outside lock to prevent deadlock (stop() acquires multiple locks)
         # drain_queue=False: user preemption drops only the current utterance,
@@ -1886,7 +1913,7 @@ class GnomeSpeaksService:
 
         if not CONFIG.get("key"):
             GLib.idle_add(self._emit_error, "Azure Speech key not configured")
-            self._user_speech_active.clear()
+            self._release_user_speech()
             return False
 
         with self._speak_lock:
@@ -1900,7 +1927,14 @@ class GnomeSpeaksService:
                 kwargs={"owner_token": token},
                 daemon=True,
             )
-            self._speak_thread.start()
+            try:
+                self._speak_thread.start()
+            except Exception:
+                # Nobody else will run the worker's finally — releasing the
+                # hold here is the difference between a failed utterance and
+                # a permanently silent speech queue.
+                self._release_user_speech()
+                raise
             return True
 
     def _tts_level_cb(self, level):
@@ -2024,7 +2058,7 @@ class GnomeSpeaksService:
                 self._set_state("idle")
             _schedule_warmup()
             if user_initiated:
-                self._user_speech_active.clear()
+                self._release_user_speech()
 
             # Hands-free loop: after TTS finishes in conversation mode,
             # automatically restart listening if continuous_dictation is enabled.
@@ -2303,7 +2337,7 @@ class GnomeSpeaksService:
 
         # Talk blocks until the exchange completes, so one try/finally holds
         # the speech queue for the whole call (user outranks agents).
-        self._user_speech_active.set()
+        self._hold_user_speech()
         try:
             with self._talk_lock:
                 if self.current_state not in ("idle",):
@@ -2334,7 +2368,7 @@ class GnomeSpeaksService:
                 done_event.wait()
                 return result_holder["reply"]
         finally:
-            self._user_speech_active.clear()
+            self._release_user_speech()
 
     def _talk_worker(self, text, result_holder, done_event):
         """Background thread: full-duplex TTS+STT via speech_tts.talk_fullduplex()."""
@@ -2714,7 +2748,7 @@ class GnomeSpeaksService:
         """
         # AI replies are user-initiated speech: hold the agent speech queue
         # for the whole turn (LLM streaming + sentence TTS).
-        self._user_speech_active.set()
+        self._hold_user_speech()
         try:
             provider = CONFIG.get("llm_provider", "anthropic")
             model = CONFIG.get("llm_model", "claude-opus-4.6")
@@ -2909,7 +2943,7 @@ class GnomeSpeaksService:
                     else False
                 ))
         finally:
-            self._user_speech_active.clear()
+            self._release_user_speech()
 
     # -- Conversation worker ------------------------------------------------
 
