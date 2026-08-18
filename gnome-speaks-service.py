@@ -3712,17 +3712,27 @@ class DBusHandler:
                 result = self.service.current_state
                 invocation.return_value(GLib.Variant("(s)", (result,)))
 
+            # Both of these touch the ledger, so they go to the pool like
+            # every other blocking method. A tail-read is fast, but the cases
+            # it cannot short — a filtered search that matches nothing, a
+            # cold-cache read off a spun-down disk — would still stall
+            # StateChanged/SubtitleUpdate/AudioLevel for their whole duration.
+            # extension.js calls both through the async proxy
+            # (GetChronicleRemote/RespeakRemote), so a reply that arrives a
+            # beat later is invisible to it.
             elif method_name == "GetChronicle":
                 limit = parameters.unpack()[0]
-                entries = _chronicle_read(limit=limit if limit > 0 else 20)
-                invocation.return_value(
-                    GLib.Variant("(s)", (json.dumps(entries),)))
+                self._run_async(
+                    invocation, "(s)",
+                    lambda n: json.dumps(_chronicle_read(limit=n)),
+                    limit if limit > 0 else 20)
 
             elif method_name == "Respeak":
                 entry_id = parameters.unpack()[0]
-                entry = self.service.respeak(entry_id or None)
-                invocation.return_value(
-                    GLib.Variant("(b)", (entry is not None,)))
+                self._run_async(
+                    invocation, "(b)",
+                    lambda i: self.service.respeak(i) is not None,
+                    entry_id or None)
 
             else:
                 invocation.return_dbus_error(
