@@ -198,7 +198,7 @@ footer {
 
 <section class="wrap" id="features">
   <h2><span class="numeral">I.</span>What it does</h2>
-  <p class="sub">One floating badge, six ways to talk to your machine. The GNOME Shell extension handles only UI — audio, speech, and network live in a background service on the session bus.</p>
+  <p class="sub">One floating badge, seven ways to talk to your machine. The GNOME Shell extension handles only UI — audio, speech, and network live in a background service on the session bus.</p>
   <div class="grid">
     <div class="card">
       <div class="glyph">⌨️</div>
@@ -230,12 +230,17 @@ footer {
       <h3>A queue, not a shouting match</h3>
       <p>The local HTTP API serializes speech FIFO with per-utterance voices and outcome reporting — scripts and agents never cut each other off, and you always preempt.</p>
     </div>
+    <div class="card">
+      <div class="glyph">📜</div>
+      <h3>The Chronicle</h3>
+      <p>Speech is the one interface with no scrollback. Every line — yours and its — lands in a local ledger; unfurl the scroll from the badge and click any line to hear it again, or just say <code>cast echo</code>.</p>
+    </div>
   </div>
 </section>
 
 <section class="wrap" id="quickstart">
   <h2><span class="numeral">II.</span>Quickstart</h2>
-  <p class="sub">GNOME Shell 46–48. Azure Speech key required for cloud voices; the sibling <a href="https://github.com/techempower-org/speech-to-cli">speech-to-cli</a> engine provides audio and STT/TTS.</p>
+  <p class="sub">GNOME Shell 46–50, Ubuntu 26.04 LTS included. Azure Speech key required for cloud voices; the sibling <a href="https://github.com/techempower-org/speech-to-cli">speech-to-cli</a> engine provides audio and STT/TTS.</p>
   <pre class="block"><span class="c"># clone the extension and its engine side by side</span>
 git clone https://github.com/techempower-org/gnome-speaks
 git clone https://github.com/techempower-org/speech-to-cli
@@ -271,7 +276,7 @@ curl -X POST localhost:7710/speak -H 'Content-Type: application/json' \
   <div class="wrap footcols">
     <div>
       <h4>GNOME Speaks</h4>
-      <p>GPL-3.0-or-later.<br>Built for GNOME Shell 46–48.</p>
+      <p>GPL-3.0-or-later.<br>Built for GNOME Shell 46–50.</p>
     </div>
     <div>
       <h4>Ecosystem</h4>

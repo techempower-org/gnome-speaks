@@ -1,7 +1,7 @@
 <!-- claude-md-version: c2e0cdd | updated: 2026-03-22 -->
 # CLAUDE.md — gnome-speaks
 
-GNOME Shell extension (v46-48) for desktop voice interaction: STT, TTS, and AI conversation via Azure Speech Services.
+GNOME Shell extension (v46-50) for desktop voice interaction: STT, TTS, and AI conversation via Azure Speech Services.
 
 ## Architecture
 
@@ -9,18 +9,20 @@ Two-process design connected by session D-Bus (`org.gnome.Speaks`):
 
 | File | Runtime | Role | Lines |
 |------|---------|------|-------|
-| `extension.js` | GNOME Shell (GJS) | UI: badge, panel indicator, subtitle overlay, keybindings, drag | ~1,800 |
-| `gnome-speaks-service.py` | systemd user service (Python) | Audio, STT, TTS, speech queue, LLM, typing, clipboard, wake watcher | ~3,400 |
-| `spellbook.py` | imported by the service | Incantation matcher + executor ("cast …" → local actions); denylist | ~450 |
-| `spellbook.json` | data | Repo spells (self-control); user overlay at `~/.config/speech-to-cli/spellbook.json` merges + hot-reloads | — |
-| `prefs.js` | GNOME Extensions app (GJS/Gtk4) | 10-page preferences window (incl. Spellcraft) | ~1,750 |
-| `stylesheet.css` | GNOME Shell | Badge states, animations, subtitle overlay | ~350 |
+| `extension.js` | GNOME Shell (GJS) | UI: badge + pills + 📜 rune, panel indicator, subtitle overlay, chronicle scroll, keybindings, drag | ~2,620 |
+| `gnome-speaks-service.py` | systemd user service (Python) | Audio, STT, TTS, speech queue, chronicle, LLM, typing, clipboard, wake watcher | ~3,720 |
+| `spellbook.py` | imported by the service | Incantation matcher + executor ("cast …" → local actions); denylist | ~390 |
+| `spellbook.json` | data | 12 repo spells (self-control); user overlay at `~/.config/speech-to-cli/spellbook.json` merges + hot-reloads | — |
+| `spiel_provider.py` | imported by the service | Spiel/libspiel synthesis side (`org.gnome.Speaks.Speech.Provider`); off unless `spiel_provider` | ~120 |
+| `prefs.js` | GNOME Extensions app (GJS/Gtk4) | 6-page preferences window (task-first redesign, #5e49049) | ~1,540 |
+| `stylesheet.css` | GNOME Shell | Badge states, pills, animations, subtitle overlay, chronicle scroll | ~560 |
 
 The extension touches **no** network or audio -- all I/O is in the Python service.
 Spoken output serializes through a FIFO **speech queue** (HTTP callers never stomp
 each other; user speech preempts). Transcripts hit the **spellbook** before mode
-routing. A **wake watcher** thread streams mic audio to a LAN Wyoming
-openwakeword server while idle.
+routing. Everything said in either direction appends to the **chronicle**
+(`$XDG_STATE_HOME/gnome-speaks/chronicle.jsonl`) and is respeakable. A **wake
+watcher** thread streams mic audio to a LAN Wyoming openwakeword server while idle.
 
 ## External Dependencies
 
@@ -49,6 +51,10 @@ systemctl --user restart gnome-speaks.service
 
 No separate build step -- files are plain JS and Python (no transpilation, no bundling).
 
+`./pack.sh` builds the extensions.gnome.org submission zip via the official
+`gnome-extensions pack` into `dist/` (gitignored). Extension only -- the service
+is not a shell component and never ships in that zip.
+
 ## Service Management
 
 ```bash
@@ -62,14 +68,18 @@ flushes; `source` + `coalesce`/`kind:"progress"` drops that source's own
 unspoken backlog so agents never narrate stale status), `/skip` (optional
 `{"id":N}` scopes it to that item), `/stop` (drains queue), `/pause`,
 `/resume`, `/cast` (text seam into the spellbook — same gates as spoken casts),
-`GET /status`, `/queue` (pending + `source` + per-item outcomes:
-done/canceled/interrupted/error), `/voices`.
+`/respeak` (`{"id":N}`; omit id = last spoken line), `GET /status`, `/queue`
+(pending + `source` + per-item outcomes: done/canceled/interrupted/error),
+`/voices`, `/chronicle` (`?limit&q&kind=you|spoken`, oldest-first),
+`/api/version` (realm-sigil contract).
 
 ## D-Bus Interface
 
 Bus name: `org.gnome.Speaks` | Path: `/org/gnome/Speaks`
 
-Key methods: `StartListening`, `StopListening`, `Speak(text)`, `SpeakClipboard`, `SpeakSelection`, `Talk(text)`, `Stop`, `GetState`
+Key methods: `StartListening`, `StopListening`, `Speak(text)`, `SpeakClipboard`, `SpeakSelection`, `Talk(text)`, `Stop`, `GetState`, `GetChronicle(limit)` (`limit<=0` → 20), `Respeak(id)` (`0` → last spoken)
+
+Second bus name when `spiel_provider` is enabled: `org.gnome.Speaks.Speech.Provider` (`org.freedesktop.Speech.Provider`, see `spiel_provider.py`).
 
 Signals: `StateChanged`, `TranscriptionReady`, `PartialTranscription`, `SubtitleUpdate`, `AudioLevel`, `Error`
 
@@ -97,12 +107,13 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 | Half/Full Duplex | Auto-detected speaker vs headphone routing |
 | Wake word | Idle-only mic stream to LAN openwakeword; detection = dictation hotkey. Toggle: "cast wake word" |
 | Spellbook | "cast …"/"invoke …" transcripts run local spells (never typed/LLM'd); `POST /cast` is the text seam |
+| Chronicle | Not a mode -- always-on ledger of both directions; 📜 badge rune (8 lines) + panel submenu (12), click to respeak. Spells: "cast echo" / "chronicle" / "seal the chronicle" |
 
 ## Coding Conventions
 
 - **extension.js**: GJS with GNOME Shell imports (St, Clutter, Meta, Shell). No ES modules from npm -- pure GObject Introspection. Prefix private methods with `_`.
 - **gnome-speaks-service.py**: GLib main loop + threading for blocking audio/network ops. `GLib.idle_add()` to marshal D-Bus signal emissions back to the main thread. Logs to stderr via `logging`.
-- **prefs.js**: Adw (libadwaita) preferences pages. Config changes written to `~/.config/speech-to-cli/config.json` with debounced saves.
+- **prefs.js**: Adw (libadwaita) preferences pages. Config changes written to `~/.config/speech-to-cli/config.json` with debounced, **merge-on-write** saves (#16): re-read the file and apply only the dirty/deleted keys, because the service writes the same file (spells, quality toggle) and dumping a stale full object would erase its changes. Track edits through `_setConfigValue`/`_deleteConfigKey` so they land in `_dirtyKeys`/`_deletedKeys` -- mutating `this._config` directly means the change is silently dropped at save time.
 - **stylesheet.css**: GNOME Shell CSS (subset of CSS3). No SCSS or preprocessors.
 
 ## Key Gotchas
@@ -114,11 +125,18 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 - **Schema compilation**: After editing the `.gschema.xml`, must run `glib-compile-schemas` on the install directory.
 - **Disposed notification sources**: During shell init/restart, `MessageTray` `source-added` can fire with already-disposed `FdoNotificationDaemonSource` objects. Any signal connection on them crashes the shell. Always wrap `source.connect()` in try-catch and listen for `source-removed` to drop references before GC disposes them.
 - **Azure content filter**: Avoid `[SYSTEM:]` prefix in system prompts -- Azure GPT content filter blocks it.
-- **speech-to-cli `load_config()` whitelists keys**: unknown config.json keys are silently dropped. Adding a config key means adding it to the whitelist in `state.py` too, or the feature reads a default forever.
+- **speech-to-cli `load_config()` whitelists keys**: unknown config.json keys are silently dropped. Adding a config key means adding it to the whitelist in `state.py` too, or the feature reads a default forever. Scope: this only binds keys the **Python** side reads -- keys consumed only by extension.js (`subtitles_user`, `subtitles_tts`) bypass it entirely, since GJS parses config.json raw. Don't "fix" their absence from `state.py`, and don't assume a working extension key means the Python side can see it.
 - **`Shell.Eval` is dead** (returns `(false,'')`; Introspect/Screenshot are AccessDenied) -- `_get_focused_app()` is silently a no-op (#7). Desktop actuation needs D-Bus methods exported from extension.js.
 - **Public repo**: LAN hostnames/IPs, the HA domain, and the wake-word model name (it's the wake phrase) never enter git -- they live in `~/.config/speech-to-cli/config.json` and the user spellbook overlay. Scan patch history before pushing.
 - **systemctl scope trap**: this file prescribes `systemctl --user` for the voice service — but `systemctl --user is-active <system-unit>` answers `inactive` with **exit 0** for units that live in the system scope (e.g. litrpg-engine on this machine). A confidently wrong answer; check the scope before believing "inactive", and never build a health check or spell on the --user reading of a system unit.
 - **Speech-queue state ownership**: `_speak_token` fences playback cleanup -- a preempted worker must not reset state it no longer owns. Keep the token claims when adding new speech paths.
+- **`--nested` is gone on GNOME 50**: the nested-shell test harness is now `dbus-run-session -- gnome-shell --headless --virtual-monitor 1280x720`. Any doc, script, or muscle memory reaching for `--nested` fails on 50+.
+- **`addTopChrome` and `affectsInputRegion`**: GNOME 49+ tracks input regions from reactive actors automatically and **rejects** the param. It defaulted to `true` on 46-48, so omitting it is behavior-identical everywhere -- never re-add it.
+- **St renders only ONE box-shadow**: comma-separated shadow lists log `Ignoring excess values` per rule and the extra layers never draw. Keep one shadow per rule and get depth from gradients instead.
+- **`log()` is deprecated in GJS**: use `console.log/warn/error/debug`. Service-absent paths should log at `debug` so a solo-extension install (EGO users with no service) stays quiet.
+- **`PopupSubMenu.open()` refuses an EMPTY submenu** (`popupMenu.js` guards on `isEmpty()`): populating a submenu from its own `open-state-changed` deadlocks -- the event never fires, the row is dead. Seed a placeholder at build time and refresh from the PARENT menu's open instead (the Chronicle submenu bug, cff6745).
+- **Subtitles are conversation-mode only**: both user-voice subtitle paths early-return on `!this._conversationMode` (in dictation the text is already at the cursor). `subtitles_user` / `subtitles_tts` gate the two directions independently *on top of* the `live_subtitles` master; `live_subtitles` is dual-written to GSettings `live-subtitles` because the overlay gates on the GSettings layer.
+- **Orca's Spiel switch moved**: `orca.settings.speechSystemOverride` **no longer exists** in Orca 50 -- an `orca-customizations.py` setting it does nothing silently. Use the relocatable GSettings schema: `gsettings set "org.gnome.Orca.Speech:/org/gnome/orca/default/speech/" speech-server-factory spiel` (values: `speechdispatcherfactory` | `spiel`; the `:path` suffix is mandatory). libspiel is still unpackaged on Ubuntu 26.04 -- source build + `~/.config/environment.d/` typelib path.
 
 ## Testing
 
@@ -127,6 +145,9 @@ No test suite. Validate changes by:
 2. Checking logs (`journalctl --user -u gnome-speaks.service -f`)
 3. Testing via D-Bus (`dbus-send`) or keyboard shortcuts
 4. Python syntax check: `python3 -c "import py_compile; py_compile.compile('gnome-speaks-service.py', doraise=True)"`
+5. Shell-side changes: headless session (`--nested` is dead on 50, see gotchas) --
+   `dbus-run-session -- gnome-shell --headless --virtual-monitor 1280x720`, then
+   enable/disable/re-enable and require **zero** JS errors, shell CRITICALs, and St warnings.
 
 ## Git
 
