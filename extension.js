@@ -9,6 +9,7 @@
 
 import GLib from 'gi://GLib';
 import St from 'gi://St';
+import Atk from 'gi://Atk';
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -182,24 +183,30 @@ const STATE_CONFIG = {
         label: '',
         styleClass: 'gnome-speaks-idle',
         showLabel: false,
+        // What a screen reader says instead of the icon. The badge's own
+        // label is empty while idle, so without this it announces nothing.
+        accessibleName: 'GNOME Speaks — idle, activate to start listening',
     },
     [States.LISTENING]: {
         iconName: 'audio-input-microphone-symbolic',
         label: 'Listening...',
         styleClass: 'gnome-speaks-listening',
         showLabel: true,
+        accessibleName: 'GNOME Speaks — listening, activate to stop',
     },
     [States.PROCESSING]: {
         iconName: 'process-working-symbolic',
         label: 'Processing...',
         styleClass: 'gnome-speaks-processing',
         showLabel: true,
+        accessibleName: 'GNOME Speaks — processing, activate to cancel',
     },
     [States.SPEAKING]: {
         iconName: 'audio-speakers-symbolic',
         label: 'Speaking...',
         styleClass: 'gnome-speaks-speaking',
         showLabel: true,
+        accessibleName: 'GNOME Speaks — speaking, activate to stop',
     },
 };
 
@@ -249,6 +256,13 @@ export default class GnomeSpeaksExtension extends Extension {
         this._wordHighlights = [];
         this._pendingPartialMarkup = null;
         this._lastVadTime = 0;
+        // Focus bookkeeping for the popups: the rows we can walk with the
+        // arrows, and the actor that gets focus back when they close.
+        this._chronicleLines = [];
+        this._chronicleFocusReturn = null;
+        this._contextMenuItems = [];
+        this._contextFocusReturn = null;
+        this._ctrlAltTabRegistered = false;
         this._settings = this.getSettings();
 
         // Restore persisted badge position
@@ -524,6 +538,8 @@ export default class GnomeSpeaksExtension extends Extension {
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.CENTER,
             ...boxOrientation(false),
+            accessible_role: Atk.Role.PUSH_BUTTON,
+            accessible_name: STATE_CONFIG[States.IDLE].accessibleName,
         });
 
         this._badge.add_child(this._icon);
@@ -534,10 +550,14 @@ export default class GnomeSpeaksExtension extends Extension {
         this._continuousMode = false;
         this._terminalMode = false;
 
-        this._qualityPill = this._createPill('✦', 'gnome-speaks-quality-hd', () => this._toggleVoiceQuality());
-        this._modePill = this._createPill('✏️', 'gnome-speaks-mode-dict', () => this._toggleMode());
-        this._continuousPill = this._createPill('🔄', 'gnome-speaks-pill-off', () => this._toggleContinuous());
-        this._terminalPill = this._createPill('>', 'gnome-speaks-pill-off', () => this._toggleTerminal());
+        this._qualityPill = this._createPill('✦', 'gnome-speaks-quality-hd',
+            'Voice quality', () => this._toggleVoiceQuality());
+        this._modePill = this._createPill('✏️', 'gnome-speaks-mode-dict',
+            'Speech mode', () => this._toggleMode());
+        this._continuousPill = this._createPill('🔄', 'gnome-speaks-pill-off',
+            'Continuous dictation', () => this._toggleContinuous());
+        this._terminalPill = this._createPill('>', 'gnome-speaks-pill-off',
+            'Terminal mode', () => this._toggleTerminal());
 
         this._badge.add_child(this._qualityPill);
         this._badge.add_child(this._modePill);
@@ -548,7 +568,8 @@ export default class GnomeSpeaksExtension extends Extension {
         // pills come and go with activity, but the ledger of what was said
         // is exactly what you reach for while idle, so it never hides.
         this._chroniclePill = this._createPill('📜', 'gnome-speaks-pill-chronicle',
-            () => this._toggleChronicleScroll());
+            'The Chronicle — recent speech',
+            fromKeyboard => this._toggleChronicleScroll(fromKeyboard));
         this._badge.add_child(this._chroniclePill);
 
         this._pills = [this._qualityPill, this._modePill, this._continuousPill, this._terminalPill];
@@ -560,7 +581,7 @@ export default class GnomeSpeaksExtension extends Extension {
         let pressId = this._badge.connect('button-press-event', (actor, event) => {
             let button = event.get_button();
             if (button === 3) {
-                this._showContextMenu(event);
+                this._showContextMenu();
                 return Clutter.EVENT_STOP;
             }
             if (button === 1) {
@@ -621,6 +642,40 @@ export default class GnomeSpeaksExtension extends Extension {
             return Clutter.EVENT_STOP;
         });
         this._signals.push({obj: this._badge, id: releaseId});
+
+        let keyId = this._badge.connect('key-press-event', (actor, event) => {
+            let symbol = event.get_key_symbol();
+
+            // Escape furls whatever is open, from anywhere in the badge —
+            // including while a pill holds focus, which is exactly where a
+            // keyboard user is standing when they open the Chronicle.
+            if (symbol === Clutter.KEY_Escape) {
+                if (this._chronicleScroll || this._contextMenu) {
+                    this._destroyChronicleScroll();
+                    this._destroyContextMenu();
+                    return Clutter.EVENT_STOP;
+                }
+                return Clutter.EVENT_PROPAGATE;
+            }
+
+            // Everything else belongs to the focused actor. A focused pill is
+            // an St.Button and answers Enter/Space itself; the badge must not
+            // reach past it and start listening on the same keystroke.
+            if (!actor.has_key_focus())
+                return Clutter.EVENT_PROPAGATE;
+
+            if (symbol === Clutter.KEY_Return || symbol === Clutter.KEY_KP_Enter ||
+                symbol === Clutter.KEY_space) {
+                this._onBadgeClicked();
+                return Clutter.EVENT_STOP;
+            }
+            if (symbol === Clutter.KEY_Menu) {
+                this._showContextMenu(true);
+                return Clutter.EVENT_STOP;
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
+        this._signals.push({obj: this._badge, id: keyId});
 
         // Waveform + timeout — vertical stack below badge
         this._waveformLevels = new Array(32).fill(0);
@@ -690,6 +745,19 @@ export default class GnomeSpeaksExtension extends Extension {
         Main.layoutManager.addTopChrome(this._badge, {
             trackFullscreen: false,
         });
+
+        // Chrome is invisible to the keyboard unless it joins the
+        // Ctrl+Alt+Tab ring — focusable pills are worth nothing if there is
+        // no door into the badge. Guarded: a shell that ever renames this
+        // manager should cost us a keyboard shortcut, not the extension.
+        try {
+            Main.ctrlAltTabManager.addGroup(this._badge, 'GNOME Speaks',
+                'audio-input-microphone-symbolic');
+            this._ctrlAltTabRegistered = true;
+        } catch (e) {
+            this._ctrlAltTabRegistered = false;
+            console.debug(`[GNOME Speaks] Ctrl+Alt+Tab registration skipped: ${e.message}`);
+        }
     }
 
     _endDrag() {
@@ -722,7 +790,9 @@ export default class GnomeSpeaksExtension extends Extension {
     _updateQualityPill() {
         if (!this._qualityPill) return;
         let isHD = this._voiceQuality === 'hd';
-        this._qualityPill.text = isHD ? '✦ HD' : '⚡ Fast';
+        this._setPillState(this._qualityPill, isHD ? '✦ HD' : '⚡ Fast',
+            isHD ? 'Voice quality: HD — activate for Fast'
+                : 'Voice quality: Fast — activate for HD');
         this._qualityPill.remove_style_class_name(
             isHD ? 'gnome-speaks-quality-fast' : 'gnome-speaks-quality-hd');
         this._qualityPill.add_style_class_name(
@@ -747,22 +817,42 @@ export default class GnomeSpeaksExtension extends Extension {
         });
     }
 
-    _createPill(text, styleClass, onClick) {
-        let pill = new St.Label({
+    // A pill is a real button, not a painted label: St.Button carries key
+    // focus, Enter/Space activation and an AT-SPI push-button role for free
+    // — the same things a screen reader needs to see it at all. The child
+    // label is explicit so text metrics and alignment stay exactly where the
+    // St.Label version put them; the visual identity must not move.
+    _createPill(text, styleClass, accessibleName, onActivate) {
+        let label = new St.Label({
             text: text,
-            style_class: styleClass,
-            reactive: true,
-            track_hover: true,
             y_align: Clutter.ActorAlign.CENTER,
             x_align: Clutter.ActorAlign.CENTER,
         });
-        pill.connect('button-release-event', (actor, event) => {
-            if (event.get_button() !== 1) return Clutter.EVENT_PROPAGATE;
-            onClick();
-            return Clutter.EVENT_STOP;
+        let pill = new St.Button({
+            style_class: styleClass,
+            child: label,
+            reactive: true,
+            can_focus: true,
+            track_hover: true,
+            y_align: Clutter.ActorAlign.CENTER,
+            x_align: Clutter.ActorAlign.CENTER,
+            accessible_name: accessibleName,
         });
-        pill.connect('button-press-event', () => Clutter.EVENT_STOP);
+        pill._pillLabel = label;
+        pill.connect('clicked', (actor, button) => {
+            // St.Button reports button 0 for keyboard activation — the only
+            // honest signal of "this came from the keyboard", which the
+            // Chronicle needs so it only steals focus when a keyboard asked.
+            onActivate(button === 0);
+        });
         return pill;
+    }
+
+    _setPillState(pill, text, accessibleName) {
+        if (!pill) return;
+        if (pill._pillLabel)
+            pill._pillLabel.text = text;
+        pill.accessible_name = accessibleName;
     }
 
     _toggleContinuous() {
@@ -783,7 +873,9 @@ export default class GnomeSpeaksExtension extends Extension {
     _updateContinuousPill() {
         if (!this._continuousPill) return;
         let on = this._continuousMode;
-        this._continuousPill.text = on ? '🔄 Loop' : '🔄';
+        this._setPillState(this._continuousPill, on ? '🔄 Loop' : '🔄',
+            on ? 'Continuous dictation: on — activate to stop looping'
+                : 'Continuous dictation: off — activate to loop');
         this._continuousPill.remove_style_class_name(on ? 'gnome-speaks-pill-off' : 'gnome-speaks-pill-on');
         this._continuousPill.add_style_class_name(on ? 'gnome-speaks-pill-on' : 'gnome-speaks-pill-off');
     }
@@ -804,7 +896,9 @@ export default class GnomeSpeaksExtension extends Extension {
     _updateTerminalPill() {
         if (!this._terminalPill) return;
         let on = this._terminalMode;
-        this._terminalPill.text = on ? '> Term' : '>';
+        this._setPillState(this._terminalPill, on ? '> Term' : '>',
+            on ? 'Terminal mode: on — activate to turn off'
+                : 'Terminal mode: off — activate to turn on');
         this._terminalPill.remove_style_class_name(on ? 'gnome-speaks-pill-off' : 'gnome-speaks-pill-on');
         this._terminalPill.add_style_class_name(on ? 'gnome-speaks-pill-on' : 'gnome-speaks-pill-off');
     }
@@ -1090,7 +1184,9 @@ export default class GnomeSpeaksExtension extends Extension {
     _updateModePill() {
         if (!this._modePill) return;
         let isChat = this._conversationMode;
-        this._modePill.text = isChat ? '🤖 AI' : '✏️ Type';
+        this._setPillState(this._modePill, isChat ? '🤖 AI' : '✏️ Type',
+            isChat ? 'Mode: AI chat — activate to switch to typing'
+                : 'Mode: typing — activate to switch to AI chat');
         this._modePill.remove_style_class_name(
             isChat ? 'gnome-speaks-mode-dict' : 'gnome-speaks-mode-chat');
         this._modePill.add_style_class_name(
@@ -1137,6 +1233,14 @@ export default class GnomeSpeaksExtension extends Extension {
         }
 
         if (this._badge) {
+            if (this._ctrlAltTabRegistered) {
+                try {
+                    Main.ctrlAltTabManager.removeGroup(this._badge);
+                } catch (e) {
+                    // Shell already dropped it (badge destroy does this too)
+                }
+                this._ctrlAltTabRegistered = false;
+            }
             this._badge.remove_all_transitions();
             Main.layoutManager.removeChrome(this._badge);
             this._badge.destroy();
@@ -1148,6 +1252,7 @@ export default class GnomeSpeaksExtension extends Extension {
         this._modePill = null;
         this._continuousPill = null;
         this._terminalPill = null;
+        this._chroniclePill = null;
         this._pills = null;
     }
 
@@ -1674,6 +1779,7 @@ export default class GnomeSpeaksExtension extends Extension {
         }
         this._badge.remove_style_class_name('gnome-speaks-error');
         this._badge.add_style_class_name(config.styleClass);
+        this._badge.accessible_name = config.accessibleName;
 
         // Update waveform bar color for state
         if (this._waveformBars) {
@@ -2293,15 +2399,34 @@ export default class GnomeSpeaksExtension extends Extension {
         this._trackTimeout(timeoutId, 'audio-pulse-resume');
     }
 
-    _showContextMenu(event) {
+    _showContextMenu(fromKeyboard = false) {
         if (!this._badge) return;
         this._destroyContextMenu();
+
+        this._contextFocusReturn = fromKeyboard ? this._badge : null;
+        this._contextMenuItems = [];
 
         this._contextMenu = new St.BoxLayout({
             ...boxOrientation(true),
             style_class: 'popup-menu-content',
             style: 'background-color: rgba(40,40,40,0.95); border-radius: 12px; padding: 8px 0; min-width: 200px;',
             reactive: true,
+            can_focus: true,
+            accessible_role: Atk.Role.MENU,
+            accessible_name: 'GNOME Speaks actions',
+        });
+
+        this._contextMenu.connect('key-press-event', (actor, keyEvent) => {
+            let symbol = keyEvent.get_key_symbol();
+            if (symbol === Clutter.KEY_Escape) {
+                this._destroyContextMenu();
+                return Clutter.EVENT_STOP;
+            }
+            if (symbol === Clutter.KEY_Down || symbol === Clutter.KEY_Tab)
+                return this._moveContextMenuFocus(1);
+            if (symbol === Clutter.KEY_Up || symbol === Clutter.KEY_ISO_Left_Tab)
+                return this._moveContextMenuFocus(-1);
+            return Clutter.EVENT_PROPAGATE;
         });
 
         let titleItem = new St.Label({
@@ -2355,6 +2480,9 @@ export default class GnomeSpeaksExtension extends Extension {
 
         Main.layoutManager.addTopChrome(this._contextMenu);
 
+        if (this._contextFocusReturn && this._contextMenuItems.length > 0)
+            this._contextMenuItems[0].grab_key_focus();
+
         // Position menu above the badge
         let [badgeX, badgeY] = this._badge.get_transformed_position();
         let badgeWidth = this._badge.get_width();
@@ -2404,29 +2532,50 @@ export default class GnomeSpeaksExtension extends Extension {
     }
 
     _createMenuItem(text, callback) {
-        let item = new St.Label({
-            text: text,
-            style: 'padding: 8px 16px; color: white; font-size: 14px;',
+        const BASE = 'padding: 8px 16px; color: white; font-size: 14px;';
+        const LIT = `${BASE} background-color: rgba(255,255,255,0.1);`;
+
+        let item = new St.Button({
+            child: new St.Label({
+                text: text,
+                x_align: Clutter.ActorAlign.START,
+                x_expand: true,
+            }),
+            style: BASE,
             reactive: true,
+            can_focus: true,
             track_hover: true,
+            x_expand: true,
+            accessible_name: text,
         });
 
-        item.connect('enter-event', () => {
-            item.set_style('padding: 8px 16px; color: white; font-size: 14px; background-color: rgba(255,255,255,0.1);');
-            return Clutter.EVENT_PROPAGATE;
-        });
+        // One highlight, two ways to earn it — the keyboard must light the
+        // row it is standing on exactly like the pointer does.
+        let relight = () => item.set_style(
+            item.hover || item.has_key_focus() ? LIT : BASE);
+        item.connect('notify::hover', relight);
+        item.connect('key-focus-in', relight);
+        item.connect('key-focus-out', relight);
+        item.connect('clicked', () => callback());
 
-        item.connect('leave-event', () => {
-            item.set_style('padding: 8px 16px; color: white; font-size: 14px;');
-            return Clutter.EVENT_PROPAGATE;
-        });
-
-        item.connect('button-release-event', () => {
-            callback();
-            return Clutter.EVENT_STOP;
-        });
+        // The open menu keeps its own focus ring order; this factory only
+        // ever builds rows for it, so registering here beats four call sites.
+        if (this._contextMenuItems)
+            this._contextMenuItems.push(item);
 
         return item;
+    }
+
+    _moveContextMenuFocus(delta) {
+        let items = this._contextMenuItems;
+        if (!items || items.length === 0)
+            return Clutter.EVENT_STOP;
+        let current = items.findIndex(i => i.has_key_focus());
+        let next = current < 0
+            ? (delta > 0 ? 0 : items.length - 1)
+            : (current + delta + items.length) % items.length;
+        items[next].grab_key_focus();
+        return Clutter.EVENT_STOP;
     }
 
     _destroyContextMenu() {
@@ -2435,33 +2584,71 @@ export default class GnomeSpeaksExtension extends Extension {
             this._menuGrabId = null;
         }
 
+        let returnTo = this._contextFocusReturn;
+        this._contextFocusReturn = null;
+        this._contextMenuItems = [];
+
         if (this._contextMenu) {
-            Main.layoutManager.removeChrome(this._contextMenu);
-            this._contextMenu.destroy();
+            let menu = this._contextMenu;
             this._contextMenu = null;
+
+            // Same rule as the Chronicle: hand focus back only if the menu
+            // still holds it.
+            let focused = global.stage.get_key_focus();
+            let hadFocus = focused && (focused === menu || menu.contains(focused));
+
+            Main.layoutManager.removeChrome(menu);
+            menu.destroy();
+
+            if (hadFocus && returnTo && !this._destroyed && this._badge)
+                returnTo.grab_key_focus();
         }
     }
 
     // -- The Chronicle scroll (OSD popup off the 📜 pill) -------------------
 
-    _toggleChronicleScroll() {
+    _toggleChronicleScroll(fromKeyboard = false) {
         if (this._chronicleScroll)
             this._destroyChronicleScroll();
         else
-            this._showChronicleScroll();
+            this._showChronicleScroll(fromKeyboard);
     }
 
-    _showChronicleScroll() {
+    _showChronicleScroll(fromKeyboard = false) {
         if (!this._badge || this._destroyed)
             return;
         this._destroyContextMenu();
+
+        // Only a keyboard-opened scroll takes key focus. A mouse click on
+        // chrome must never pull focus out of whatever the user was typing
+        // in — but a keyboard user who can't reach the lines has no scroll.
+        this._chronicleFocusReturn = fromKeyboard ? this._chroniclePill : null;
+        this._chronicleLines = [];
 
         let scroll = new St.BoxLayout({
             ...boxOrientation(true),
             style_class: 'gnome-speaks-chronicle-scroll',
             reactive: true,
+            can_focus: true,
+            accessible_role: Atk.Role.PANEL,
+            accessible_name: 'The Chronicle — recent speech',
         });
         this._chronicleScroll = scroll;
+
+        // Key handling lives on the container: key events bubble up from the
+        // focused line, so one handler covers every line plus the empty case.
+        scroll.connect('key-press-event', (actor, event) => {
+            let symbol = event.get_key_symbol();
+            if (symbol === Clutter.KEY_Escape) {
+                this._destroyChronicleScroll();
+                return Clutter.EVENT_STOP;
+            }
+            if (symbol === Clutter.KEY_Down || symbol === Clutter.KEY_Tab)
+                return this._moveChronicleFocus(1);
+            if (symbol === Clutter.KEY_Up || symbol === Clutter.KEY_ISO_Left_Tab)
+                return this._moveChronicleFocus(-1);
+            return Clutter.EVENT_PROPAGATE;
+        });
 
         let header = new St.Label({
             text: '📜  The Chronicle',
@@ -2509,16 +2696,26 @@ export default class GnomeSpeaksExtension extends Extension {
                 let text = entry.text.replace(/\s+/g, ' ');
                 if (text.length > 64)
                     text = `${text.substring(0, 64)}…`;
-                let line = new St.Label({
+                // Buttons, not labels: a line you can speak again is an
+                // action, and a screen reader should hear it as one.
+                let lineLabel = new St.Label({
                     text: `${isYou ? '🗣' : '✨'}  ${text}`,
-                    style_class: `gnome-speaks-chronicle-line gnome-speaks-chronicle-line-${isYou ? 'you' : 'it'}`,
-                    reactive: true,
-                    track_hover: true,
+                    x_align: Clutter.ActorAlign.START,
+                    x_expand: true,
                 });
-                line.connect('button-press-event', () => Clutter.EVENT_STOP);
-                line.connect('button-release-event', (actor, ev) => {
-                    if (ev.get_button() !== 1)
-                        return Clutter.EVENT_PROPAGATE;
+                let line = new St.Button({
+                    style_class: `gnome-speaks-chronicle-line gnome-speaks-chronicle-line-${isYou ? 'you' : 'it'}`,
+                    child: lineLabel,
+                    reactive: true,
+                    can_focus: true,
+                    track_hover: true,
+                    x_expand: true,
+                    // Dash, not a full stop: the ledger text already ends in
+                    // its own punctuation and "you.. Activate" reads badly
+                    // out loud — which is the only way this string is read.
+                    accessible_name: `${isYou ? 'You said' : 'Spoken'}: ${text} — activate to speak again`,
+                });
+                line.connect('clicked', actor => {
                     this._proxy.RespeakRemote(entry.id, () => {});
                     // Cast flash: the line lights gold, then the scroll furls.
                     actor.add_style_class_name('gnome-speaks-chronicle-line-cast');
@@ -2529,14 +2726,28 @@ export default class GnomeSpeaksExtension extends Extension {
                         return GLib.SOURCE_REMOVE;
                     });
                     this._trackTimeout(closeId, 'chronicle-cast-close');
-                    return Clutter.EVENT_STOP;
                 });
+                this._chronicleLines.push(line);
                 scroll.add_child(line);
             }
 
-            addQuietLine('a line, spoken again ✦ click to recast');
+            addQuietLine('a line, spoken again ✦ click or Enter to recast · Esc to furl');
             this._presentChronicleScroll();
         });
+    }
+
+    // Arrow keys and Tab walk the ledger. The scroll is not a modal grab, so
+    // nothing else moves focus between these lines for us.
+    _moveChronicleFocus(delta) {
+        let lines = this._chronicleLines;
+        if (!lines || lines.length === 0)
+            return Clutter.EVENT_STOP;
+        let current = lines.findIndex(l => l.has_key_focus());
+        let next = current < 0
+            ? (delta > 0 ? 0 : lines.length - 1)
+            : (current + delta + lines.length) % lines.length;
+        lines[next].grab_key_focus();
+        return Clutter.EVENT_STOP;
     }
 
     _presentChronicleScroll() {
@@ -2545,6 +2756,15 @@ export default class GnomeSpeaksExtension extends Extension {
             return;
 
         Main.layoutManager.addTopChrome(scroll);
+
+        // Keyboard-opened: land on the newest line (or the scroll itself when
+        // there is nothing to land on) so Escape and the arrows have a home.
+        if (this._chronicleFocusReturn) {
+            if (this._chronicleLines && this._chronicleLines.length > 0)
+                this._chronicleLines[0].grab_key_focus();
+            else
+                scroll.grab_key_focus();
+        }
 
         let [badgeX, badgeY] = this._badge.get_transformed_position();
         let badgeWidth = this._badge.get_width();
@@ -2601,12 +2821,26 @@ export default class GnomeSpeaksExtension extends Extension {
             global.stage.disconnect(this._chronicleGrabId);
             this._chronicleGrabId = null;
         }
+        let returnTo = this._chronicleFocusReturn;
+        this._chronicleFocusReturn = null;
+        this._chronicleLines = [];
         if (this._chronicleScroll) {
             let scroll = this._chronicleScroll;
             this._chronicleScroll = null;
+
+            // Give focus back only if it is still ours to give — the user may
+            // have clicked into a window since, and yanking it back there
+            // would be a worse bug than the one this fixes.
+            let focused = global.stage.get_key_focus();
+            let hadFocus = focused &&
+                (focused === scroll || scroll.contains(focused));
+
             scroll.remove_all_transitions();
             Main.layoutManager.removeChrome(scroll);
             scroll.destroy();
+
+            if (hadFocus && returnTo && !this._destroyed && this._badge)
+                returnTo.grab_key_focus();
         }
     }
 
