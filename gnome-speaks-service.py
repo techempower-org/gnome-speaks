@@ -273,8 +273,121 @@ _config_write_lock = threading.Lock()
 CHRONICLE_PATH = os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
     "gnome-speaks", "chronicle.jsonl")
+# Every read walks backwards from EOF and stops once it has what it was asked
+# for, so the common case (the badge's 8, the submenu's 12) touches one block.
+# Rotation is the other half: it bounds the case a tail-read cannot short —
+# a filtered search that matches nothing still has to walk the whole ledger,
+# and without a cap "the whole ledger" grows forever.
+_CHRONICLE_MAX_BYTES = int(os.environ.get(
+    "GNOME_SPEAKS_CHRONICLE_MAX_BYTES", 2 * 1024 * 1024))
+_CHRONICLE_GENERATIONS = 1  # chronicle.jsonl + chronicle.jsonl.1
+_CHRONICLE_BLOCK = 65536
 _chronicle_lock = threading.Lock()
 _chronicle_last_id = 0
+_chronicle_id_seeded = False
+
+
+def _chronicle_files():
+    """Ledger files newest-first: the active one, then rotated generations."""
+    return [CHRONICLE_PATH] + [
+        "%s.%d" % (CHRONICLE_PATH, i)
+        for i in range(1, _CHRONICLE_GENERATIONS + 1)]
+
+
+def _iter_lines_reverse(path, block=None):
+    """Yield complete lines newest-first, reading backwards from EOF.
+
+    Holds one block plus the line straddling the block boundary — never the
+    file. Partial trailing writes are impossible here (appends are one
+    write() of one line under the lock), but a truncated final line would
+    simply fail to parse and be skipped by the callers.
+    """
+    block = block or _CHRONICLE_BLOCK
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        carry = b""
+        while pos > 0:
+            step = min(block, pos)
+            pos -= step
+            f.seek(pos)
+            chunk = f.read(step) + carry
+            lines = chunk.split(b"\n")
+            carry = lines.pop(0)  # may be partial; completed next iteration
+            for line in reversed(lines):
+                if line.strip():
+                    yield line
+        if carry.strip():
+            yield carry
+
+
+def _chronicle_scan_locked(match, want):
+    """Collect up to `want` entries that `match` accepts, newest-first.
+
+    Caller holds _chronicle_lock. Spans the rotated generations so history
+    survives a rollover, and returns the moment it has enough.
+    """
+    out = []
+    for path in _chronicle_files():
+        try:
+            for raw in _iter_lines_reverse(path):
+                try:
+                    entry = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if match(entry):
+                    out.append(entry)
+                    if len(out) >= want:
+                        return out
+        except FileNotFoundError:
+            continue
+        except OSError:
+            log.warning("Chronicle read failed (%s)", path, exc_info=True)
+            break
+    return out
+
+
+def _chronicle_rotate_locked():
+    """Roll the active ledger once it passes _CHRONICLE_MAX_BYTES.
+
+    Renames, never truncates: the oldest generation is dropped whole and no
+    line is ever half-lost. Caller holds _chronicle_lock.
+    """
+    try:
+        if os.path.getsize(CHRONICLE_PATH) < _CHRONICLE_MAX_BYTES:
+            return
+    except OSError:
+        return
+    for i in range(_CHRONICLE_GENERATIONS, 0, -1):
+        src = CHRONICLE_PATH if i == 1 else "%s.%d" % (CHRONICLE_PATH, i - 1)
+        try:
+            os.replace(src, "%s.%d" % (CHRONICLE_PATH, i))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            log.warning("Chronicle rotation failed", exc_info=True)
+            return
+    log.info("Chronicle rotated past %d bytes", _CHRONICLE_MAX_BYTES)
+
+
+def _chronicle_seed_id_locked():
+    """Adopt the newest id on disk so ids keep ascending across restarts.
+
+    _chronicle_last_id starts at 0 every run and ids are wall-clock ms, so a
+    backwards clock step (NTP correction, suspended laptop) could mint an id
+    that already exists in the ledger — and Respeak would then have two
+    entries answering to one id. One bounded tail-read at the first append
+    closes that. Caller holds _chronicle_lock.
+    """
+    global _chronicle_last_id, _chronicle_id_seeded
+    _chronicle_id_seeded = True
+    recent = _chronicle_scan_locked(
+        lambda e: isinstance(e.get("id"), int) and not isinstance(e["id"], bool),
+        50)
+    if recent:
+        _chronicle_last_id = max([_chronicle_last_id]
+                                 + [e["id"] for e in recent])
+        log.debug("Chronicle ids resume from %d", _chronicle_last_id)
 
 
 def _chronicle_append(kind, text, voice=None, source=None):
@@ -296,6 +409,9 @@ def _chronicle_append(kind, text, voice=None, source=None):
         entry["source"] = source
     try:
         with _chronicle_lock:
+            os.makedirs(os.path.dirname(CHRONICLE_PATH), exist_ok=True)
+            if not _chronicle_id_seeded:
+                _chronicle_seed_id_locked()
             # ms timestamp as id; bump on same-ms collisions so ids stay
             # unique without a persistent counter.
             eid = int(time.time() * 1000)
@@ -303,49 +419,44 @@ def _chronicle_append(kind, text, voice=None, source=None):
                 eid = _chronicle_last_id + 1
             _chronicle_last_id = eid
             entry["id"] = eid
-            os.makedirs(os.path.dirname(CHRONICLE_PATH), exist_ok=True)
             with open(CHRONICLE_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            _chronicle_rotate_locked()
     except OSError:
         log.warning("Chronicle append failed", exc_info=True)
 
 
 def _chronicle_read(limit=20, q=None, kind=None):
     """Return the newest matching entries, oldest-first (ready to display)."""
-    entries = deque(maxlen=max(1, min(int(limit or 20), 500)))
-    try:
-        with _chronicle_lock, open(CHRONICLE_PATH, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if kind and entry.get("kind") != kind:
-                    continue
-                if q and q.lower() not in entry.get("text", "").lower():
-                    continue
-                entries.append(entry)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        log.warning("Chronicle read failed", exc_info=True)
-    return list(entries)
+    want = max(1, min(int(limit or 20), 500))
+    needle = q.lower() if q else None
+
+    def _match(entry):
+        if kind and entry.get("kind") != kind:
+            return False
+        if needle and needle not in entry.get("text", "").lower():
+            return False
+        return True
+
+    with _chronicle_lock:
+        entries = _chronicle_scan_locked(_match, want)
+    entries.reverse()  # collected newest-first; the display wants oldest-first
+    return entries
 
 
 def _chronicle_find(entry_id):
-    """Return the entry with this id, or None."""
+    """Return the entry with this id, or None.
+
+    Searches newest-first, so on the (clock-step) chance of a duplicate id
+    the most recent entry wins rather than the most ancient.
+    """
     try:
-        with _chronicle_lock, open(CHRONICLE_PATH, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if entry.get("id") == entry_id:
-                    return entry
-    except (FileNotFoundError, OSError):
-        pass
-    return None
+        entry_id = int(entry_id)
+    except (TypeError, ValueError):
+        return None
+    with _chronicle_lock:
+        hits = _chronicle_scan_locked(lambda e: e.get("id") == entry_id, 1)
+    return hits[0] if hits else None
 
 
 # ---------------------------------------------------------------------------
@@ -3601,17 +3712,27 @@ class DBusHandler:
                 result = self.service.current_state
                 invocation.return_value(GLib.Variant("(s)", (result,)))
 
+            # Both of these touch the ledger, so they go to the pool like
+            # every other blocking method. A tail-read is fast, but the cases
+            # it cannot short — a filtered search that matches nothing, a
+            # cold-cache read off a spun-down disk — would still stall
+            # StateChanged/SubtitleUpdate/AudioLevel for their whole duration.
+            # extension.js calls both through the async proxy
+            # (GetChronicleRemote/RespeakRemote), so a reply that arrives a
+            # beat later is invisible to it.
             elif method_name == "GetChronicle":
                 limit = parameters.unpack()[0]
-                entries = _chronicle_read(limit=limit if limit > 0 else 20)
-                invocation.return_value(
-                    GLib.Variant("(s)", (json.dumps(entries),)))
+                self._run_async(
+                    invocation, "(s)",
+                    lambda n: json.dumps(_chronicle_read(limit=n)),
+                    limit if limit > 0 else 20)
 
             elif method_name == "Respeak":
                 entry_id = parameters.unpack()[0]
-                entry = self.service.respeak(entry_id or None)
-                invocation.return_value(
-                    GLib.Variant("(b)", (entry is not None,)))
+                self._run_async(
+                    invocation, "(b)",
+                    lambda i: self.service.respeak(i) is not None,
+                    entry_id or None)
 
             else:
                 invocation.return_dbus_error(
