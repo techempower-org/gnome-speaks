@@ -40,7 +40,8 @@ GNOME Speaks preferences can configure all four projects from one unified settin
 
 ## Features
 
-- **Floating voice badge** — glassmorphism-styled status indicator with pulse animations
+- **Floating voice badge** — glassmorphism-styled status indicator with pulse animations, mode pills, and a 📜 Chronicle rune
+- **The Chronicle** — an append-only local ledger of everything said, both directions; click any line to hear it again, or say "cast echo"
 - **Wake word** — hands-free activation via a LAN openwakeword server; speaking your wake phrase opens the mic like the keyboard shortcut (idle-only, never over TTS)
 - **Voice spellbook** — "cast …" utterances run local spells instead of being typed: mode switching, status reports spoken back in themed voices, home-automation rituals, oracle consultations — with confirmation gates and a hardcoded denylist for anything destructive
 - **Speech queue** — the HTTP API queues utterances FIFO so concurrent callers (agents, scripts, browsers) never cut each other off; your own speech always preempts
@@ -49,6 +50,8 @@ GNOME Speaks preferences can configure all four projects from one unified settin
 - **Speech-to-text** — real-time streaming transcription via Azure WebSocket STT
 - **Live typing** — partial transcriptions appear in the text field as you speak, replaced by the final text when done
 - **Text-to-speech** — HD and Fast voice modes (DragonHD / Neural) with streaming playback
+- **Prosody controls** — speaking rate, pitch, and volume applied as SSML to every utterance; the rate composes with Fast mode's built-in boost instead of being ignored by it
+- **Per-voice subtitles** — the live-caption overlay has independent switches (and colors) for your voice and its voice
 - **Streaming LLM→TTS** — AI responses start speaking on the first complete sentence instead of waiting for the full reply
 - **Continuous STT session** — in loop mode, the recorder and WebSocket stay alive across cycles (no restart overhead)
 - **Voice quality toggle** — switch between HD (DragonHD, eastus) and Fast (Neural, westus) modes via `Super+Alt+V` or the panel menu
@@ -72,7 +75,8 @@ GNOME Shell process                    Background service
 │  - badge        │                    │  - Azure STT (WS) + TTS    │
 │  - panel menu   │                    │  - speech queue + HTTP API │
 │  - keybindings  │                    │  - spellbook.py dispatch   │
-│  - settings     │                    │  - wake-word watcher       │
+│  - subtitles    │                    │  - chronicle ledger        │
+│  - chronicle UI │                    │  - wake-word watcher       │
 │  - bus watcher  │                    │  - ydotool live typing     │
 └─────────────────┘                    │  - LLM integration         │
                                        └──────────┬─────────────────┘
@@ -133,7 +137,7 @@ Automatically reads GNOME desktop notifications aloud as they arrive.
 
 ## Requirements
 
-- GNOME Shell 46, 47, or 48
+- GNOME Shell 46–50 (developed on 46–48; verified on 50.1 / Ubuntu 26.04 LTS)
 - PipeWire (for audio capture and playback)
 - Python 3.10+
 - An [Azure Speech Services](https://azure.microsoft.com/en-us/products/ai-services/speech-services) API key
@@ -179,11 +183,23 @@ The installer will:
 1. Copy extension files to `~/.local/share/gnome-shell/extensions/gnome-speaks@jphein/`
 2. Compile GSettings schemas
 3. Install and start the systemd user service
-4. Register the D-Bus service for auto-activation
+4. Register the D-Bus service for auto-activation (plus the inert [Spiel provider](#spiel-provider) name)
 5. Install missing Python dependencies
 6. Enable the extension
 
+Dependencies are checked by **import**, not by `pip show` — distro packages and pip
+metadata lie in opposite directions, and only the import is ground truth. On PEP 668
+distros (Ubuntu 23.04+) the installer retries with `pip install --user
+--break-system-packages`, which stays scoped to your user site-packages.
+
 Restart GNOME Shell after installation (log out and back in on Wayland, or `Alt+F2` → `r` on X11).
+
+### Extension-only zip (extensions.gnome.org)
+
+`./pack.sh` wraps the official packer and writes
+`dist/gnome-speaks@jphein.shell-extension.zip`. Only the shell extension ships in
+that zip — the companion service (audio, STT/TTS, LLM, HTTP API) is not a shell
+component and still installs via `install.sh`.
 
 ### Meson build (alternative)
 
@@ -225,6 +241,42 @@ Create `~/.config/speech-to-cli/config.json`:
 | `language` | STT/TTS language code |
 
 You can get a free Azure Speech key at [Azure Portal](https://portal.azure.com) — the free tier includes 500K characters/month for TTS and 5 hours/month for STT.
+
+### Prosody
+
+Three keys shape every spoken utterance, applied as SSML `<prosody>`:
+
+| Key | Default | Values |
+|-----|---------|--------|
+| `speed` | `1.0` | Rate multiplier — `1.25` is 25% faster |
+| `pitch` | `"default"` | `x-low`, `low`, `medium`, `high`, `x-high` |
+| `volume` | `"default"` | `silent`, `x-soft`, `soft`, `medium`, `loud`, `x-loud` |
+
+Those are the steps preferences offers; `pitch`/`volume` are passed through to SSML after an
+injection-safety check, so relative forms Azure accepts (`+10%`, `-2st`) work if you edit the
+config by hand.
+
+`speed` **composes** with Fast quality's built-in +15% rather than being overwritten by it,
+so the setting works in both quality modes; `speed: 1.0` still means "whatever the voice
+does naturally". `pitch` and `volume` are left out of the SSML entirely while `"default"`,
+so an untouched config produces the same markup it always did.
+
+### Subtitles
+
+The caption overlay has a master switch plus one switch per direction, because the two
+directions are useful independently — captions of *its* voice with your own live transcript
+off is a common preference:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `live_subtitles` | `true` | Master switch (mirrored into GSettings `live-subtitles`) |
+| `subtitles_user` | `true` | Live transcript while **you** speak |
+| `subtitles_tts` | `true` | Captions while **it** speaks |
+| `subtitle_color_user` / `subtitle_color_tts` | `light_green` / `amber` | Per-direction color |
+| `show_word_highlights` | `true` | Newly heard words flash as they arrive |
+
+Subtitles are a conversation-mode surface: in dictation mode the text is already landing at
+your cursor, so the overlay stays out of the way.
 
 ### Extension preferences
 
@@ -290,6 +342,9 @@ current utterance immediately and holds the queue until you finish.
 | `GET /queue` | Queue introspection: `{current, pending, depth, recent}`. Each entry carries its `source` (`null` when unset). `recent` holds the last 16 terminal outcomes — `done`, `canceled` (dropped before starting), `interrupted` (cut off mid-play), or `error` — so callers can learn the fate of a submitted `id`. |
 | `GET /status` | Service state, pause flag, `queue_depth`, playback progress. |
 | `GET /voices` | Available Azure voices (cached 5 min). |
+| `GET /chronicle` | Read the [Chronicle](#the-chronicle). Query params: `limit` (default 20, capped at 500), `q` (case-insensitive substring), `kind` (`you` / `spoken`). Returns `{entries, enabled}`, oldest-first — ready to display. |
+| `POST /respeak` | Play a Chronicle line again. Body `{"id": N}`; omit `id` to replay the last thing spoken. Returns `{ok, respeaking}`, or `404` on a bad id, an empty chronicle, or a full queue. |
+| `GET /api/version` | [realm-sigil](https://github.com/jphein/realm-sigil) version contract (git-derived, with a minimal fallback when realm-sigil isn't installed). |
 
 ```bash
 curl -X POST localhost:7710/speak -H 'Content-Type: application/json' \
@@ -327,6 +382,43 @@ that promotion is free — dropping older same-source items always leaves the
 newest, and the newest always gets spoken — so `kind: "progress"` is the same
 machinery under a name that reads better at the call site.
 
+## The Chronicle
+
+Speech is the one interface with no scrollback — you hear it once and it's gone. The
+Chronicle is an append-only ledger of everything said in both directions, so a line you
+half-caught is still there afterwards.
+
+Every final transcript is recorded as `kind: "you"`, and every utterance that actually
+played as `kind: "spoken"` (carrying its `voice` and `source`). One JSON object per line at
+`$XDG_STATE_HOME/gnome-speaks/chronicle.jsonl` (`~/.local/state/…` by default) — local
+only, never synced, never in git:
+
+```json
+{"kind": "you", "text": "how much battery is left", "ts": "2026-08-17T21:04:11-0700", "id": 1787025851000}
+{"kind": "spoken", "text": "The batteries hold 82 percent.", "ts": "2026-08-17T21:04:13-0700", "voice": "en-US-Ava:DragonHDLatestNeural", "source": "assistant", "id": 1787025853000}
+```
+
+Ids are millisecond timestamps, bumped on same-millisecond collisions, so they stay unique
+without a persistent counter. Writes are best-effort by design: a full disk logs a warning
+and must never take down the voice pipeline. A streamed AI reply is recorded as **one**
+entry rather than per-sentence — sentence-level shards would be useless to respeak.
+
+Five ways in:
+
+| Seam | Use |
+|---|---|
+| 📜 rune on the badge | Unfurls a scroll of the last 8 lines, newest first — green for you, violet for it. Click a line: it flares gold and respeaks. Click outside to dismiss. |
+| Panel menu → Chronicle | Submenu of the last 12 lines; click to hear one again. |
+| `GET /chronicle` · `POST /respeak` | Scripted access (see [HTTP API](#http-api)). |
+| `GetChronicle(limit)` · `Respeak(id)` | Same over D-Bus. `Respeak(0)` replays the last spoken line; `GetChronicle(0)` falls back to 20 entries. |
+| "cast echo" · "cast chronicle" · "cast seal the chronicle" | Replay the last line · recite the last three · stop/resume recording. |
+
+A respeak re-enters the normal speech queue rather than jumping it: a `spoken` line replays
+in its **original** voice, while a `you` line is read back in the current default voice.
+
+Recording is on by default and switchable in preferences ("Keep the Chronicle") or by
+voice; while sealed, nothing is written at all.
+
 ## Spiel provider
 
 gnome-speaks can register as a [Spiel](https://github.com/project-spiel) speech
@@ -344,12 +436,34 @@ The provider writes raw S16LE PCM to the client's pipe (the client owns
 playback, per Spiel's design), handles concurrent requests, and treats a
 closed pipe as cancellation. No SSML or word-event support is advertised.
 
-**Pointing Orca at it:** Orca ≥46 ships a Spiel backend, but note two traps:
-libspiel is not packaged on Ubuntu (build from source; make its typelib
-visible session-wide via `~/.config/environment.d/`), and Orca initializes
-speech *before* applying `speechServerFactory` from user settings — the
-reliable switch is `orca.settings.speechSystemOverride = "spiel"` in
-`~/.local/share/orca/orca-customizations.py`.
+**Pointing Orca at it:** Orca ≥46 ships a Spiel backend, but note two traps.
+
+First, libspiel is still not packaged on Ubuntu (26.04 included) — build from
+source and make its typelib visible session-wide via
+`~/.config/environment.d/`.
+
+Second, *how* you select the backend depends on your Orca version:
+
+- **Orca 50+** keeps settings in GSettings, and the old
+  `orca.settings.speechSystemOverride` hook **no longer exists** — an
+  `orca-customizations.py` that sets it is silently doing nothing. Use the
+  relocatable schema instead (an old `speechServerFactory` in your settings is
+  migrated to this key automatically):
+
+  ```bash
+  gsettings set "org.gnome.Orca.Speech:/org/gnome/orca/default/speech/" \
+      speech-server-factory spiel
+  ```
+
+  Valid values are `speechdispatcherfactory` (the default) and `spiel`. Note the
+  schema is relocatable, so the `:path` suffix is mandatory — plain
+  `gsettings set org.gnome.Orca.Speech …` errors out. Swap `default` for your
+  profile name if you use Orca profiles, and restart Orca.
+
+- **Orca 46–49** initializes speech *before* applying `speechServerFactory` from
+  user settings, so the reliable switch there is
+  `orca.settings.speechSystemOverride = "spiel"` in
+  `~/.local/share/orca/orca-customizations.py`.
 
 ## Voice Spellbook
 
@@ -364,14 +478,27 @@ Spells are data: the repo ships `spellbook.json` with the self-control spells;
 a user overlay at `~/.config/speech-to-cli/spellbook.json` merges over it by
 spell name and hot-reloads on save. POST spells can carry dictated
 text: `"remainder_field": "body"` injects the words spoken after the pattern
-into that body field, and `"reply"` speaks a fixed success line. The realm/oracle/home spells below are
-overlay examples — their endpoints are site-specific and never live in the repo.
+into that body field, and `"reply"` speaks a fixed success line.
+
+**Ships in the repo** (`spellbook.json`) — all self-control, no external endpoints:
 
 | Incantation | Effect |
 |---|---|
 | "cast silence" / "cast skip" | stop everything / skip current utterance |
 | "cast terminal mode" / "ai mode" / "type mode" | switch modes |
 | "cast read notifications" | toggle the notification herald |
+| "cast wake word" | arm or disarm the [waking watch](#wake-word) |
+| "cast deep thought" | toggle extended LLM thinking |
+| "cast subtitles" | toggle the caption overlay (writes both config and GSettings) |
+| "cast echo" | replay the last thing spoken |
+| "cast chronicle" | recite the last three [Chronicle](#the-chronicle) lines |
+| "cast seal the chronicle" | stop or resume recording the Chronicle |
+
+**Overlay examples** — these live in your own `~/.config/speech-to-cli/spellbook.json`
+because their endpoints are site-specific:
+
+| Incantation | Effect |
+|---|---|
 | "cast defense report" | combat-ward summary, spoken |
 | "cast my level" | character sheet from realm progression |
 | "cast recent events" | last 5 realm events, spoken |
