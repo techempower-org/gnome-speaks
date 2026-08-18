@@ -52,6 +52,21 @@
     color: rgba(255, 255, 255, 0.92);
 }
 
+/* Every pill in the row used to BE an StLabel, so the rule above — not the
+ * `margin-left: 6px` in the pill classes, which never won on specificity —
+ * is what actually set the gaps between pills. A pill is now an StButton
+ * wrapping an StLabel, so that same rule lands on the inner label, where an
+ * 8px margin pushes the glyph off-centre and widens every pill by 8px.
+ * Hand the gap back to the button and zero it on the label: same pixels,
+ * different widget. Verified by AT-SPI extents against the old build. */
+.gnome-speaks-badge StButton {
+    margin-left: 8px;
+}
+
+.gnome-speaks-badge StButton StLabel {
+    margin-left: 0px;
+}
+
 .gnome-speaks-badge:hover {
     background-color: rgba(28, 31, 42, 0.86);
     border: 1px solid rgba(255, 255, 255, 0.16);
@@ -264,7 +279,8 @@
     border: 1px solid rgba(255, 205, 80, 0.48);
     box-shadow: 0 0 10px rgba(255, 190, 40, 0.22);
 }
-.gnome-speaks-quality-hd:hover {
+.gnome-speaks-quality-hd:hover,
+.gnome-speaks-quality-hd:focus {
     background-gradient-start: rgba(255, 214, 92, 0.44);
     background-gradient-end: rgba(230, 158, 26, 0.26);
     border: 1px solid rgba(255, 214, 100, 0.72);
@@ -280,7 +296,8 @@
     border: 1px solid rgba(94, 226, 140, 0.46);
     box-shadow: 0 0 10px rgba(94, 226, 140, 0.20);
 }
-.gnome-speaks-quality-fast:hover {
+.gnome-speaks-quality-fast:hover,
+.gnome-speaks-quality-fast:focus {
     background-gradient-start: rgba(130, 240, 170, 0.38);
     background-gradient-end: rgba(58, 190, 112, 0.22);
     border: 1px solid rgba(110, 236, 154, 0.68);
@@ -293,7 +310,8 @@
     color: rgba(255, 255, 255, 0.45);
     border: 1px solid rgba(255, 255, 255, 0.07);
 }
-.gnome-speaks-mode-dict:hover {
+.gnome-speaks-mode-dict:hover,
+.gnome-speaks-mode-dict:focus {
     background-color: rgba(255, 255, 255, 0.12);
     color: rgba(255, 255, 255, 0.75);
     box-shadow: 0 0 10px rgba(255, 255, 255, 0.10);
@@ -308,7 +326,8 @@
     border: 1px solid rgba(184, 132, 255, 0.52);
     box-shadow: 0 0 10px rgba(178, 122, 255, 0.24);
 }
-.gnome-speaks-mode-chat:hover {
+.gnome-speaks-mode-chat:hover,
+.gnome-speaks-mode-chat:focus {
     background-gradient-start: rgba(204, 160, 255, 0.46);
     background-gradient-end: rgba(148, 92, 234, 0.28);
     border: 1px solid rgba(196, 152, 255, 0.75);
@@ -321,7 +340,8 @@
     color: rgba(255, 255, 255, 0.35);
     border: 1px solid rgba(255, 255, 255, 0.07);
 }
-.gnome-speaks-pill-off:hover {
+.gnome-speaks-pill-off:hover,
+.gnome-speaks-pill-off:focus {
     background-color: rgba(255, 255, 255, 0.12);
     color: rgba(255, 255, 255, 0.65);
     box-shadow: 0 0 10px rgba(255, 255, 255, 0.10);
@@ -335,7 +355,8 @@
     border: 1px solid rgba(80, 205, 240, 0.5);
     box-shadow: 0 0 10px rgba(64, 196, 232, 0.22);
 }
-.gnome-speaks-pill-on:hover {
+.gnome-speaks-pill-on:hover,
+.gnome-speaks-pill-on:focus {
     background-gradient-start: rgba(110, 222, 248, 0.42);
     background-gradient-end: rgba(44, 166, 206, 0.24);
     border: 1px solid rgba(100, 214, 245, 0.72);
@@ -349,13 +370,31 @@
     color: rgba(255, 255, 255, 0.55);
     border: 1px solid rgba(255, 220, 150, 0.14);
 }
-.gnome-speaks-pill-chronicle:hover {
+.gnome-speaks-pill-chronicle:hover,
+.gnome-speaks-pill-chronicle:focus {
     background-gradient-direction: vertical;
     background-gradient-start: rgba(255, 216, 130, 0.24);
     background-gradient-end: rgba(210, 158, 60, 0.12);
     color: rgba(255, 236, 190, 1.0);
     border: 1px solid rgba(255, 216, 120, 0.55);
     box-shadow: 0 0 14px rgba(255, 200, 90, 0.35);
+}
+
+/* ── Keyboard focus: hover's light, plus a rim you can't mistake ──
+ *
+ * Hover is where the pointer happens to be; focus is where the keyboard
+ * IS, and a keyboard user must never have to guess which pill will fire.
+ * So focus takes the lit-hover treatment above and adds a pale rim on
+ * top — still 1px, so nothing in the row shifts as focus moves. Listed
+ * after the tinted rules so the rim wins on equal specificity. */
+.gnome-speaks-quality-hd:focus,
+.gnome-speaks-quality-fast:focus,
+.gnome-speaks-mode-dict:focus,
+.gnome-speaks-mode-chat:focus,
+.gnome-speaks-pill-off:focus,
+.gnome-speaks-pill-on:focus,
+.gnome-speaks-pill-chronicle:focus {
+    border: 1px solid rgba(255, 255, 255, 0.85);
 }
 
 /* ============================================================
@@ -398,9 +437,18 @@
     color: rgba(214, 190, 250, 0.95);
 }
 
+/* The 1px border is paid for out of the padding (6/12 → 5/11) so a lit
+ * line never nudges the ones below it. Focus does the same, brighter. */
 .gnome-speaks-chronicle-line:hover {
     background-color: rgba(255, 255, 255, 0.08);
     border: 1px solid rgba(255, 216, 130, 0.25);
+    padding: 5px 11px;
+}
+
+.gnome-speaks-chronicle-line:focus {
+    background-color: rgba(255, 255, 255, 0.12);
+    border: 1px solid rgba(255, 232, 170, 0.75);
+    box-shadow: 0 0 12px rgba(255, 200, 90, 0.25);
     padding: 5px 11px;
 }
 
