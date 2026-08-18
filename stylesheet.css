@@ -47,43 +47,38 @@
     transition-duration: 250ms;
 }
 
-.gnome-speaks-badge StLabel {
+/* ── Labels inside the badge are addressed by NAME, never by type ──
+ *
+ * `.gnome-speaks-badge StLabel` used to live here, and a type selector
+ * cannot tell the one label it was written for from every label the badge
+ * would ever contain. At (0,1,1) it beat the pill classes at (0,1,0), so
+ * their `margin-left: 6px` and their tinted `color` had never once applied:
+ * the row's real gap was this rule's 8px, and pill text took this rule's
+ * white. Nothing looked broken, so nothing said so. Wrapping each pill in
+ * an StButton then re-aimed the same rule at the inner label, widening
+ * every pill by 8px — and lighting the glyphs needed a second storey of
+ * `.gnome-speaks-quality-hd StLabel`-style rules to climb back over it,
+ * each restating a colour its pill class already declared.
+ *
+ * Both storeys are gone. The status label is named, and pill text simply
+ * INHERITS from its button — so a pill's own `color`, including its :hover
+ * and :focus variants, reaches the glyph with nothing in between. One
+ * declaration per pill, in the pill class, where a reader will look.
+ *
+ * The two names also mean a label added to this badge tomorrow inherits
+ * nothing by accident. Rendering is byte-identical to the tinted build,
+ * verified by reading computed St.ThemeNode colours out of a headless
+ * shell in every state. */
+.gnome-speaks-badge-label {
     margin-left: 8px;
     color: rgba(255, 255, 255, 0.92);
 }
 
-/* Every pill in the row used to BE an StLabel, so the rule above — not the
- * `margin-left: 6px` in the pill classes, which never won on specificity —
- * is what actually set the gaps between pills. A pill is now an StButton
- * wrapping an StLabel, so that same rule lands on the inner label, where an
- * 8px margin pushes the glyph off-centre and widens every pill by 8px.
- * Hand the gap back to the button and zero it on the label: same pixels,
- * different widget. Verified by AT-SPI extents against the old build. */
-.gnome-speaks-badge StButton {
-    margin-left: 8px;
-}
-
-.gnome-speaks-badge StButton StLabel {
-    margin-left: 0px;
-}
-
-/* Pill TEXT tints. The pill classes' own `color` never reaches the glyphs:
- * `.gnome-speaks-badge StLabel` above is (0,1,1) and beats both the class
- * rule on the button (0,1,0) and plain inheritance. These (0,2,1) rules
- * finally let each rune's text glow in its own tint (JP, 2026-08-18). */
-.gnome-speaks-quality-hd StLabel { color: rgba(255, 226, 140, 1.0); }
-.gnome-speaks-quality-fast StLabel { color: rgba(158, 248, 192, 1.0); }
-.gnome-speaks-mode-dict StLabel { color: rgba(255, 255, 255, 0.45); }
-.gnome-speaks-mode-dict:hover StLabel,
-.gnome-speaks-mode-dict:focus StLabel { color: rgba(255, 255, 255, 0.75); }
-.gnome-speaks-mode-chat StLabel { color: rgba(212, 176, 255, 1.0); }
-.gnome-speaks-pill-off StLabel { color: rgba(255, 255, 255, 0.35); }
-.gnome-speaks-pill-off:hover StLabel,
-.gnome-speaks-pill-off:focus StLabel { color: rgba(255, 255, 255, 0.65); }
-.gnome-speaks-pill-on StLabel { color: rgba(150, 230, 255, 1.0); }
-.gnome-speaks-pill-chronicle StLabel { color: rgba(255, 255, 255, 0.55); }
-.gnome-speaks-pill-chronicle:hover StLabel,
-.gnome-speaks-pill-chronicle:focus StLabel { color: rgba(255, 236, 190, 1.0); }
+/* `.gnome-speaks-pill-label` is deliberately unstyled: the glyph takes its
+ * colour by inheritance from its pill button, so there is nothing to say
+ * here. The class exists so that anything you DO need to say to a pill's
+ * text later has a name to say it to, instead of reaching for `StLabel`
+ * and hitting every other label in the badge along with it. */
 
 .gnome-speaks-badge:hover {
     background-color: rgba(28, 31, 42, 0.86);
@@ -178,7 +173,7 @@
     color: rgba(150, 245, 185, 1.0);
 }
 
-.gnome-speaks-listening StLabel {
+.gnome-speaks-listening .gnome-speaks-badge-label {
     color: rgba(235, 255, 242, 0.98);
 }
 
@@ -202,7 +197,7 @@
     color: rgba(255, 214, 130, 1.0);
 }
 
-.gnome-speaks-processing StLabel {
+.gnome-speaks-processing .gnome-speaks-badge-label {
     color: rgba(255, 246, 230, 0.98);
 }
 
@@ -226,7 +221,7 @@
     color: rgba(206, 168, 255, 1.0);
 }
 
-.gnome-speaks-speaking StLabel {
+.gnome-speaks-speaking .gnome-speaks-badge-label {
     color: rgba(246, 238, 255, 0.98);
 }
 
@@ -249,7 +244,7 @@
     color: rgba(255, 150, 150, 1.0);
 }
 
-.gnome-speaks-error StLabel {
+.gnome-speaks-error .gnome-speaks-badge-label {
     color: rgba(255, 236, 236, 0.98);
 }
 
@@ -280,7 +275,7 @@
     font-weight: 700;
     border-radius: 999px;
     padding: 3px 11px;
-    margin-left: 6px;
+    margin-left: 8px;   /* the row's real gap — see the badge-label note above */
     text-align: center;
     transition-duration: 200ms;
     border: 1px solid rgba(255, 255, 255, 0.10);
