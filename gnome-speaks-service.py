@@ -285,13 +285,36 @@ _CHRONICLE_BLOCK = 65536
 _chronicle_lock = threading.Lock()
 _chronicle_last_id = 0
 _chronicle_id_seeded = False
+# Rotation runs on its own thread and is single-flight; the speech path only
+# ever sets this flag. Cooldown keeps a broken archive from spawning a thread
+# per utterance.
+_chronicle_archiving = threading.Event()
+_chronicle_archive_retry_after = 0.0
 
 
 def _chronicle_files():
-    """Ledger files newest-first: the active one, then rotated generations."""
+    """HOT ledger files newest-first: the active one, then rotated generations.
+
+    Bounded, and therefore the only thing the recent list ever reads. The cold
+    archive is deliberately NOT here — see _chronicle_archive_path.
+    """
     return [CHRONICLE_PATH] + [
         "%s.%d" % (CHRONICLE_PATH, i)
         for i in range(1, _CHRONICLE_GENERATIONS + 1)]
+
+
+def _chronicle_archive_path():
+    """The cold archive: append-only, never rotated, never deleted.
+
+    The Chronicle's promise is everything that was ever said, so rotation
+    moves the oldest generation in here instead of dropping it. Growth is
+    ~11 MB/year at the observed rate, which is why only an explicit search
+    (`q`) or an id lookup ever reads it — never the recent list.
+
+    Derived from CHRONICLE_PATH at call time so there is one source of truth.
+    """
+    return os.path.join(os.path.dirname(CHRONICLE_PATH),
+                        "chronicle-archive.jsonl")
 
 
 def _iter_lines_reverse(path, block=None):
@@ -321,20 +344,41 @@ def _iter_lines_reverse(path, block=None):
             yield carry
 
 
-def _chronicle_scan_locked(match, want):
+def _chronicle_scan_locked(match, want, include_archive=False):
     """Collect up to `want` entries that `match` accepts, newest-first.
 
-    Caller holds _chronicle_lock. Spans the rotated generations so history
+    Caller holds _chronicle_lock. Walks the hot generations first so history
     survives a rollover, and returns the moment it has enough.
+
+    include_archive appends the cold archive as the LAST place to look, for
+    the two callers that must reach the whole history: an id lookup (Respeak
+    of a months-old line) and an explicit text search. Both run off the main
+    loop. The recent list never sets it.
+
+    Entries are deduplicated by id, because a crash between "archived" and
+    "rotated" can leave one line in both the archive and a hot generation.
+    Only ids seen in the HOT files are remembered — that is where the overlap
+    lives, and it keeps the set bounded by the rotation cap instead of by the
+    size of the archive.
     """
     out = []
-    for path in _chronicle_files():
+    hot_ids = set()
+    hot = _chronicle_files()
+    paths = (hot + [_chronicle_archive_path()]) if include_archive else hot
+    for path in paths:
+        is_hot = path in hot
         try:
             for raw in _iter_lines_reverse(path):
                 try:
                     entry = json.loads(raw)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
+                eid = entry.get("id")
+                if isinstance(eid, int) and not isinstance(eid, bool):
+                    if is_hot:
+                        hot_ids.add(eid)
+                    elif eid in hot_ids:
+                        continue  # already returned from a hot generation
                 if match(entry):
                     out.append(entry)
                     if len(out) >= want:
@@ -347,27 +391,138 @@ def _chronicle_scan_locked(match, want):
     return out
 
 
-def _chronicle_rotate_locked():
-    """Roll the active ledger once it passes _CHRONICLE_MAX_BYTES.
+def _chronicle_newest_archived_id():
+    """Highest id already in the cold archive, or None.
 
-    Renames, never truncates: the oldest generation is dropped whole and no
-    line is ever half-lost. Caller holds _chronicle_lock.
+    The archive is append-only and its ids ascend (generations go in in order,
+    and ids ascend globally — see _chronicle_seed_id_locked), so its newest
+    line is its high-water mark. One bounded tail-read.
+    """
+    try:
+        for raw in _iter_lines_reverse(_chronicle_archive_path()):
+            try:
+                entry = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            eid = entry.get("id")
+            if isinstance(eid, int) and not isinstance(eid, bool):
+                return eid
+    except (FileNotFoundError, OSError):
+        pass
+    return None
+
+
+def _chronicle_archive_generation(src):
+    """Append `src` to the cold archive. True when its lines are safely there.
+
+    Runs on the rotation thread WITHOUT _chronicle_lock: this is a copy of a
+    whole generation, and holding the lock would put it in front of the next
+    _chronicle_append — which is called from the main loop. Safe to run
+    unlocked because rotation is single-flight (_chronicle_archiving), so
+    nothing else writes `src` or the archive while this runs, and readers of
+    either file are read-only.
+
+    Lines already at or below the archive's high-water mark are skipped, so
+    archiving the same generation twice is a no-op rather than a duplication.
+    That matters because the step after this one can fail: if it does, `src`
+    survives and will be offered again on the next rotation.
+    """
+    watermark = _chronicle_newest_archived_id()
+    archive = _chronicle_archive_path()
+    kept = skipped = 0
+    try:
+        with open(src, "rb") as fin, open(archive, "ab") as fout:
+            for raw in fin:
+                if not raw.strip():
+                    continue
+                if watermark is not None:
+                    try:
+                        eid = json.loads(raw).get("id")
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        eid = None
+                    if (isinstance(eid, int) and not isinstance(eid, bool)
+                            and eid <= watermark):
+                        skipped += 1
+                        continue
+                if not raw.endswith(b"\n"):
+                    raw += b"\n"  # never let two entries fuse into one line
+                fout.write(raw)
+                kept += 1
+            fout.flush()
+            os.fsync(fout.fileno())
+    except FileNotFoundError:
+        return True  # nothing to archive: this generation does not exist yet
+    except OSError:
+        # Refusing to rotate is the right failure: the active file grows past
+        # its cap (slower searches) instead of history being deleted.
+        log.warning("Chronicle archive append failed — rotation aborted",
+                    exc_info=True)
+        return False
+    if kept or skipped:
+        log.info("Chronicle archived %d line(s) (%d already archived)",
+                 kept, skipped)
+    return True
+
+
+def _chronicle_rotate_worker():
+    """Archive the oldest generation, then roll the generations.
+
+    Order matters and is the reason this is safe to do in the background:
+    the archive copy completes and is fsynced BEFORE the renames, so every
+    line is readable from its hot generation for the whole copy and from the
+    archive afterwards. There is no instant where a line is invisible — only
+    a window where it is in both places, which reads deduplicate by id.
+    """
+    global _chronicle_archive_retry_after
+    try:
+        oldest = "%s.%d" % (CHRONICLE_PATH, _CHRONICLE_GENERATIONS)
+        if not _chronicle_archive_generation(oldest):
+            # Leave the generations alone: the active file grows past its cap
+            # (slower searches) rather than history being deleted. Back off so
+            # a persistently unwritable archive does not spawn a thread per
+            # utterance.
+            _chronicle_archive_retry_after = time.monotonic() + 60
+            return
+        with _chronicle_lock:
+            for i in range(_CHRONICLE_GENERATIONS, 0, -1):
+                src = (CHRONICLE_PATH if i == 1
+                       else "%s.%d" % (CHRONICLE_PATH, i - 1))
+                try:
+                    os.replace(src, "%s.%d" % (CHRONICLE_PATH, i))
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    log.warning("Chronicle rotation failed", exc_info=True)
+                    return
+        log.info("Chronicle rotated past %d bytes", _CHRONICLE_MAX_BYTES)
+    except Exception:
+        log.warning("Chronicle rotation aborted", exc_info=True)
+    finally:
+        _chronicle_archiving.clear()
+
+
+def _chronicle_rotate_locked():
+    """Kick off a rotation if the active ledger has passed its cap.
+
+    Detection only — the work happens on a background thread. Archiving a
+    generation is a bounded copy, but "bounded" is _CHRONICLE_MAX_BYTES, and
+    _chronicle_append runs on the GLib main loop (via
+    _emit_transcription_ready): measured 4 ms at the 2 MB default and 117 ms
+    with a 16 MB cap, all of it in front of the next utterance. Caller holds
+    _chronicle_lock.
     """
     try:
         if os.path.getsize(CHRONICLE_PATH) < _CHRONICLE_MAX_BYTES:
             return
     except OSError:
         return
-    for i in range(_CHRONICLE_GENERATIONS, 0, -1):
-        src = CHRONICLE_PATH if i == 1 else "%s.%d" % (CHRONICLE_PATH, i - 1)
-        try:
-            os.replace(src, "%s.%d" % (CHRONICLE_PATH, i))
-        except FileNotFoundError:
-            continue
-        except OSError:
-            log.warning("Chronicle rotation failed", exc_info=True)
-            return
-    log.info("Chronicle rotated past %d bytes", _CHRONICLE_MAX_BYTES)
+    if time.monotonic() < _chronicle_archive_retry_after:
+        return
+    if _chronicle_archiving.is_set():
+        return  # single-flight: one rotation at a time, by design
+    _chronicle_archiving.set()
+    threading.Thread(target=_chronicle_rotate_worker, daemon=True,
+                     name="chronicle-rotate").start()
 
 
 def _chronicle_seed_id_locked():
@@ -381,9 +536,12 @@ def _chronicle_seed_id_locked():
     """
     global _chronicle_last_id, _chronicle_id_seeded
     _chronicle_id_seeded = True
+    # include_archive: if the hot files were cleared by hand, the archive is
+    # still the record of which ids exist — minting an id it already holds
+    # would give Respeak two answers for one lookup.
     recent = _chronicle_scan_locked(
         lambda e: isinstance(e.get("id"), int) and not isinstance(e["id"], bool),
-        50)
+        50, include_archive=True)
     if recent:
         _chronicle_last_id = max([_chronicle_last_id]
                                  + [e["id"] for e in recent])
@@ -426,8 +584,15 @@ def _chronicle_append(kind, text, voice=None, source=None):
         log.warning("Chronicle append failed", exc_info=True)
 
 
-def _chronicle_read(limit=20, q=None, kind=None):
-    """Return the newest matching entries, oldest-first (ready to display)."""
+def _chronicle_read(limit=20, q=None, kind=None, include_archive=False):
+    """Return the newest matching entries, oldest-first (ready to display).
+
+    include_archive extends the walk into the cold archive once the hot
+    generations are exhausted. Only an explicit text search sets it: the
+    recent list (the badge, the submenu, GetChronicle) must stay a bounded
+    read of the hot files, and it is the one caller that cannot afford to
+    walk a year of history to fill twelve rows.
+    """
     want = max(1, min(int(limit or 20), 500))
     needle = q.lower() if q else None
 
@@ -439,7 +604,8 @@ def _chronicle_read(limit=20, q=None, kind=None):
         return True
 
     with _chronicle_lock:
-        entries = _chronicle_scan_locked(_match, want)
+        entries = _chronicle_scan_locked(_match, want,
+                                        include_archive=include_archive)
     entries.reverse()  # collected newest-first; the display wants oldest-first
     return entries
 
@@ -448,14 +614,17 @@ def _chronicle_find(entry_id):
     """Return the entry with this id, or None.
 
     Searches newest-first, so on the (clock-step) chance of a duplicate id
-    the most recent entry wins rather than the most ancient.
+    the most recent entry wins rather than the most ancient. Falls through to
+    the cold archive last: respeaking a line from months ago has to work, and
+    this runs off the main loop (Respeak goes through the D-Bus pool).
     """
     try:
         entry_id = int(entry_id)
     except (TypeError, ValueError):
         return None
     with _chronicle_lock:
-        hits = _chronicle_scan_locked(lambda e: e.get("id") == entry_id, 1)
+        hits = _chronicle_scan_locked(lambda e: e.get("id") == entry_id, 1,
+                                     include_archive=True)
     return hits[0] if hits else None
 
 
@@ -3436,7 +3605,14 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
                          "recent": list(svc._queue_recent)})
 
     def _handle_chronicle(self):
-        """GET /chronicle?limit=20&q=text&kind=you|spoken — newest last."""
+        """GET /chronicle?limit=20&q=text&kind=you|spoken — newest last.
+
+        A `q` search reaches back into the cold archive (whole history, this
+        handler runs on an HTTP worker thread); without it this is the recent
+        list and stays a bounded read of the hot generations. `archive`
+        reports which one you got, so a caller can tell "not in the last few
+        thousand lines" from "not in the Chronicle at all".
+        """
         from urllib.parse import urlparse, parse_qs
         params = parse_qs(urlparse(self.path).query)
         try:
@@ -3447,10 +3623,12 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         if kind not in (None, "you", "spoken"):
             self._send_error_json(400, "kind must be 'you' or 'spoken'")
             return
-        entries = _chronicle_read(limit=limit, q=params.get("q", [None])[0],
-                                  kind=kind)
+        q = params.get("q", [None])[0]
+        entries = _chronicle_read(limit=limit, q=q, kind=kind,
+                                  include_archive=bool(q))
         self._send_json({"entries": entries, "count": len(entries),
-                         "enabled": CONFIG.get("chronicle", True)})
+                         "enabled": CONFIG.get("chronicle", True),
+                         "archive": bool(q)})
 
     def _handle_respeak(self):
         """POST /respeak {"id": N} — omit id to replay the last spoken line."""
