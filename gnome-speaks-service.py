@@ -816,6 +816,11 @@ class GnomeSpeaksService:
         # exposed on GET /queue so the /speak id isn't write-only. Exactly one
         # terminal outcome per item (Android-style invariant).
         self._queue_recent = deque(maxlen=16)
+        # Bumped by every drain. The dispatcher captures it before dequeuing
+        # and re-reads it once it has the item, so a /stop that lands in the
+        # gap between "off the queue" and "playing" still kills the item.
+        # Plain int: increments race benignly (any bump is a mismatch).
+        self._drain_gen = 0
         # Serializes coalesce-then-put so two concurrent bursts from the same
         # source can't interleave (drop, drop, put, put would leave two items
         # where the caller asked for one). Order is always _enqueue_lock ->
@@ -1754,6 +1759,10 @@ class GnomeSpeaksService:
         """Remove all pending speech-queue items. Returns the count cleared."""
         cleared = 0
         ids = []
+        # Bump first: an item the dispatcher pulled microseconds ago is no
+        # longer in the queue, so draining cannot reach it. The generation
+        # tells the dispatcher "a drain crossed your dequeue — drop it".
+        self._drain_gen += 1
         while True:
             try:
                 item = self._tts_queue.get_nowait()
@@ -1768,6 +1777,21 @@ class GnomeSpeaksService:
                              cleared, ids)
                 return cleared
 
+    def _queue_hold_reason(self):
+        """Why the dispatcher must not start an item right now (or None).
+
+        Pause is queue-level (unanimous across Web Speech/.NET/Apple): a
+        paused service must not start the next item either.
+        """
+        if self._user_speech_active.is_set():
+            return "user speech"
+        if state._pause_event.is_set():
+            return "paused"
+        st = self.current_state
+        if st in ("listening", "processing"):
+            return st
+        return None
+
     def _tts_dispatcher(self):
         """Daemon thread: plays queued HTTP speech items serially.
 
@@ -1778,18 +1802,37 @@ class GnomeSpeaksService:
         while True:
             # Wait until clear BEFORE dequeuing, so held items stay visible
             # in GET /queue and remain drainable by /stop during user speech.
-            # Pause is queue-level (unanimous across Web Speech/.NET/Apple):
-            # a paused service must not start the next item either.
-            while (self._user_speech_active.is_set()
-                   or state._pause_event.is_set()
-                   or self.current_state in ("listening", "processing")):
+            while self._queue_hold_reason() is not None:
                 time.sleep(0.2)
+            gen = self._drain_gen
             try:
                 item = self._tts_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
+            # The gate above is a check-then-act: this thread parks inside
+            # get() with the hold clear, and put_nowait wakes it the instant
+            # an item arrives — by which time the mic may be open. Re-check
+            # under the claim lock and hand the item back rather than talking
+            # over an open mic (or over a /stop that crossed the dequeue).
             with self._queue_current_lock:
-                self._queue_current = item
+                hold = self._queue_hold_reason()
+                drained = self._drain_gen != gen
+                if hold is None and not drained:
+                    self._queue_current = item
+            if drained:
+                log.info("Speech queue: item %d dropped — drained mid-claim",
+                         item.id)
+                self._queue_recent.append({"id": item.id,
+                                           "outcome": "canceled"})
+                continue
+            if hold is not None:
+                # Front of the deque, not the tail: FIFO order is the contract.
+                with self._tts_queue.mutex:
+                    self._tts_queue.queue.appendleft(item)
+                    self._tts_queue.not_empty.notify()
+                log.debug("Speech queue: item %d held back (%s)",
+                          item.id, hold)
+                continue
             try:
                 if self.current_state != "speaking":
                     self._set_state("speaking")
