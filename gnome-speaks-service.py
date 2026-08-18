@@ -255,6 +255,16 @@ INTROSPECTION_XML = """
 """
 
 # ---------------------------------------------------------------------------
+# Config file (shared with prefs.js and the speech-to-cli engine). Writes go
+# through _save_config_flag: serialized by _config_write_lock and published
+# with an atomic rename, because prefs.js merges on write and a torn read
+# there costs the user every key in the file.
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = os.path.expanduser("~/.config/speech-to-cli/config.json")
+_config_write_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
 # The Chronicle — append-only ledger of everything said (both directions).
 # One JSON object per line; local-only (never enters git). Entries are
 # respeakable via POST /respeak, the Respeak D-Bus method, or "cast echo".
@@ -889,14 +899,16 @@ class GnomeSpeaksService:
 
         Skips JSON parse if file mtime is unchanged since last read.
         """
-        path = os.path.expanduser("~/.config/speech-to-cli/config.json")
         try:
-            mtime = os.path.getmtime(path)
+            mtime = os.path.getmtime(CONFIG_PATH)
             if mtime == self._config_mtime:
                 return
-            self._config_mtime = mtime
-            with open(path) as f:
+            with open(CONFIG_PATH) as f:
                 disk = json.load(f)
+            # Cache the mtime only once the parse succeeded: caching it first
+            # makes a failed read look like an up-to-date one, and the
+            # prefs change is then never applied.
+            self._config_mtime = mtime
             for key in self._SYNC_FLAGS:
                 if key in disk:
                     CONFIG[key] = disk[key]
@@ -904,15 +916,45 @@ class GnomeSpeaksService:
             log.debug("Config reload skipped: %s", exc)
 
     def _save_config_flag(self, key, value):
-        """Write a single flag back to the config file so prefs stays in sync."""
+        """Write a single flag back to the config file so prefs stays in sync.
+
+        Read-modify-write under _config_write_lock, published with an atomic
+        rename. Both halves matter:
+
+        - the lock keeps two service threads (a D-Bus toggle and an HTTP
+          spell, say) from each merging onto the same base and dropping one
+          another's flag;
+        - the rename keeps readers out of the write. open(path, "w")
+          truncates in place, and prefs.js's merge-on-write re-reads this
+          file — on a parse failure it falls back to `onDisk = {}` and
+          writes back a config.json holding only the key it was editing,
+          taking the Azure credentials with it.
+        """
         CONFIG[key] = value
         try:
-            path = os.path.expanduser("~/.config/speech-to-cli/config.json")
-            with open(path) as f:
-                disk = json.load(f)
-            disk[key] = value
-            with open(path, "w") as f:
-                json.dump(disk, f, indent=2)
+            with _config_write_lock:
+                try:
+                    with open(CONFIG_PATH) as f:
+                        disk = json.load(f)
+                    if not isinstance(disk, dict):
+                        raise ValueError("config.json is not an object")
+                except FileNotFoundError:
+                    disk = {}
+                disk[key] = value
+                tmp = f"{CONFIG_PATH}.tmp.{os.getpid()}"
+                os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+                try:
+                    with open(tmp, "w") as f:
+                        json.dump(disk, f, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, CONFIG_PATH)
+                except Exception:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
         except Exception as e:
             log.warning("Failed to save config flag %s: %s", key, e)
 
