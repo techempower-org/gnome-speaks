@@ -50,27 +50,35 @@
 /* ── Labels inside the badge are addressed by NAME, never by type ──
  *
  * `.gnome-speaks-badge StLabel` used to live here, and a type selector
- * cannot tell the difference between the one label it was written for and
- * every label the badge would ever contain. It outranked the pill classes
- * (0,1,1 beats 0,1,0), so their `margin-left: 6px` and their tinted
- * `color` had never once applied — the row's real gap was this rule's 8px,
- * and pill text took this rule's colour. Nothing looked wrong, so nothing
- * said so. Wrapping each pill in an StButton then re-aimed the same rule
- * at the inner label and widened every pill by 8px.
+ * cannot tell the one label it was written for from every label the badge
+ * would ever contain. At (0,1,1) it beat the pill classes at (0,1,0), so
+ * their `margin-left: 6px` and their tinted `color` had never once applied:
+ * the row's real gap was this rule's 8px, and pill text took this rule's
+ * white. Nothing looked broken, so nothing said so. Wrapping each pill in
+ * an StButton then re-aimed the same rule at the inner label, widening
+ * every pill by 8px — and lighting the glyphs needed a second storey of
+ * `.gnome-speaks-quality-hd StLabel`-style rules to climb back over it,
+ * each restating a colour its pill class already declared.
  *
- * Two named classes now: one for the badge's own status label, one for the
- * text inside a pill. The gap lives on the pill classes where it is read,
- * and a label added here tomorrow inherits nothing by accident.
- * Rendered result is unchanged — verified by reading computed St.ThemeNode
- * colours, margins and padding back out of a headless shell. */
+ * Both storeys are gone. The status label is named, and pill text simply
+ * INHERITS from its button — so a pill's own `color`, including its :hover
+ * and :focus variants, reaches the glyph with nothing in between. One
+ * declaration per pill, in the pill class, where a reader will look.
+ *
+ * The two names also mean a label added to this badge tomorrow inherits
+ * nothing by accident. Rendering is byte-identical to the tinted build,
+ * verified by reading computed St.ThemeNode colours out of a headless
+ * shell in every state. */
 .gnome-speaks-badge-label {
     margin-left: 8px;
-}
-
-.gnome-speaks-badge-label,
-.gnome-speaks-pill-label {
     color: rgba(255, 255, 255, 0.92);
 }
+
+/* `.gnome-speaks-pill-label` is deliberately unstyled: the glyph takes its
+ * colour by inheritance from its pill button, so there is nothing to say
+ * here. The class exists so that anything you DO need to say to a pill's
+ * text later has a name to say it to, instead of reaching for `StLabel`
+ * and hitting every other label in the badge along with it. */
 
 .gnome-speaks-badge:hover {
     background-color: rgba(28, 31, 42, 0.86);
@@ -165,8 +173,7 @@
     color: rgba(150, 245, 185, 1.0);
 }
 
-.gnome-speaks-listening .gnome-speaks-badge-label,
-.gnome-speaks-listening .gnome-speaks-pill-label {
+.gnome-speaks-listening .gnome-speaks-badge-label {
     color: rgba(235, 255, 242, 0.98);
 }
 
@@ -190,8 +197,7 @@
     color: rgba(255, 214, 130, 1.0);
 }
 
-.gnome-speaks-processing .gnome-speaks-badge-label,
-.gnome-speaks-processing .gnome-speaks-pill-label {
+.gnome-speaks-processing .gnome-speaks-badge-label {
     color: rgba(255, 246, 230, 0.98);
 }
 
@@ -215,8 +221,7 @@
     color: rgba(206, 168, 255, 1.0);
 }
 
-.gnome-speaks-speaking .gnome-speaks-badge-label,
-.gnome-speaks-speaking .gnome-speaks-pill-label {
+.gnome-speaks-speaking .gnome-speaks-badge-label {
     color: rgba(246, 238, 255, 0.98);
 }
 
@@ -239,8 +244,7 @@
     color: rgba(255, 150, 150, 1.0);
 }
 
-.gnome-speaks-error .gnome-speaks-badge-label,
-.gnome-speaks-error .gnome-speaks-pill-label {
+.gnome-speaks-error .gnome-speaks-badge-label {
     color: rgba(255, 236, 236, 0.98);
 }
 
