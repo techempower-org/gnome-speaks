@@ -18,6 +18,30 @@ import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
+// St.BoxLayout:vertical was deprecated in GNOME 48 in favour of :orientation,
+// and upstream has it slated for removal. :orientation does not exist before
+// 48, and metadata.json still claims 46/47 — so detect once at load and let
+// every box construction speak whichever dialect this shell understands.
+// `pack-start` is already gone in GNOME 50; `vertical` is next.
+const HAS_ORIENTATION = 'orientation' in St.BoxLayout.prototype;
+
+/**
+ * Construct-time orientation props for an St.BoxLayout, portable across 46-50.
+ *
+ * @param {boolean} vertical - true for a column, false for a row
+ * @returns {object} props to spread into the St.BoxLayout constructor
+ */
+function boxOrientation(vertical) {
+    if (HAS_ORIENTATION) {
+        return {
+            orientation: vertical
+                ? Clutter.Orientation.VERTICAL
+                : Clutter.Orientation.HORIZONTAL,
+        };
+    }
+    return {vertical};
+}
+
 const DBUS_NAME = 'org.gnome.Speaks';
 const DBUS_PATH = '/org/gnome/Speaks';
 const DBUS_INTERFACE = 'org.gnome.Speaks';
@@ -499,7 +523,7 @@ export default class GnomeSpeaksExtension extends Extension {
             track_hover: true,
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.CENTER,
-            vertical: false,
+            ...boxOrientation(false),
         });
 
         this._badge.add_child(this._icon);
@@ -604,7 +628,7 @@ export default class GnomeSpeaksExtension extends Extension {
             style_class: 'gnome-speaks-waveform-wrapper',
             reactive: false,
             can_focus: false,
-            vertical: true,
+            ...boxOrientation(true),
             opacity: 0,
         });
 
@@ -613,13 +637,13 @@ export default class GnomeSpeaksExtension extends Extension {
         this._waveformBarsTop = [];
         this._waveformRowTop = new St.BoxLayout({
             style_class: 'gnome-speaks-waveform',
-            vertical: false,
+            ...boxOrientation(false),
             y_align: Clutter.ActorAlign.END, // bars grow downward from bottom of top row
         });
         this._waveformRowTop.set_height(24);
         this._waveformRow = new St.BoxLayout({
             style_class: 'gnome-speaks-waveform',
-            vertical: false,
+            ...boxOrientation(false),
             y_align: Clutter.ActorAlign.START, // bars grow upward from top of bottom row
         });
         this._waveformRow.set_height(24);
@@ -822,7 +846,7 @@ export default class GnomeSpeaksExtension extends Extension {
     _createSubtitleOverlay() {
         this._subtitleOverlay = new St.BoxLayout({
             style_class: 'gnome-speaks-subtitle-overlay',
-            vertical: true,
+            ...boxOrientation(true),
             reactive: false,
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.END,
@@ -2274,7 +2298,7 @@ export default class GnomeSpeaksExtension extends Extension {
         this._destroyContextMenu();
 
         this._contextMenu = new St.BoxLayout({
-            vertical: true,
+            ...boxOrientation(true),
             style_class: 'popup-menu-content',
             style: 'background-color: rgba(40,40,40,0.95); border-radius: 12px; padding: 8px 0; min-width: 200px;',
             reactive: true,
@@ -2433,7 +2457,7 @@ export default class GnomeSpeaksExtension extends Extension {
         this._destroyContextMenu();
 
         let scroll = new St.BoxLayout({
-            vertical: true,
+            ...boxOrientation(true),
             style_class: 'gnome-speaks-chronicle-scroll',
             reactive: true,
         });
