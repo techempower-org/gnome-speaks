@@ -981,14 +981,17 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
     }
 
     _addCorrectionsRow(group) {
-        const corrections = this._config['auto_corrections'] || {};
-        const text = Object.entries(corrections)
+        // Read from this._config on every open, not once at page-build time:
+        // _setConfigValue() mutates this._config in place, so a captured
+        // snapshot would re-show pre-save text the second time you edit.
+        const asText = () => Object.entries(this._config['auto_corrections'] || {})
             .map(([wrong, right]) => `${wrong}=${right}`)
             .join('\n');
+        const summary = n => `${n} defined — fix words it always mishears (wrong=right)`;
 
         const row = new Adw.ActionRow({
             title: 'Word Corrections',
-            subtitle: `${Object.keys(corrections).length} defined — fix words it always mishears (wrong=right)`,
+            subtitle: summary(Object.keys(this._config['auto_corrections'] || {}).length),
         });
 
         const editButton = new Gtk.Button({
@@ -997,11 +1000,13 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         });
 
         editButton.connect('clicked', () => {
-            const dialog = new Gtk.Dialog({
-                title: 'Auto-Corrections',
-                modal: true,
-                default_width: 400,
-                default_height: 300,
+            // Adw.AlertDialog, not Gtk.Dialog: Gtk.Dialog is deprecated since
+            // GTK 4.10, and the old call also presented without a parent, so
+            // the "modal" editor floated free of the prefs window. Mirrors the
+            // shortcut editor below.
+            const dialog = new Adw.AlertDialog({
+                heading: 'Auto-Corrections',
+                body: 'One correction per line: wrong=right',
             });
 
             const textView = new Gtk.TextView({
@@ -1013,45 +1018,39 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
                 left_margin: 8,
                 right_margin: 8,
             });
-            textView.buffer.set_text(text, -1);
+            textView.buffer.set_text(asText(), -1);
 
-            const scrolled = new Gtk.ScrolledWindow({
+            dialog.set_extra_child(new Gtk.ScrolledWindow({
                 child: textView,
                 vexpand: true,
                 hexpand: true,
-            });
+                width_request: 380,
+                height_request: 260,
+            }));
 
-            const box = dialog.get_content_area();
-            const label = new Gtk.Label({
-                label: 'One correction per line: wrong=right',
-                halign: Gtk.Align.START,
-                margin_start: 8,
-                margin_top: 8,
-            });
-            box.append(label);
-            box.append(scrolled);
-
-            dialog.add_button('Cancel', Gtk.ResponseType.CANCEL);
-            dialog.add_button('Save', Gtk.ResponseType.OK);
+            dialog.add_response('cancel', 'Cancel');
+            dialog.add_response('save', 'Save');
+            dialog.set_response_appearance('save', Adw.ResponseAppearance.SUGGESTED);
+            dialog.set_default_response('save');
+            dialog.set_close_response('cancel');
 
             dialog.connect('response', (dlg, response) => {
-                if (response === Gtk.ResponseType.OK) {
-                    let [start, end] = textView.buffer.get_bounds();
-                    let newText = textView.buffer.get_text(start, end, false);
-                    let newCorrections = {};
-                    for (let line of newText.split('\n')) {
-                        line = line.trim();
-                        if (!line || !line.includes('=')) continue;
-                        let [wrong, ...rightParts] = line.split('=');
-                        newCorrections[wrong.trim()] = rightParts.join('=').trim();
-                    }
-                    this._setConfigValue('auto_corrections', newCorrections);
-                    row.subtitle = `${Object.keys(newCorrections).length} defined — fix words it always mishears (wrong=right)`;
+                if (response !== 'save')
+                    return;
+                let [start, end] = textView.buffer.get_bounds();
+                let newText = textView.buffer.get_text(start, end, false);
+                let newCorrections = {};
+                for (let line of newText.split('\n')) {
+                    line = line.trim();
+                    if (!line || !line.includes('=')) continue;
+                    let [wrong, ...rightParts] = line.split('=');
+                    newCorrections[wrong.trim()] = rightParts.join('=').trim();
                 }
-                dlg.destroy();
+                this._setConfigValue('auto_corrections', newCorrections);
+                row.subtitle = summary(Object.keys(newCorrections).length);
             });
 
-            dialog.present();
+            dialog.present(group.get_root());
         });
 
         row.add_suffix(editButton);
