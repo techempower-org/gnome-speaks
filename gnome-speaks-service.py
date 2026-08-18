@@ -255,6 +255,16 @@ INTROSPECTION_XML = """
 """
 
 # ---------------------------------------------------------------------------
+# Config file (shared with prefs.js and the speech-to-cli engine). Writes go
+# through _save_config_flag: serialized by _config_write_lock and published
+# with an atomic rename, because prefs.js merges on write and a torn read
+# there costs the user every key in the file.
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = os.path.expanduser("~/.config/speech-to-cli/config.json")
+_config_write_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
 # The Chronicle — append-only ledger of everything said (both directions).
 # One JSON object per line; local-only (never enters git). Entries are
 # respeakable via POST /respeak, the Respeak D-Bus method, or "cast echo".
@@ -767,8 +777,10 @@ class GnomeSpeaksService:
         # STT mode selection (auto, streaming, whisper, vad, fixed)
         self._stt_mode = "auto"
 
-        # Inactivity timer
+        # Inactivity timer (touched from every worker thread via _set_state)
         self._inactivity_source_id = None
+        self._inactivity_lock = threading.Lock()
+        self._inactivity_gen = 0
         self._main_loop = None
 
         # DBus connection (set after registration)
@@ -808,7 +820,14 @@ class GnomeSpeaksService:
         self._tts_queue_seq = itertools.count(1)  # next() is atomic in CPython
         self._queue_current = None                # TTSQueueItem now playing
         self._queue_current_lock = threading.Lock()
+        # Refcounted, NOT a plain flag: user-speech paths overlap (a second
+        # Speak preempting the first, a spell's Talk during an AI reply), and
+        # a boolean would let the first one to finish unhold the queue while
+        # the other is still playing. The Event is the dispatcher's cheap
+        # read; _user_speech_depth is the truth. See _hold_user_speech.
         self._user_speech_active = threading.Event()
+        self._user_speech_depth = 0
+        self._user_speech_lock = threading.Lock()
         # Playback ownership token: each playback claims a fresh object();
         # a preempted worker's cleanup must not reset state it no longer owns.
         self._speak_token = None
@@ -816,6 +835,11 @@ class GnomeSpeaksService:
         # exposed on GET /queue so the /speak id isn't write-only. Exactly one
         # terminal outcome per item (Android-style invariant).
         self._queue_recent = deque(maxlen=16)
+        # Bumped by every drain. The dispatcher captures it before dequeuing
+        # and re-reads it once it has the item, so a /stop that lands in the
+        # gap between "off the queue" and "playing" still kills the item.
+        # Plain int: increments race benignly (any bump is a mismatch).
+        self._drain_gen = 0
         # Serializes coalesce-then-put so two concurrent bursts from the same
         # source can't interleave (drop, drop, put, put would leave two items
         # where the caller asked for one). Order is always _enqueue_lock ->
@@ -877,14 +901,16 @@ class GnomeSpeaksService:
 
         Skips JSON parse if file mtime is unchanged since last read.
         """
-        path = os.path.expanduser("~/.config/speech-to-cli/config.json")
         try:
-            mtime = os.path.getmtime(path)
+            mtime = os.path.getmtime(CONFIG_PATH)
             if mtime == self._config_mtime:
                 return
-            self._config_mtime = mtime
-            with open(path) as f:
+            with open(CONFIG_PATH) as f:
                 disk = json.load(f)
+            # Cache the mtime only once the parse succeeded: caching it first
+            # makes a failed read look like an up-to-date one, and the
+            # prefs change is then never applied.
+            self._config_mtime = mtime
             for key in self._SYNC_FLAGS:
                 if key in disk:
                     CONFIG[key] = disk[key]
@@ -892,15 +918,45 @@ class GnomeSpeaksService:
             log.debug("Config reload skipped: %s", exc)
 
     def _save_config_flag(self, key, value):
-        """Write a single flag back to the config file so prefs stays in sync."""
+        """Write a single flag back to the config file so prefs stays in sync.
+
+        Read-modify-write under _config_write_lock, published with an atomic
+        rename. Both halves matter:
+
+        - the lock keeps two service threads (a D-Bus toggle and an HTTP
+          spell, say) from each merging onto the same base and dropping one
+          another's flag;
+        - the rename keeps readers out of the write. open(path, "w")
+          truncates in place, and prefs.js's merge-on-write re-reads this
+          file — on a parse failure it falls back to `onDisk = {}` and
+          writes back a config.json holding only the key it was editing,
+          taking the Azure credentials with it.
+        """
         CONFIG[key] = value
         try:
-            path = os.path.expanduser("~/.config/speech-to-cli/config.json")
-            with open(path) as f:
-                disk = json.load(f)
-            disk[key] = value
-            with open(path, "w") as f:
-                json.dump(disk, f, indent=2)
+            with _config_write_lock:
+                try:
+                    with open(CONFIG_PATH) as f:
+                        disk = json.load(f)
+                    if not isinstance(disk, dict):
+                        raise ValueError("config.json is not an object")
+                except FileNotFoundError:
+                    disk = {}
+                disk[key] = value
+                tmp = f"{CONFIG_PATH}.tmp.{os.getpid()}"
+                os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+                try:
+                    with open(tmp, "w") as f:
+                        json.dump(disk, f, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, CONFIG_PATH)
+                except Exception:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
         except Exception as e:
             log.warning("Failed to save config flag %s: %s", key, e)
 
@@ -1019,22 +1075,41 @@ class GnomeSpeaksService:
     # -- Inactivity timer --------------------------------------------------
 
     def _reset_inactivity_timer(self):
-        if self._inactivity_source_id is not None:
-            GLib.source_remove(self._inactivity_source_id)
-            self._inactivity_source_id = None
-        if INACTIVITY_TIMEOUT_SEC <= 0:
-            return
-        self._inactivity_source_id = GLib.timeout_add_seconds(
-            INACTIVITY_TIMEOUT_SEC, self._on_inactivity_timeout,
-        )
+        """Restart the idle-exit timer. Called from every _set_state, i.e.
+        from worker threads that transition state concurrently.
 
-    def _on_inactivity_timeout(self):
+        Serialized: read-remove-add on _inactivity_source_id used to race,
+        and two threads landing on the same id both removed it (GLib
+        "Source ID N was not found") and then both stored theirs — orphaning
+        a live 10-minute timer per collision. Each orphan later fires, and
+        a fire that finds the service idle quits the main loop, so the
+        service exits while it is still in use. Measured: 1144 orphaned
+        timers from 3s of two-thread state churn.
+        """
+        with self._inactivity_lock:
+            if self._inactivity_source_id is not None:
+                GLib.source_remove(self._inactivity_source_id)
+                self._inactivity_source_id = None
+            if INACTIVITY_TIMEOUT_SEC <= 0:
+                return
+            self._inactivity_gen += 1
+            self._inactivity_source_id = GLib.timeout_add_seconds(
+                INACTIVITY_TIMEOUT_SEC, self._on_inactivity_timeout,
+                self._inactivity_gen,
+            )
+
+    def _on_inactivity_timeout(self, gen):
+        with self._inactivity_lock:
+            if gen != self._inactivity_gen:
+                # Superseded while we sat in the main-loop dispatch queue:
+                # not ours to act on, and must not clobber the live handle.
+                return False
+            self._inactivity_source_id = None  # one-shot; already spent
         if self.current_state == "idle":
             log.info("Inactivity timeout reached, quitting.")
             if self._main_loop is not None:
                 self._main_loop.quit()
             return False
-        self._inactivity_source_id = None
         self._reset_inactivity_timer()
         return False
 
@@ -1754,6 +1829,10 @@ class GnomeSpeaksService:
         """Remove all pending speech-queue items. Returns the count cleared."""
         cleared = 0
         ids = []
+        # Bump first: an item the dispatcher pulled microseconds ago is no
+        # longer in the queue, so draining cannot reach it. The generation
+        # tells the dispatcher "a drain crossed your dequeue — drop it".
+        self._drain_gen += 1
         while True:
             try:
                 item = self._tts_queue.get_nowait()
@@ -1768,6 +1847,41 @@ class GnomeSpeaksService:
                              cleared, ids)
                 return cleared
 
+    def _hold_user_speech(self):
+        """Claim the agent-queue hold for one user-speech path (refcounted).
+
+        Every claim must be matched by exactly one _release_user_speech, or
+        the queue stays silent forever / starts narrating too early.
+        """
+        with self._user_speech_lock:
+            self._user_speech_depth += 1
+            self._user_speech_active.set()
+
+    def _release_user_speech(self):
+        """Drop one claim; the hold lifts only when the last one is gone."""
+        with self._user_speech_lock:
+            if self._user_speech_depth > 0:
+                self._user_speech_depth -= 1
+            else:
+                log.warning("User-speech hold released more often than held")
+            if self._user_speech_depth == 0:
+                self._user_speech_active.clear()
+
+    def _queue_hold_reason(self):
+        """Why the dispatcher must not start an item right now (or None).
+
+        Pause is queue-level (unanimous across Web Speech/.NET/Apple): a
+        paused service must not start the next item either.
+        """
+        if self._user_speech_active.is_set():
+            return "user speech"
+        if state._pause_event.is_set():
+            return "paused"
+        st = self.current_state
+        if st in ("listening", "processing"):
+            return st
+        return None
+
     def _tts_dispatcher(self):
         """Daemon thread: plays queued HTTP speech items serially.
 
@@ -1778,18 +1892,37 @@ class GnomeSpeaksService:
         while True:
             # Wait until clear BEFORE dequeuing, so held items stay visible
             # in GET /queue and remain drainable by /stop during user speech.
-            # Pause is queue-level (unanimous across Web Speech/.NET/Apple):
-            # a paused service must not start the next item either.
-            while (self._user_speech_active.is_set()
-                   or state._pause_event.is_set()
-                   or self.current_state in ("listening", "processing")):
+            while self._queue_hold_reason() is not None:
                 time.sleep(0.2)
+            gen = self._drain_gen
             try:
                 item = self._tts_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
+            # The gate above is a check-then-act: this thread parks inside
+            # get() with the hold clear, and put_nowait wakes it the instant
+            # an item arrives — by which time the mic may be open. Re-check
+            # under the claim lock and hand the item back rather than talking
+            # over an open mic (or over a /stop that crossed the dequeue).
             with self._queue_current_lock:
-                self._queue_current = item
+                hold = self._queue_hold_reason()
+                drained = self._drain_gen != gen
+                if hold is None and not drained:
+                    self._queue_current = item
+            if drained:
+                log.info("Speech queue: item %d dropped — drained mid-claim",
+                         item.id)
+                self._queue_recent.append({"id": item.id,
+                                           "outcome": "canceled"})
+                continue
+            if hold is not None:
+                # Front of the deque, not the tail: FIFO order is the contract.
+                with self._tts_queue.mutex:
+                    self._tts_queue.queue.appendleft(item)
+                    self._tts_queue.not_empty.notify()
+                log.debug("Speech queue: item %d held back (%s)",
+                          item.id, hold)
+                continue
             try:
                 if self.current_state != "speaking":
                     self._set_state("speaking")
@@ -1832,8 +1965,8 @@ class GnomeSpeaksService:
             return False
 
         # Hold the queue dispatcher before preempting (user outranks agents).
-        # The worker's finally clears this; early exits must clear it here.
-        self._user_speech_active.set()
+        # The worker's finally releases this; early exits must release here.
+        self._hold_user_speech()
 
         # Stop outside lock to prevent deadlock (stop() acquires multiple locks)
         # drain_queue=False: user preemption drops only the current utterance,
@@ -1843,7 +1976,7 @@ class GnomeSpeaksService:
 
         if not CONFIG.get("key"):
             GLib.idle_add(self._emit_error, "Azure Speech key not configured")
-            self._user_speech_active.clear()
+            self._release_user_speech()
             return False
 
         with self._speak_lock:
@@ -1857,7 +1990,14 @@ class GnomeSpeaksService:
                 kwargs={"owner_token": token},
                 daemon=True,
             )
-            self._speak_thread.start()
+            try:
+                self._speak_thread.start()
+            except Exception:
+                # Nobody else will run the worker's finally — releasing the
+                # hold here is the difference between a failed utterance and
+                # a permanently silent speech queue.
+                self._release_user_speech()
+                raise
             return True
 
     def _tts_level_cb(self, level):
@@ -1981,7 +2121,7 @@ class GnomeSpeaksService:
                 self._set_state("idle")
             _schedule_warmup()
             if user_initiated:
-                self._user_speech_active.clear()
+                self._release_user_speech()
 
             # Hands-free loop: after TTS finishes in conversation mode,
             # automatically restart listening if continuous_dictation is enabled.
@@ -2260,7 +2400,7 @@ class GnomeSpeaksService:
 
         # Talk blocks until the exchange completes, so one try/finally holds
         # the speech queue for the whole call (user outranks agents).
-        self._user_speech_active.set()
+        self._hold_user_speech()
         try:
             with self._talk_lock:
                 if self.current_state not in ("idle",):
@@ -2291,7 +2431,7 @@ class GnomeSpeaksService:
                 done_event.wait()
                 return result_holder["reply"]
         finally:
-            self._user_speech_active.clear()
+            self._release_user_speech()
 
     def _talk_worker(self, text, result_holder, done_event):
         """Background thread: full-duplex TTS+STT via speech_tts.talk_fullduplex()."""
@@ -2671,7 +2811,7 @@ class GnomeSpeaksService:
         """
         # AI replies are user-initiated speech: hold the agent speech queue
         # for the whole turn (LLM streaming + sentence TTS).
-        self._user_speech_active.set()
+        self._hold_user_speech()
         try:
             provider = CONFIG.get("llm_provider", "anthropic")
             model = CONFIG.get("llm_model", "claude-opus-4.6")
@@ -2866,7 +3006,7 @@ class GnomeSpeaksService:
                     else False
                 ))
         finally:
-            self._user_speech_active.clear()
+            self._release_user_speech()
 
     # -- Conversation worker ------------------------------------------------
 
