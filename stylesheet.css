@@ -67,24 +67,6 @@
     margin-left: 0px;
 }
 
-/* Pill TEXT tints. The pill classes' own `color` never reaches the glyphs:
- * `.gnome-speaks-badge StLabel` above is (0,1,1) and beats both the class
- * rule on the button (0,1,0) and plain inheritance. These (0,2,1) rules
- * finally let each rune's text glow in its own tint (JP, 2026-08-18). */
-.gnome-speaks-quality-hd StLabel { color: rgba(255, 226, 140, 1.0); }
-.gnome-speaks-quality-fast StLabel { color: rgba(158, 248, 192, 1.0); }
-.gnome-speaks-mode-dict StLabel { color: rgba(255, 255, 255, 0.45); }
-.gnome-speaks-mode-dict:hover StLabel,
-.gnome-speaks-mode-dict:focus StLabel { color: rgba(255, 255, 255, 0.75); }
-.gnome-speaks-mode-chat StLabel { color: rgba(212, 176, 255, 1.0); }
-.gnome-speaks-pill-off StLabel { color: rgba(255, 255, 255, 0.35); }
-.gnome-speaks-pill-off:hover StLabel,
-.gnome-speaks-pill-off:focus StLabel { color: rgba(255, 255, 255, 0.65); }
-.gnome-speaks-pill-on StLabel { color: rgba(150, 230, 255, 1.0); }
-.gnome-speaks-pill-chronicle StLabel { color: rgba(255, 255, 255, 0.55); }
-.gnome-speaks-pill-chronicle:hover StLabel,
-.gnome-speaks-pill-chronicle:focus StLabel { color: rgba(255, 236, 190, 1.0); }
-
 .gnome-speaks-badge:hover {
     background-color: rgba(28, 31, 42, 0.86);
     border: 1px solid rgba(255, 255, 255, 0.16);
