@@ -526,6 +526,10 @@ export default class GnomeSpeaksExtension extends Extension {
 
         this._label = new St.Label({
             text: '',
+            // Named, not inferred: the stylesheet used to reach this label
+            // through `.gnome-speaks-badge StLabel`, which also swept up
+            // every other label the badge will ever contain.
+            style_class: 'gnome-speaks-badge-label',
             y_align: Clutter.ActorAlign.CENTER,
             visible: false,
         });
@@ -825,6 +829,7 @@ export default class GnomeSpeaksExtension extends Extension {
     _createPill(text, styleClass, accessibleName, onActivate) {
         let label = new St.Label({
             text: text,
+            style_class: 'gnome-speaks-pill-label',
             y_align: Clutter.ActorAlign.CENTER,
             x_align: Clutter.ActorAlign.CENTER,
         });

@@ -47,24 +47,29 @@
     transition-duration: 250ms;
 }
 
-.gnome-speaks-badge StLabel {
+/* ── Labels inside the badge are addressed by NAME, never by type ──
+ *
+ * `.gnome-speaks-badge StLabel` used to live here, and a type selector
+ * cannot tell the difference between the one label it was written for and
+ * every label the badge would ever contain. It outranked the pill classes
+ * (0,1,1 beats 0,1,0), so their `margin-left: 6px` and their tinted
+ * `color` had never once applied — the row's real gap was this rule's 8px,
+ * and pill text took this rule's colour. Nothing looked wrong, so nothing
+ * said so. Wrapping each pill in an StButton then re-aimed the same rule
+ * at the inner label and widened every pill by 8px.
+ *
+ * Two named classes now: one for the badge's own status label, one for the
+ * text inside a pill. The gap lives on the pill classes where it is read,
+ * and a label added here tomorrow inherits nothing by accident.
+ * Rendered result is unchanged — verified by reading computed St.ThemeNode
+ * colours, margins and padding back out of a headless shell. */
+.gnome-speaks-badge-label {
     margin-left: 8px;
+}
+
+.gnome-speaks-badge-label,
+.gnome-speaks-pill-label {
     color: rgba(255, 255, 255, 0.92);
-}
-
-/* Every pill in the row used to BE an StLabel, so the rule above — not the
- * `margin-left: 6px` in the pill classes, which never won on specificity —
- * is what actually set the gaps between pills. A pill is now an StButton
- * wrapping an StLabel, so that same rule lands on the inner label, where an
- * 8px margin pushes the glyph off-centre and widens every pill by 8px.
- * Hand the gap back to the button and zero it on the label: same pixels,
- * different widget. Verified by AT-SPI extents against the old build. */
-.gnome-speaks-badge StButton {
-    margin-left: 8px;
-}
-
-.gnome-speaks-badge StButton StLabel {
-    margin-left: 0px;
 }
 
 .gnome-speaks-badge:hover {
@@ -160,7 +165,8 @@
     color: rgba(150, 245, 185, 1.0);
 }
 
-.gnome-speaks-listening StLabel {
+.gnome-speaks-listening .gnome-speaks-badge-label,
+.gnome-speaks-listening .gnome-speaks-pill-label {
     color: rgba(235, 255, 242, 0.98);
 }
 
@@ -184,7 +190,8 @@
     color: rgba(255, 214, 130, 1.0);
 }
 
-.gnome-speaks-processing StLabel {
+.gnome-speaks-processing .gnome-speaks-badge-label,
+.gnome-speaks-processing .gnome-speaks-pill-label {
     color: rgba(255, 246, 230, 0.98);
 }
 
@@ -208,7 +215,8 @@
     color: rgba(206, 168, 255, 1.0);
 }
 
-.gnome-speaks-speaking StLabel {
+.gnome-speaks-speaking .gnome-speaks-badge-label,
+.gnome-speaks-speaking .gnome-speaks-pill-label {
     color: rgba(246, 238, 255, 0.98);
 }
 
@@ -231,7 +239,8 @@
     color: rgba(255, 150, 150, 1.0);
 }
 
-.gnome-speaks-error StLabel {
+.gnome-speaks-error .gnome-speaks-badge-label,
+.gnome-speaks-error .gnome-speaks-pill-label {
     color: rgba(255, 236, 236, 0.98);
 }
 
@@ -262,7 +271,7 @@
     font-weight: 700;
     border-radius: 999px;
     padding: 3px 11px;
-    margin-left: 6px;
+    margin-left: 8px;   /* the row's real gap — see the badge-label note above */
     text-align: center;
     transition-duration: 200ms;
     border: 1px solid rgba(255, 255, 255, 0.10);
