@@ -1007,26 +1007,29 @@ export default class GnomeSpeaksExtension extends Extension {
             this._subtitleOverlay.add_style_class_name(`gnome-speaks-subtitle-${color}`);
     }
 
+    // The monitor the badge actually sits on — NOT primaryMonitor. Anything
+    // that positions chrome against the badge must clamp to this, or on a
+    // multi-head desk it gets yanked onto the primary display and reads as
+    // "the button did nothing".
+    _monitorForBadge() {
+        if (!this._badge)
+            return Main.layoutManager.primaryMonitor;
+        let cx = this._badge.x + this._badge.width / 2;
+        let cy = this._badge.y + this._badge.height / 2;
+        for (let m of Main.layoutManager.monitors) {
+            if (cx >= m.x && cx < m.x + m.width &&
+                cy >= m.y && cy < m.y + m.height)
+                return m;
+        }
+        return Main.layoutManager.primaryMonitor;
+    }
+
     _positionSubtitleOverlay() {
         if (!this._subtitleOverlay || !this._badge)
             return;
 
         let badge = this._badge;
-
-        // Find which monitor the badge is on (not always primaryMonitor)
-        let badgeCenterX = badge.x + badge.width / 2;
-        let badgeCenterY = badge.y + badge.height / 2;
-        let monitor = null;
-        for (let i = 0; i < Main.layoutManager.monitors.length; i++) {
-            let m = Main.layoutManager.monitors[i];
-            if (badgeCenterX >= m.x && badgeCenterX < m.x + m.width &&
-                badgeCenterY >= m.y && badgeCenterY < m.y + m.height) {
-                monitor = m;
-                break;
-            }
-        }
-        if (!monitor)
-            monitor = Main.layoutManager.primaryMonitor;
+        let monitor = this._monitorForBadge();
         if (!monitor)
             return;
 
@@ -1035,7 +1038,7 @@ export default class GnomeSpeaksExtension extends Extension {
 
         // Show above or below badge depending on position within THIS monitor
         let screenMidY = monitor.y + monitor.height / 2;
-        let showAbove = badgeCenterY > screenMidY;
+        let showAbove = (badge.y + badge.height / 2) > screenMidY;
 
         // Horizontal: center on badge, clamp to THIS monitor's edges
         let overlayX = badge.x + badge.width / 2 - overlayWidth / 2;
@@ -2785,7 +2788,9 @@ export default class GnomeSpeaksExtension extends Extension {
             let x = badgeX + (badgeWidth - w) / 2;
             let y = badgeY - h - 12;
 
-            let monitor = Main.layoutManager.primaryMonitor;
+            // The badge's OWN monitor: clamping to primaryMonitor sent the
+            // scroll to another display whenever the badge lived elsewhere.
+            let monitor = this._monitorForBadge();
             if (monitor) {
                 x = Math.max(monitor.x + 8,
                     Math.min(x, monitor.x + monitor.width - w - 8));
@@ -2808,15 +2813,23 @@ export default class GnomeSpeaksExtension extends Extension {
             if (!this._chronicleScroll)
                 return Clutter.EVENT_PROPAGATE;
             let [px, py] = ev.get_coords();
-            let [mx, my] = this._chronicleScroll.get_transformed_position();
-            let mw = this._chronicleScroll.get_width();
-            let mh = this._chronicleScroll.get_height();
-            if (px < mx || px > mx + mw || py < my || py > my + mh) {
-                this._destroyChronicleScroll();
-                // Don't swallow: a click on the badge/pill should still land,
-                // so the 📜 pill acts as a true toggle.
+            let inside = (actor, w = null, h = null) => {
+                if (!actor)
+                    return false;
+                let [ax, ay] = actor.get_transformed_position();
+                let aw = w === null ? actor.get_width() : w;
+                let ah = h === null ? actor.get_height() : h;
+                return px >= ax && px <= ax + aw && py >= ay && py <= ay + ah;
+            };
+            // The rune is its own close button: St.Button emits `clicked` on
+            // RELEASE, so destroying here would let that release reopen the
+            // scroll a frame later — the toggle would look stuck open. Leave
+            // it to _toggleChronicleScroll.
+            if (inside(this._chroniclePill))
                 return Clutter.EVENT_PROPAGATE;
-            }
+            if (!inside(this._chronicleScroll))
+                this._destroyChronicleScroll();
+            // Never swallow: a click elsewhere must still reach its target.
             return Clutter.EVENT_PROPAGATE;
         });
     }
