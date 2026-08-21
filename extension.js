@@ -588,6 +588,13 @@ export default class GnomeSpeaksExtension extends Extension {
                 this._showContextMenu();
                 return Clutter.EVENT_STOP;
             }
+            // A press that landed on a pill belongs to that pill. The badge
+            // claims button 1 for drag + click-to-listen, and that claim used
+            // to swallow every pill: the 📜 rune started dictation instead of
+            // unfurling the Chronicle. Never assume a child consumed its own
+            // event — check the source and get out of the way.
+            if (this._eventOnPill(event))
+                return Clutter.EVENT_PROPAGATE;
             if (button === 1) {
                 let [stageX, stageY] = event.get_coords();
                 this._dragStartX = stageX;
@@ -634,11 +641,17 @@ export default class GnomeSpeaksExtension extends Extension {
         });
         this._signals.push({obj: this._badge, id: motionId});
 
-        let releaseId = this._badge.connect('button-release-event', () => {
+        let releaseId = this._badge.connect('button-release-event', (actor, event) => {
             // Always end drag state on any release — the grab routes
             // all events here, so we must unconditionally clean up
             let wasDragging = this._isDragging;
             this._endDrag();
+
+            // Same rule as press: a release on a pill is the pill's business
+            // (St.Button emits `clicked` from it). Toggling listening here
+            // would fire on every pill activation.
+            if (!wasDragging && this._eventOnPill(event))
+                return Clutter.EVENT_PROPAGATE;
 
             if (!wasDragging) {
                 this._onBadgeClicked();
@@ -826,6 +839,45 @@ export default class GnomeSpeaksExtension extends Extension {
     // — the same things a screen reader needs to see it at all. The child
     // label is explicit so text metrics and alignment stay exactly where the
     // St.Label version put them; the visual identity must not move.
+    // True when this pointer event originated on (or inside) one of the
+    // badge's pills. Walks the actor chain rather than comparing to the
+    // pills directly, because the event source is usually the inner label.
+    _eventOnPill(event) {
+        if (!event || !this._badge)
+            return false;
+
+        let pills = (this._pills || []).concat(
+            this._chroniclePill ? [this._chroniclePill] : []);
+        if (pills.length === 0)
+            return false;
+
+        // Path 1 — the actor chain: usually the event's source is the pill's
+        // inner label, so walk up to the badge looking for a pill.
+        let source = event.get_source ? event.get_source() : null;
+        for (let actor = source; actor && actor !== this._badge;
+             actor = actor.get_parent()) {
+            if (pills.includes(actor))
+                return true;
+        }
+
+        // Path 2 — geometry: belt and braces. If the pointer is inside a
+        // visible pill's allocation, the badge has no business acting on it
+        // even when the event was routed straight to the badge (a grab, or a
+        // child that declined the event).
+        if (event.get_coords) {
+            let [x, y] = event.get_coords();
+            for (let pill of pills) {
+                if (!pill.visible)
+                    continue;
+                let [px, py] = pill.get_transformed_position();
+                if (x >= px && x <= px + pill.get_width() &&
+                    y >= py && y <= py + pill.get_height())
+                    return true;
+            }
+        }
+        return false;
+    }
+
     _createPill(text, styleClass, accessibleName, onActivate) {
         let label = new St.Label({
             text: text,
