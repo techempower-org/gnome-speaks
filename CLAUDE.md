@@ -128,6 +128,22 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
   (`$XDG_RUNTIME_DIR/gnome-speaks/prior-engine` written *before* the swap, restore-on-start,
   `ExecStopPost=… --restore-ime`, and a session watchdog). Do not treat any of them as optional,
   and keep `restore_prior_engine()` dependency-free — it must run with no config and no instance.
+- **The cancel wire is not the cancel verdict**: `state._cancel_event` (speech-to-cli) is a single
+  process-global bit shared by every STT and TTS call. It can *interrupt* an operation, but it can
+  never say **which** one was cancelled, and the next operation's `CancelRegistry.begin()`
+  legitimately lowers it while an earlier one is still winding down (stop's joins time out after
+  3 s). So anything the service decides **about a finished operation** — type this transcript,
+  record this queue outcome, restart the loop — must read that operation's `CancelToken`, never the
+  wire. Never reintroduce a bare `state._cancel_event.clear()` in a worker; go through
+  `self._cancels` (`issue` → `begin` → `retire`), and retire on every exit or the token leaks into
+  the live set forever.
+- **`stop()` and `stop_listening()` both set `_stop_event` and mean opposite things**:
+  `stop_listening()` is the dictation hotkey — end the utterance, **keep** the text.  `stop()` is the
+  panic stop (D-Bus Stop, `POST /stop`, "cast stop", every user-speech preemption) — **abandon** it.
+  `_stop_event` cannot express the difference and is cleared by the next `start_listening()`, so
+  only `stop()` cancels the session token and only the token may gate the transcript. A library
+  result is not a cancellation check either: `stt_fixed()` calls `is_cancelled()` exactly once and
+  then POSTs to Azure with a 30 s timeout, so a stop during the upload is simply never seen.
 - **`commit_text("\n")` is not the Enter key**: it inserts a newline *character*, so a shell never
   runs the command. `press_enter()` is a distinct seam method for this reason and delegates to a
   key-event backend even when IBus is active (spec §5.4, "non-text targets"). Never collapse it
