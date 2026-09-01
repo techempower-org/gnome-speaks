@@ -891,6 +891,139 @@ def replace_typed_text(old_text, new_text):
                 _type_raw(new_suffix)
 
 
+# ---------------------------------------------------------------------------
+# Injection seam
+# ---------------------------------------------------------------------------
+# Every path that puts text in front of the user's cursor goes through an
+# Injector.  Today there is exactly one backend (ydotool/xdotool, the functions
+# above); the seam exists so an IBus backend can be added beside it without
+# touching the STT cycle.  See the IBus spec, phase 1 — this extraction is a
+# pure refactor and deliberately changes no behavior.
+#
+# YdotoolInjector delegates to the module-level functions rather than absorbing
+# them: it keeps their bodies byte-identical (so every timing quirk survives by
+# construction) and keeps them patchable by name, which the test harnesses rely
+# on to stay off the real uinput device.
+
+
+class Injector:
+    """Backend-agnostic text injection.
+
+    Subclasses implement the five injection primitives the STT cycle uses.
+    ``prepare``/``recover``/``available``/``supports_preedit`` have safe
+    defaults so a partial backend degrades instead of crashing.
+    """
+
+    name = "base"
+
+    def prepare(self):
+        """One-time backend startup. Called off the main thread at boot."""
+
+    def available(self):
+        """True if this backend can type live at the cursor."""
+        return False
+
+    def supports_preedit(self):
+        """True if partials can go to a volatile pre-edit region."""
+        return False
+
+    def commit(self, text):
+        """Put final ``text`` at the cursor. Returns True on success."""
+        raise NotImplementedError
+
+    def type_raw(self, text):
+        """Type ``text`` with no focus-settle delay and no fallback."""
+        raise NotImplementedError
+
+    def send_backspaces(self, count):
+        """Retract ``count`` characters already put at the cursor."""
+        raise NotImplementedError
+
+    def replace_text(self, old_text, new_text):
+        """Update live-typed text from ``old_text`` to ``new_text``."""
+        raise NotImplementedError
+
+    def paste(self, text):
+        """Deliver ``text`` via the clipboard. Returns True on success."""
+        raise NotImplementedError
+
+    def recover(self):
+        """Clear any wedged backend state (called on shutdown)."""
+
+
+class YdotoolInjector(Injector):
+    """The shipping backend: ydotool (or xdotool), synthesizing key events.
+
+    Thin adapter over the module-level typing functions above — same code,
+    same timings, same quirks.
+    """
+
+    name = "ydotool"
+
+    def prepare(self):
+        _detect_typing_tool()
+        _reset_ydotoold()
+
+    def available(self):
+        return _TYPING_TOOL in ("ydotool", "xdotool")
+
+    def supports_preedit(self):
+        return False
+
+    def commit(self, text):
+        return type_at_cursor(text)
+
+    def type_raw(self, text):
+        return _type_raw(text)
+
+    def send_backspaces(self, count):
+        return _send_backspaces(count)
+
+    def replace_text(self, old_text, new_text):
+        return replace_typed_text(old_text, new_text)
+
+    def paste(self, text):
+        return _clipboard_paste(text)
+
+    def recover(self):
+        return _reset_ydotoold()
+
+
+_INJECTION_METHODS = ("ydotool", "ibus", "auto")
+
+_injector = None
+_injector_lock = threading.Lock()
+
+
+def _make_injector():
+    """Pick a backend from CONFIG['injection_method'].
+
+    Only ydotool is implemented; every other value falls back to it.  The
+    config key must also be whitelisted in speech-to-cli's state.py
+    load_config(), or it reads "ydotool" forever.
+    """
+    method = str(CONFIG.get("injection_method") or "ydotool").strip().lower()
+    if method not in _INJECTION_METHODS:
+        log.warning("Unknown injection_method %r (expected one of %s), using ydotool",
+                    method, ", ".join(_INJECTION_METHODS))
+    elif method == "ibus":
+        log.warning("injection_method=ibus is not implemented yet, using ydotool")
+    elif method == "auto":
+        log.info("injection_method=auto resolves to ydotool (no IBus backend yet)")
+    return YdotoolInjector()
+
+
+def get_injector():
+    """The process-wide injection backend (lazy, built once)."""
+    global _injector
+    if _injector is None:
+        with _injector_lock:
+            if _injector is None:
+                _injector = _make_injector()
+                log.info("Injection backend: %s", _injector.name)
+    return _injector
+
+
 # ── Terminal-mode smart lowercasing ──────────────────────────────────────
 # Lowercase by default but preserve correct casing for filesystem entries.
 # Caches directory listings for 30s to avoid repeated disk I/O.
@@ -1665,7 +1798,7 @@ class GnomeSpeaksService:
                     return
 
                 if CONFIG.get("dictation_mode", True):
-                    type_at_cursor(user_text)
+                    get_injector().commit(user_text)
                 else:
                     clipboard_write(user_text)
             else:
@@ -1767,7 +1900,7 @@ class GnomeSpeaksService:
         # --- Mode flags (stable across cycles) ---
         live_typing = (CONFIG.get("dictation_mode", True)
                        and not CONFIG.get("conversation_mode", False)
-                       and _TYPING_TOOL in ("ydotool", "xdotool"))
+                       and get_injector().available())
         use_lexical = CONFIG.get("terminal_mode", False)
 
         # ---------------------------------------------------------------
@@ -1962,7 +2095,7 @@ class GnomeSpeaksService:
                         if live_typing:
                             # Terminal mode: smart lowercase (preserves filesystem casing)
                             raw = _terminal_lowercase(raw_partial[0]) if use_lexical else raw_partial[0]
-                            replace_typed_text(typed_partial[0], raw)
+                            get_injector().replace_text(typed_partial[0], raw)
                             typed_partial[0] = raw
                 elif mtype == "phrase":
                     got_phrase = True
@@ -2040,7 +2173,7 @@ class GnomeSpeaksService:
             # the mic closes (never TTS over an open mic).
             if user_text and self._try_cast(user_text):
                 if live_typing and typed_partial[0]:
-                    _send_backspaces(len(typed_partial[0]))
+                    get_injector().send_backspaces(len(typed_partial[0]))
                 GLib.idle_add(self._emit_transcription_ready, user_text)
                 if (is_loop and not self._stop_event.is_set()
                         and CONFIG.get("continuous_dictation", False)):
@@ -2065,7 +2198,7 @@ class GnomeSpeaksService:
             # just silently re-enter listening on the next cycle.
             if is_loop and not user_text and not self._stop_event.is_set():
                 if live_typing and typed_partial[0]:
-                    _send_backspaces(len(typed_partial[0]))
+                    get_injector().send_backspaces(len(typed_partial[0]))
                 _log("no speech in loop cycle, continuing")
                 # Quiet cycle = natural gap for starved queue items (agent
                 # messages, spell replies) to play before the mic reopens.
@@ -2081,7 +2214,7 @@ class GnomeSpeaksService:
                 # Conversation mode: send to LLM then speak response
                 if CONFIG.get("conversation_mode", False):
                     if live_typing:
-                        _send_backspaces(len(typed_partial[0]))
+                        get_injector().send_backspaces(len(typed_partial[0]))
                         time.sleep(0.02)
                     self._conversation_worker(user_text)
                     if not CONFIG.get("continuous_dictation", False):
@@ -2096,22 +2229,22 @@ class GnomeSpeaksService:
                             # Final correction: if Azure's final differs from what
                             # was live-typed, surgically fix the divergent tail.
                             if typed_partial[0] != user_text:
-                                replace_typed_text(typed_partial[0], user_text)
-                            _type_raw(" ")
+                                get_injector().replace_text(typed_partial[0], user_text)
+                            get_injector().type_raw(" ")
                     elif live_typing:
-                        _send_backspaces(len(typed_partial[0]))
+                        get_injector().send_backspaces(len(typed_partial[0]))
                         time.sleep(0.02)
-                        _clipboard_paste(user_text)
+                        get_injector().paste(user_text)
                     else:
-                        type_at_cursor(user_text)
+                        get_injector().commit(user_text)
                 else:
                     if live_typing and typed_partial[0]:
-                        _send_backspaces(len(typed_partial[0]))
+                        get_injector().send_backspaces(len(typed_partial[0]))
                     clipboard_write(user_text)
             else:
                 log.info("No speech detected")
                 if live_typing and typed_partial[0]:
-                    _send_backspaces(len(typed_partial[0]))
+                    get_injector().send_backspaces(len(typed_partial[0]))
                 GLib.idle_add(self._emit_transcription_ready, "")
 
             # 10. Decide whether to loop or exit
@@ -3443,7 +3576,7 @@ class GnomeSpeaksService:
                 type_text, _speak_text = self._parse_type_tags(reply)
                 if type_text:
                     log.info("Typing %d chars at cursor (from streamed reply)", len(type_text))
-                    _clipboard_paste(type_text)
+                    get_injector().paste(type_text)
 
             # Half-duplex drain
             if spoke_anything and CONFIG.get("half_duplex", False):
@@ -3553,7 +3686,7 @@ class GnomeSpeaksService:
         """Clean up resources on exit."""
         log.info("Shutting down")
         self.stop()
-        _reset_ydotoold()
+        get_injector().recover()
         _discard_prewarmed_rec()
         _invalidate_stt_ws()
 
@@ -4235,8 +4368,7 @@ def main():
     # Detect typing tool in background to avoid blocking startup with
     # shutil.which() + pidof subprocess calls (~100-200ms).
     def _init_typing():
-        _detect_typing_tool()
-        _reset_ydotoold()
+        get_injector().prepare()
     threading.Thread(target=_init_typing, daemon=True).start()
 
     # Detect audio output device and auto-enable echo cancellation
