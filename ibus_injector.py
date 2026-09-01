@@ -45,7 +45,7 @@ log = logging.getLogger("gnome-speaks")
 try:
     import gi
     gi.require_version("IBus", "1.0")
-    from gi.repository import IBus, GLib, GObject  # noqa: F401
+    from gi.repository import IBus, GLib, GObject, Gio  # noqa: F401
     HAS_IBUS = True
 except (ImportError, ValueError) as _exc:  # pragma: no cover - platform dependent
     IBus = None
@@ -117,6 +117,91 @@ def clear_prior_engine():
         log.debug("Could not clear prior-engine file", exc_info=True)
 
 
+INPUT_SOURCES_SCHEMA = "org.gnome.desktop.input-sources"
+
+
+def _xkb_engine_for(bus, layout, variant):
+    """Find the daemon's engine name for an XKB layout/variant pair.
+
+    Engine names look like `xkb:<layout>:<variant>:<lang3>`, and the language
+    third is NOT derivable from the layout -- 'de+neo' is `xkb:de:neo:ger`, not
+    `...:eng`. So ask the daemon what it actually has rather than constructing
+    a name it may not know; setting a nonexistent engine is how you end up
+    exactly where this function is trying to rescue you from.
+    """
+    prefix = "xkb:%s:%s:" % (layout, variant)
+    try:
+        matches = sorted(e.get_name() for e in bus.list_engines()
+                         if e.get_name().startswith(prefix))
+    except Exception:
+        log.debug("Could not list IBus engines", exc_info=True)
+        matches = []
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    # Several languages share this layout; prefer the session's own.
+    lang = (os.environ.get("LANG") or "")[:2].lower()
+    if lang:
+        for name in matches:
+            if name.rsplit(":", 1)[-1].lower().startswith(lang[:2]):
+                return name
+    for name in matches:
+        if name.endswith(":eng"):
+            return name
+    return matches[0]
+
+
+def derive_restore_target(bus=None):
+    """Work out what the user's input source *should* be, from GNOME itself.
+
+    Needed because `GetGlobalEngine` frequently fails with "No global engine"
+    on GNOME: the shell manages input sources itself and simply leaves the
+    daemon's global engine unset. Recording None there and calling it a day is
+    how a session gets stranded on our engine after one dictation cycle.
+
+    org.gnome.desktop.input-sources is the authority the shell itself uses:
+    mru-sources first (what the user last had), else sources[0].
+    """
+    if not HAS_IBUS:
+        return None
+    try:
+        settings = Gio.Settings.new(INPUT_SOURCES_SCHEMA)
+    except Exception:
+        log.debug("No %s schema; cannot derive a restore target",
+                  INPUT_SOURCES_SCHEMA, exc_info=True)
+        return None
+    entries = []
+    for key in ("mru-sources", "sources"):
+        try:
+            entries.extend(settings.get_value(key).unpack() or [])
+        except Exception:
+            log.debug("Could not read %s", key, exc_info=True)
+    if not entries:
+        return None
+    if bus is None:
+        try:
+            bus = IBus.Bus()
+        except Exception:
+            bus = None
+    for kind, source_id in entries:
+        if kind == "ibus":
+            return source_id                      # already an engine name
+        if kind != "xkb":
+            continue
+        layout, _, variant = source_id.partition("+")
+        if bus is not None:
+            name = _xkb_engine_for(bus, layout, variant)
+            if name:
+                return name
+        # Last resort: the conventional construction. Unverified, but better
+        # than leaving the user on our engine.
+        guess = "xkb:%s:%s:eng" % (layout, variant)
+        log.debug("Falling back to unverified engine name %r", guess)
+        return guess
+    return None
+
+
 def read_prior_engine():
     try:
         with open(prior_engine_path(), encoding="utf-8") as fh:
@@ -133,6 +218,22 @@ def restore_prior_engine(reason="startup"):
     happened, so callers can log the interesting case and stay quiet otherwise.
     """
     name = read_prior_engine()
+    if not name and HAS_IBUS:
+        # No breadcrumb, but we may still be the installed engine -- a crash
+        # before the breadcrumb was written, or a build that predates it.
+        # Being stranded is detectable without one, so detect it.
+        try:
+            IBus.init()
+            probe = IBus.Bus()
+            if probe.is_connected():
+                current = probe.get_global_engine()
+                if current is not None and current.get_name() == ENGINE_NAME:
+                    name = derive_restore_target(probe)
+                    if name:
+                        log.warning("Found the session stranded on %s with no "
+                                    "breadcrumb; restoring %r", ENGINE_NAME, name)
+        except Exception:
+            log.debug("Stranded-engine probe failed", exc_info=True)
     if not name:
         return False
     if not HAS_IBUS:
@@ -454,9 +555,23 @@ class IbusInjector(Injector):
                 prior = self._bus.get_global_engine()
                 prior_name = prior.get_name() if prior else None
             except Exception:
+                # "No global engine" is the COMMON case on GNOME, not an
+                # error: the shell owns input sources and often leaves the
+                # daemon's global engine unset. Not a reason to give up on
+                # having somewhere to go back to.
+                log.debug("GetGlobalEngine unavailable", exc_info=True)
                 prior_name = None
             if prior_name == ENGINE_NAME:
                 prior_name = None  # never record ourselves as the way back
+            if not prior_name:
+                prior_name = derive_restore_target(self._bus)
+                if prior_name:
+                    log.debug("No global engine set; restore target derived "
+                              "from input-sources: %r", prior_name)
+                else:
+                    log.warning("No global engine and no derivable input "
+                                "source: a dictation session may not be able "
+                                "to hand the input method back")
             # Persist BEFORE the swap: a crash in between is the whole reason
             # this file exists, and a breadcrumb written afterwards is a
             # breadcrumb that is missing exactly when it is needed.
@@ -536,14 +651,23 @@ class IbusInjector(Injector):
             return
         self._active = False
         prior, self._prior = self._prior, None
+        if not prior:
+            # Late derivation: acquire may have found nothing, but leaving the
+            # session on OUR engine is not an option -- that is a stranded
+            # input method, which is the failure this whole backend exists to
+            # avoid. Try again now rather than "standing down".
+            prior = derive_restore_target(self._bus)
         try:
             if prior:
                 self._bus.set_global_engine(prior)
                 log.debug("IBus global engine restored to %r", prior)
             else:
-                # Nothing to go back to. Leaving OURS installed would hand the
-                # user a dead input method, so stand down either way.
-                log.debug("IBus had no prior engine to restore")
+                # No target at all. Say so loudly: the user is sitting on our
+                # engine and nothing here can move them off it.
+                log.warning("IBus session ended with no restore target; the "
+                            "input method may be left on %s. Recover with: "
+                            "ibus engine <your-input-source>", ENGINE_NAME)
+                return
         except Exception:
             log.warning("IBus restore failed; the breadcrumb file will be "
                         "used at next service start", exc_info=True)
