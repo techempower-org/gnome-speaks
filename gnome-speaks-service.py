@@ -938,10 +938,13 @@ class YdotoolInjector(Injector):
     def commit(self, text):
         return type_at_cursor(text)
 
-    def type_raw(self, text):
+    def type_text(self, text):
         return _type_raw(text)
 
     def press_enter(self):
+        # Same underlying call as type_text for THIS backend only, because
+        # ydotool types and presses keys through one tool. They stay separate
+        # methods because no other backend can conflate them.
         return _type_raw("\n")
 
     def send_backspaces(self, count):
@@ -2251,7 +2254,7 @@ class GnomeSpeaksService:
                             # was live-typed, surgically fix the divergent tail.
                             if typed_partial[0] != user_text:
                                 get_injector().replace_text(typed_partial[0], user_text)
-                            get_injector().type_raw(" ")
+                            get_injector().type_text(" ")
                     elif live_typing:
                         get_injector().send_backspaces(len(typed_partial[0]))
                         time.sleep(0.02)

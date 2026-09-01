@@ -622,8 +622,8 @@ class IbusInjector(Injector):
             self._arm_flush()
         return True
 
-    def type_raw(self, text):
-        # Text, not keys -- it goes through the same coalesced commit so the
+    def type_text(self, text):
+        # TEXT path: goes through the same coalesced commit so the
         # whitespace-join rule can stop it doubling a separator.
         return self.commit(text)
 

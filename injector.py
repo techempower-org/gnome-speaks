@@ -86,15 +86,34 @@ class Injector:
         """Put final `text` at the cursor. Returns True on success."""
         raise NotImplementedError
 
-    def type_raw(self, text):
-        """Put `text` at the cursor with no focus-settle delay or fallback."""
+    def type_text(self, text):
+        """Put `text` at the cursor with no focus-settle delay or fallback.
+
+        TEXT path. See the two-category rule under `press_enter`.
+        """
         raise NotImplementedError
 
     def press_enter(self):
         """Press Return — a KEY EVENT, never a text commit.
 
-        Backends that cannot generate key events must delegate this, not
-        approximate it with a newline character.
+        ── The two-category rule ────────────────────────────────────────
+        Methods on this seam fall into exactly two kinds, and they must
+        never be merged:
+
+          TEXT  — commit / type_text / set_preedit / replace_text / paste.
+                  These mean "put these characters in the field". An IBus
+                  backend serves them with commit_text.
+
+          KEYS  — press_enter. This means "press this key". IBus CANNOT
+                  serve it: commit_text("\n") inserts a newline character
+                  into the field, so a shell never runs the command. A
+                  backend without key events must DELEGATE, never
+                  approximate.
+
+        This is why ydotool stays reachable permanently rather than being
+        a transition scaffold. If a future change is tempted to fold
+        `press_enter` into `type_text` because "it is just a newline" --
+        that is the bug this comment exists to stop.
         """
         raise NotImplementedError
 
