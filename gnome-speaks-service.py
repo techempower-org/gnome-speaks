@@ -1902,9 +1902,12 @@ class GnomeSpeaksService:
             self._stop_event.clear()
             self._set_state("listening")
 
+            # Issued before the thread exists: a stop() arriving in the gap
+            # between here and the worker's first instruction is remembered by
+            # the token, and the worker then refuses to start.
             self._stt_thread = threading.Thread(
                 target=self._batch_stt_worker,
-                args=(mode,),
+                args=(mode, self._cancels.issue("stt")),
                 daemon=True,
             )
             self._stt_thread.start()
@@ -1924,21 +1927,50 @@ class GnomeSpeaksService:
 
         self._stt_thread = threading.Thread(
             target=self._streaming_stt_worker,
+            args=(self._cancels.issue("stt-stream"),),
             daemon=True,
         )
         self._stt_thread.start()
         return "ok"
 
-    def _batch_stt_worker(self, mode):
-        """Background thread: batch STT using stt() dispatcher (whisper, vad, fixed)."""
+    def _idle_after_stt(self):
+        """Return to idle only if the mic path still owns the state.
+
+        The state fence for STT, mirroring _speak_token's for playback: a
+        worker that outlived its stop must not pull a later utterance out of
+        "speaking" on its way out.
+        """
+        with self._state_lock:
+            owned = self._state in ("listening", "processing")
+        if owned:
+            self._set_state("idle")
+
+    def _batch_stt_worker(self, mode, cancel_token=None):
+        """Background thread: batch STT using stt() dispatcher (whisper, vad, fixed).
+
+        cancel_token is this listening session's verdict. It is consulted after
+        stt_dispatch returns, because the library cannot be trusted to have
+        seen the cancel: stt_fixed() checks is_cancelled() exactly once and
+        then POSTs to Azure with a 30s timeout, and any worker that started in
+        the meantime has taken the wire down. Without this check a transcript
+        lands at the cursor after the user asked for silence.
+        """
+        if cancel_token is None:
+            cancel_token = self._cancels.issue("stt")
+        started = self._cancels.begin(cancel_token)
         try:
-            state._cancel_event.clear()
+            if not started:
+                log.info("STT cancelled before it began")
+                GLib.idle_add(self._emit_transcription_ready, "")
+                self._idle_after_stt()
+                return
             result = stt_dispatch(mode=mode)
 
-            if result.get("cancelled"):
-                log.info("STT cancelled")
+            if cancel_token.cancelled or result.get("cancelled"):
+                log.info("STT cancelled — transcript discarded (%d chars)",
+                         len(result.get("text") or ""))
                 GLib.idle_add(self._emit_transcription_ready, "")
-                self._set_state("idle")
+                self._idle_after_stt()
                 _schedule_warmup()
                 return
 
@@ -1950,7 +1982,7 @@ class GnomeSpeaksService:
             # matched on the raw transcript before punctuation substitution.
             if user_text and self._try_cast(user_text):
                 GLib.idle_add(self._emit_transcription_ready, user_text)
-                self._set_state("idle")
+                self._idle_after_stt()
                 _schedule_warmup()
                 return
 
@@ -1976,7 +2008,7 @@ class GnomeSpeaksService:
                 log.info("No speech detected (%s)", mode)
                 GLib.idle_add(self._emit_transcription_ready, "")
 
-            self._set_state("idle")
+            self._idle_after_stt()
             _schedule_warmup()
 
             if user_text and CONFIG.get("continuous_dictation", False) and not self._stop_event.is_set():
@@ -1987,11 +2019,31 @@ class GnomeSpeaksService:
         except Exception as exc:
             log.exception("Batch STT (%s) failed: %s", mode, exc)
             GLib.idle_add(self._emit_error, f"STT failed: {exc}")
-            self._set_state("idle")
+            self._idle_after_stt()
             _schedule_warmup()
+        finally:
+            self._cancels.retire(cancel_token)
 
-    def _streaming_stt_worker(self):
-        """Background thread: streaming STT using speech-to-cli building blocks.
+    def _streaming_stt_worker(self, cancel_token=None):
+        """Thread entry: run one streaming STT session and always retire its
+        cancel token, whichever of the cycle body's exits is taken."""
+        if cancel_token is None:
+            cancel_token = self._cancels.issue("stt-stream")
+        try:
+            self._streaming_stt_cycle(cancel_token)
+        finally:
+            self._cancels.retire(cancel_token)
+
+    def _streaming_stt_cycle(self, cancel_token):
+        """Streaming STT using speech-to-cli building blocks.
+
+        cancel_token separates the two things _stop_event was being asked to
+        mean at once. stop_listening() ends the utterance and KEEPS the text
+        (the dictation hotkey); stop() -- D-Bus Stop, POST /stop, "cast stop",
+        every user-speech preemption -- ABANDONS it. Both set _stop_event, and
+        _stop_event is also cleared by the next start_listening(), so it can
+        neither express the difference nor survive a restart. Only stop()
+        cancels the token, and only the token gates the transcript.
 
         In continuous dictation (loop) mode, keeps the recorder process AND
         WebSocket session alive across multiple utterances — only the sender
@@ -1999,6 +2051,12 @@ class GnomeSpeaksService:
         WS session reinit (~50ms), recorder startup, and thread-creation
         overhead that the old start_listening(quick=True) path incurred.
         """
+        self._cancels.begin(cancel_token)
+
+        def _stopping():
+            """This cycle must wind down. Says nothing about keeping the text."""
+            return self._stop_event.is_set() or cancel_token.cancelled
+
         _log_tag = "stt-gnome"
         _dbg = "/tmp/speech-debug.log" if (os.environ.get("SPEECH_DEBUG") or CONFIG.get("debug")) else None
         _DBG_MAX_SIZE = 5 * 1024 * 1024  # 5 MB
@@ -2158,7 +2216,7 @@ class GnomeSpeaksService:
 
                     _log(f"limits: max_silence={max_silence} max_no_speech={max_no_speech} min_speech={min_speech}")
 
-                    while not self._stop_event.is_set():
+                    while not _stopping():
                         chunk = proc.stdout.read(FRAME_BYTES)
                         if not chunk or len(chunk) < FRAME_BYTES:
                             _log(f"recorder EOF at frame {total_frames}")
@@ -2235,7 +2293,7 @@ class GnomeSpeaksService:
             got_phrase = False
             natural_end = False
 
-            while time.time() < deadline and not self._stop_event.is_set():
+            while time.time() < deadline and not _stopping():
                 try:
                     ws.settimeout(1.0)
                     msg = ws.recv()
@@ -2325,6 +2383,20 @@ class GnomeSpeaksService:
             # 7. Final text
             user_text = " ".join(phrases).strip()
 
+            # The stop that means "abandon". Everything downstream of here
+            # puts text somewhere the user can see it -- the REST fallback,
+            # the spellbook, the LLM, the cursor -- so this is the one gate
+            # that has to hold. _stop_event cannot serve: stop_listening()
+            # sets it too, and it wants the text typed.
+            if cancel_token.cancelled:
+                _log(f"cancelled — discarding transcript ({len(user_text)} chars)")
+                if live_typing and typed_partial[0]:
+                    get_injector().send_backspaces(len(typed_partial[0]))
+                    typed_partial[0] = ""
+                GLib.idle_add(self._emit_transcription_ready, "")
+                user_text = ""
+                break
+
             if not user_text and raw_frames and not got_phrase:
                 _log(f"WS returned nothing, falling back to REST STT (frames={len(raw_frames)})")
                 user_text = _rest_stt_fallback(raw_frames, _log) or ""
@@ -2346,11 +2418,11 @@ class GnomeSpeaksService:
                 if live_typing and typed_partial[0]:
                     get_injector().send_backspaces(len(typed_partial[0]))
                 GLib.idle_add(self._emit_transcription_ready, user_text)
-                if (is_loop and not self._stop_event.is_set()
+                if (is_loop and not _stopping()
                         and CONFIG.get("continuous_dictation", False)):
                     # Let the spell's spoken reply play before re-opening the mic
                     self._drain_speech_gap()
-                    if self._stop_event.is_set():
+                    if _stopping():
                         break
                     self._set_state("listening")
                     continue
@@ -2367,7 +2439,7 @@ class GnomeSpeaksService:
             # 9. Emit results and type/copy
             # In loop mode, skip the "processing" flicker if nothing was said —
             # just silently re-enter listening on the next cycle.
-            if is_loop and not user_text and not self._stop_event.is_set():
+            if is_loop and not user_text and not _stopping():
                 if live_typing and typed_partial[0]:
                     get_injector().send_backspaces(len(typed_partial[0]))
                 _log("no speech in loop cycle, continuing")
@@ -2419,7 +2491,7 @@ class GnomeSpeaksService:
                 GLib.idle_add(self._emit_transcription_ready, "")
 
             # 10. Decide whether to loop or exit
-            if is_loop and not self._stop_event.is_set():
+            if is_loop and not _stopping():
                 # Re-check continuous_dictation in case user toggled it mid-session
                 if not CONFIG.get("continuous_dictation", False):
                     _log("continuous_dictation toggled off, exiting loop")
@@ -2455,12 +2527,14 @@ class GnomeSpeaksService:
         if CONFIG.get("conversation_mode", False) and user_text:
             return
 
-        self._set_state("idle")
+        self._idle_after_stt()
 
         # If stop_event was set by turn_end (natural_end) in single-shot mode,
         # and continuous dictation is on, restart via start_listening (legacy path
         # for non-loop mode, e.g. conversation_mode toggled on mid-session).
-        if not is_loop and CONFIG.get("continuous_dictation", False) and (natural_end or not self._stop_event.is_set()):
+        if (not is_loop and not cancel_token.cancelled
+                and CONFIG.get("continuous_dictation", False)
+                and (natural_end or not self._stop_event.is_set())):
             if natural_end:
                 self._stop_event.clear()
             self.start_listening(quick=True)
