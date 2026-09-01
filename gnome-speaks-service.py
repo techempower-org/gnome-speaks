@@ -2818,7 +2818,12 @@ class GnomeSpeaksService:
             # a bare voice-command word: the "cast" prefix + pattern match
             # means a misheard mid-sentence word can never execute a command.
             # Silent on success — the command's own output is the feedback.
-            _type_raw("\n")
+            # NB for the IBus backend: this is a KEYSTROKE, not a text
+            # commit. IBus commit_text("\n") inserts a newline character
+            # into the field; it does not press Return, so a shell never
+            # runs the command. This site must stay on a key-event backend
+            # (spec 5.4, "non-text targets") even after IBus lands.
+            get_injector().type_raw("\n")
             return None
         elif op == "loop_toggle":
             new = not CONFIG.get("continuous_dictation", False)
