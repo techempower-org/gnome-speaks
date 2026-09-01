@@ -12,7 +12,7 @@ Two-process design connected by session D-Bus (`org.gnome.Speaks`):
 | `extension.js` | GNOME Shell (GJS) | UI: badge + pills + 📜 rune, panel indicator, subtitle overlay, chronicle scroll, keybindings, drag | ~2,620 |
 | `gnome-speaks-service.py` | systemd user service (Python) | Audio, STT, TTS, speech queue, chronicle, LLM, typing, clipboard, wake watcher | ~3,720 |
 | `spellbook.py` | imported by the service | Incantation matcher + executor ("cast …" → local actions); denylist | ~390 |
-| `spellbook.json` | data | 12 repo spells (self-control); user overlay at `~/.config/speech-to-cli/spellbook.json` merges + hot-reloads | — |
+| `spellbook.json` | data | 14 repo spells (self-control); user overlay at `~/.config/speech-to-cli/spellbook.json` merges + hot-reloads | — |
 | `spiel_provider.py` | imported by the service | Spiel/libspiel synthesis side (`org.gnome.Speaks.Speech.Provider`); off unless `spiel_provider` | ~120 |
 | `prefs.js` | GNOME Extensions app (GJS/Gtk4) | 6-page preferences window (task-first redesign, #5e49049) | ~1,540 |
 | `stylesheet.css` | GNOME Shell | Badge states, pills, animations, subtitle overlay, chronicle scroll | ~560 |

@@ -493,6 +493,8 @@ into that body field, and `"reply"` speaks a fixed success line.
 | "cast echo" | replay the last thing spoken |
 | "cast chronicle" | recite the last three [Chronicle](#the-chronicle) lines |
 | "cast seal the chronicle" | stop or resume recording the Chronicle |
+| "cast loop" / "keep listening" | toggle continuous dictation, mid-session |
+| "cast run it" / "press enter" | press Enter — hands-free command execution (spell-gated so a misheard word never executes anything) |
 
 **Overlay examples** — these live in your own `~/.config/speech-to-cli/spellbook.json`
 because their endpoints are site-specific:

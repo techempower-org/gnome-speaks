@@ -180,6 +180,20 @@
         "op": "loop_toggle"
       },
       "gate": "instant"
+    },
+    {
+      "name": "run-it",
+      "patterns": [
+        "run it",
+        "execute",
+        "send it",
+        "press enter"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "press_enter"
+      },
+      "gate": "instant"
     }
   ]
 }

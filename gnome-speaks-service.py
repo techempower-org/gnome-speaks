@@ -966,6 +966,91 @@ _VOICE_COMMANDS = [
 ]
 
 
+# Terminal-mode spoken numbers. Azure lexical spells digits as words; a
+# terminal wants digits. Two composition styles, both deterministic:
+#   digit-run:  "one two seven" -> 127   (spelled digit by digit)
+#   small grammar: "twenty two" -> 22, "four hundred" -> 400 (< 1000)
+# Runs feed the symbol pass afterwards, so "one two seven dot zero dot
+# zero dot one" -> 127.0.0.1 and "port colon eight zero eight zero"
+# -> port:8080.
+_NUM_UNITS = {"zero": 0, "oh": 0, "one": 1, "two": 2, "three": 3,
+              "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+              "nine": 9}
+_NUM_TEENS = {"ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+              "fourteen": 14, "fifteen": 15, "sixteen": 16,
+              "seventeen": 17, "eighteen": 18, "nineteen": 19}
+_NUM_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+             "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+
+
+def _terminal_numbers(text):
+    """Convert runs of spoken number words to digits (terminal mode)."""
+    words = text.split()
+    out, i = [], 0
+    while i < len(words):
+        w = words[i].lower()
+        if w not in _NUM_UNITS and w not in _NUM_TEENS and w not in _NUM_TENS:
+            out.append(words[i])
+            i += 1
+            continue
+        # Collect the maximal run of number words.
+        j = i
+        run = []
+        while j < len(words):
+            lw = words[j].lower()
+            if lw in _NUM_UNITS or lw in _NUM_TEENS or lw in _NUM_TENS or \
+                    (lw == "hundred" and run):
+                run.append(lw)
+                j += 1
+            else:
+                break
+        # Style 1: all single digits -> concatenate (127, 8080, versions).
+        if all(r in _NUM_UNITS for r in run):
+            out.append("".join(str(_NUM_UNITS[r]) for r in run))
+        else:
+            # Style 2: small-number grammar, segmenting greedily.
+            # "twenty two" -> 22; "one hundred five" -> 105;
+            # "twenty twenty six" -> 2026 (segments concatenate).
+            segs, cur, k = [], None, 0
+            while k < len(run):
+                r = run[k]
+                if r == "hundred":
+                    cur = (cur if cur is not None else 1) * 100
+                elif r in _NUM_TENS:
+                    if cur is not None and cur % 100 == 0:
+                        cur += _NUM_TENS[r]
+                    else:
+                        if cur is not None:
+                            segs.append(cur)
+                        cur = _NUM_TENS[r]
+                elif r in _NUM_TEENS:
+                    if cur is not None and cur % 100 == 0:
+                        cur += _NUM_TEENS[r]
+                    else:
+                        if cur is not None:
+                            segs.append(cur)
+                        cur = _NUM_TEENS[r]
+                else:  # unit
+                    if cur is not None and cur % 10 == 0 and cur % 100 != 0:
+                        cur += _NUM_UNITS[r]
+                        segs.append(cur)
+                        cur = None
+                    elif cur is not None and cur % 100 == 0:
+                        cur += _NUM_UNITS[r]
+                        segs.append(cur)
+                        cur = None
+                    else:
+                        if cur is not None:
+                            segs.append(cur)
+                        cur = _NUM_UNITS[r]
+                k += 1
+            if cur is not None:
+                segs.append(cur)
+            out.append("".join(str(s) for s in segs))
+        i = j
+    return " ".join(out)
+
+
 # Terminal-mode spoken symbols. Azure's lexical form (terminal mode) spells
 # symbols as words — "claude hyphen hyphen resume" — and the prose table in
 # _VOICE_COMMANDS is wrong for a shell ("dash" becomes an em-dash, "- -"
@@ -1945,6 +2030,7 @@ class GnomeSpeaksService:
             user_text = _strip_end_word(user_text, end_word)
             if use_lexical and user_text:
                 user_text = _terminal_lowercase(user_text)
+                user_text = _terminal_numbers(user_text)
                 user_text = _terminal_symbols(user_text)
             _log(f"FINAL: {repr(user_text[:100])}")
 
@@ -2594,6 +2680,13 @@ class GnomeSpeaksService:
             new = not CONFIG.get("read_notifications", False)
             self._save_config_flag("read_notifications", new)
             return "The notification herald is %s." % ("on" if new else "off")
+        elif op == "press_enter":
+            # Hands-free Enter. Deliberately a SPELL ("cast run it") and not
+            # a bare voice-command word: the "cast" prefix + pattern match
+            # means a misheard mid-sentence word can never execute a command.
+            # Silent on success — the command's own output is the feedback.
+            _type_raw("\n")
+            return None
         elif op == "loop_toggle":
             new = not CONFIG.get("continuous_dictation", False)
             self._save_config_flag("continuous_dictation", new)
