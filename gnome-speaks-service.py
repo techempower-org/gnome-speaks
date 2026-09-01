@@ -1318,6 +1318,148 @@ def apply_auto_corrections(text):
 # Service implementation
 # ---------------------------------------------------------------------------
 
+class CancelToken:
+    """One cancellable operation's private verdict.
+
+    speech-to-cli exposes exactly one cancellation channel -- the process-wide
+    ``state._cancel_event`` -- and every library call polls it.  A single bit
+    cannot say *which* operation was cancelled, so the worker that starts next
+    used to erase the cancel the previous one was still obeying (each worker
+    opened with ``state._cancel_event.clear()``).  A token splits the two jobs
+    the one bit was doing:
+
+      * the global event stays the **wire**: the only thing that can interrupt
+        a library call already in flight.  It is still set and cleared, and its
+        meaning is unchanged for speech-to-cli's own CLI consumers.
+      * the token is the **verdict**: set once, never reset, owned by exactly
+        one operation.  Every decision the service makes about a finished
+        operation -- type this transcript, record this outcome, restart the
+        loop -- reads the token, so no later worker can un-cancel it.
+
+    Same ownership shape as ``_speak_token``: the object identity *is* the
+    claim, and a worker acts only on the token it was handed.
+    """
+
+    __slots__ = ("id", "label", "_event")
+
+    def __init__(self, token_id, label):
+        self.id = token_id
+        self.label = label
+        self._event = threading.Event()
+
+    @property
+    def cancelled(self):
+        return self._event.is_set()
+
+    def cancel(self):
+        self._event.set()
+
+    def wait_cancelled(self, timeout=None):
+        return self._event.wait(timeout)
+
+    def __repr__(self):
+        mark = " cancelled" if self.cancelled else ""
+        return f"<CancelToken {self.label}#{self.id}{mark}>"
+
+
+class CancelRegistry:
+    """Issues cancel tokens and projects them onto the one global wire.
+
+    Lifecycle of an operation:
+
+        token = registry.issue("stt")     # registered; cancellable from now on
+        if not registry.begin(token):     # take the wire -- False if already
+            ...                           #   cancelled, so never even start
+        try:
+            ...                           # library call polls the wire
+        finally:
+            registry.retire(token)        # deregister; drop the wire if ours
+
+    ``issue`` deliberately does NOT touch the wire.  That closes the window in
+    which an operation is visible to /stop but has not yet started: a cancel
+    arriving there is remembered by the token, and ``begin`` then refuses.
+
+    Only ``begin`` lowers the wire, and only for an operation that has not been
+    cancelled -- so an operation can never un-cancel *itself*.  It can still
+    lower a wire another live-but-cancelled operation was watching; that is the
+    irreducible cost of one shared bit, and it is exactly what the verdict is
+    for.  The warning logged there is the trace for "a worker outlived its
+    stop".
+
+    Lock order: the registry never calls back into the service, so its lock is
+    always innermost (``_queue_current_lock -> registry`` is safe).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._live = {}
+        self._owner = None
+        self._next_id = 0
+
+    def issue(self, label):
+        """Register a new operation. Cancellable immediately; not yet running."""
+        with self._lock:
+            self._next_id += 1
+            token = CancelToken(self._next_id, label)
+            self._live[token.id] = token
+            return token
+
+    def begin(self, token):
+        """Hand the wire to this operation. False = cancelled before it began."""
+        with self._lock:
+            if token.cancelled:
+                return False
+            stale = [t for t in self._live.values()
+                     if t is not token and t.cancelled]
+            self._owner = token
+            state._cancel_event.clear()
+        if stale:
+            log.warning("cancel: %r took the wire while %s still winding down "
+                        "(their verdicts stand)", token,
+                        ", ".join(repr(t) for t in stale))
+        return True
+
+    def retire(self, token):
+        """Deregister a finished operation; never leave a stale cancel behind."""
+        if token is None:
+            return
+        with self._lock:
+            self._live.pop(token.id, None)
+            if self._owner is token:
+                self._owner = None
+                state._cancel_event.clear()
+
+    def cancel(self, token, kill_procs=True):
+        """Record one operation's verdict and raise the wire."""
+        if token is not None:
+            token.cancel()
+        self._raise_wire(kill_procs)
+
+    def cancel_all(self, kill_procs=True):
+        """Record every live operation's verdict and raise the wire.
+
+        Verdicts are written BEFORE the wire goes up and before any join, so a
+        worker that outlives its stop can still tell that it was stopped.
+        """
+        with self._lock:
+            tokens = list(self._live.values())
+        for token in tokens:
+            token.cancel()
+        self._raise_wire(kill_procs)
+        return tokens
+
+    def live(self):
+        with self._lock:
+            return list(self._live.values())
+
+    @staticmethod
+    def _raise_wire(kill_procs):
+        if kill_procs:
+            state.cancel_active()      # sets the wire AND terminates procs
+        else:
+            state._cancel_event.set()
+
+
 @dataclass
 class TTSQueueItem:
     """One queued HTTP speech request. Per-item overrides travel with the
@@ -1339,6 +1481,10 @@ class GnomeSpeaksService:
     def __init__(self):
         self._state = "idle"
         self._state_lock = threading.Lock()
+
+        # Per-operation cancellation. The registry owns the verdicts; the
+        # process-global state._cancel_event stays the wire (see CancelToken).
+        self._cancels = CancelRegistry()
 
         # STT streaming state
         self._stop_event = threading.Event()  # our own, NOT state._cancel_event
@@ -1398,6 +1544,7 @@ class GnomeSpeaksService:
         self._tts_queue = queue.Queue(maxsize=32)
         self._tts_queue_seq = itertools.count(1)  # next() is atomic in CPython
         self._queue_current = None                # TTSQueueItem now playing
+        self._queue_token = None                  # its CancelToken; same lock
         self._queue_current_lock = threading.Lock()
         # Refcounted, NOT a plain flag: user-speech paths overlap (a second
         # Speak preempting the first, a spell's Talk during an AI reply), and
@@ -2504,6 +2651,12 @@ class GnomeSpeaksService:
                 item = self._tts_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
+            # Issue the cancel token BEFORE publishing the claim, so the token
+            # and _queue_current become visible to /skip in the same critical
+            # section. Issuing does not touch the wire; a /skip landing between
+            # here and playback is remembered by the token and _speak_worker
+            # then refuses to start.
+            token = self._cancels.issue("queue")
             # The gate above is a check-then-act: this thread parks inside
             # get() with the hold clear, and put_nowait wakes it the instant
             # an item arrives — by which time the mic may be open. Re-check
@@ -2514,13 +2667,16 @@ class GnomeSpeaksService:
                 drained = self._drain_gen != gen
                 if hold is None and not drained:
                     self._queue_current = item
+                    self._queue_token = token
             if drained:
+                self._cancels.retire(token)
                 log.info("Speech queue: item %d dropped — drained mid-claim",
                          item.id)
                 self._queue_recent.append({"id": item.id,
                                            "outcome": "canceled"})
                 continue
             if hold is not None:
+                self._cancels.retire(token)
                 # Front of the deque, not the tail: FIFO order is the contract.
                 with self._tts_queue.mutex:
                     self._tts_queue.queue.appendleft(item)
@@ -2531,7 +2687,7 @@ class GnomeSpeaksService:
             try:
                 if self.current_state != "speaking":
                     self._set_state("speaking")
-                token = object()
+                # One object is both the playback claim and the cancel verdict.
                 self._speak_token = token
                 has_next = not self._tts_queue.empty()
                 _chronicle_append("spoken", item.text, voice=item.voice,
@@ -2543,16 +2699,22 @@ class GnomeSpeaksService:
                                              user_initiated=False,
                                              suppress_idle=has_next,
                                              owner_token=token)
-                if state._cancel_event.is_set():
-                    outcome = "interrupted"  # killed mid-play (skip/stop/preempt)
+                # The token, not the wire: a worker that started after this
+                # one has already lowered the wire, but it cannot rewrite this
+                # item's verdict. (_speak_worker returns "interrupted" itself.)
                 self._queue_recent.append({"id": item.id,
                                            "outcome": outcome or "done"})
             except Exception:
                 log.exception("Speech queue: item %d failed, continuing", item.id)
                 self._queue_recent.append({"id": item.id, "outcome": "error"})
             finally:
+                # _speak_worker normally retires the token; this covers the
+                # paths where it never ran (a raise in _chronicle_append or
+                # _set_state) so a token can never leak into the live set.
+                self._cancels.retire(token)
                 with self._queue_current_lock:
                     self._queue_current = None
+                    self._queue_token = None
 
     def speak(self, text, voice=None):
         """Synthesize and play text via speech_tts.tts(). Returns True on success.
@@ -2587,7 +2749,9 @@ class GnomeSpeaksService:
         with self._speak_lock:
             self._set_state("speaking")
             _chronicle_append("spoken", text, voice=voice, source="direct")
-            token = object()
+            # Issued AFTER the preempting stop() above, or cancel_all() would
+            # cancel the very utterance the user just asked for.
+            token = self._cancels.issue("speech")
             self._speak_token = token
             self._speak_thread = threading.Thread(
                 target=self._speak_worker,
@@ -2599,8 +2763,9 @@ class GnomeSpeaksService:
                 self._speak_thread.start()
             except Exception:
                 # Nobody else will run the worker's finally — releasing the
-                # hold here is the difference between a failed utterance and
-                # a permanently silent speech queue.
+                # hold (and retiring the token) here is the difference between
+                # a failed utterance and a permanently silent speech queue.
+                self._cancels.retire(token)
                 self._release_user_speech()
                 raise
             return True
@@ -2663,11 +2828,24 @@ class GnomeSpeaksService:
 
         Runs as a background thread for user speech (speak()) and
         synchronously inside the queue dispatcher for HTTP items.
-        Returns "done" or "error" (the dispatcher records per-item outcomes).
+        Returns "done", "error" or "interrupted".
+
+        owner_token is a CancelToken: it is simultaneously the playback claim
+        (the _speak_token fence) and this utterance's cancel verdict. Whoever
+        issued it hands it over; retiring it is this worker's job, because the
+        issuer may have returned long before the audio finishes.
         """
         outcome = "done"
+        token = (owner_token if isinstance(owner_token, CancelToken)
+                 else self._cancels.issue("speech"))
+        started = self._cancels.begin(token)
         try:
-            state._cancel_event.clear()
+            if not started:
+                # Cancelled between the claim and the first note: never start,
+                # but fall through the finally so the state fence, the hold and
+                # the token are all released exactly as after a real playback.
+                outcome = "interrupted"
+                return outcome
             q = quality or self._voice_quality
             # Update HTTP progress tracking
             with self._http_progress_lock:
@@ -2710,6 +2888,11 @@ class GnomeSpeaksService:
             GLib.idle_add(self._emit_error, f"Speak failed: {exc}")
             outcome = "error"
         finally:
+            # Drop the wire first: everything below (warmup, loop restart) runs
+            # with no stale cancel pending.
+            self._cancels.retire(token)
+            if token.cancelled:
+                outcome = "interrupted"   # killed mid-play (skip/stop/preempt)
             # Clear HTTP progress to idle state
             with self._http_progress_lock:
                 self._http_progress = {
@@ -2722,7 +2905,7 @@ class GnomeSpeaksService:
             with self._state_lock:
                 still_speaking = self._state == "speaking"
             if (still_speaking and not suppress_idle
-                    and self._speak_token is owner_token):
+                    and self._speak_token is token):
                 self._set_state("idle")
             _schedule_warmup()
             if user_initiated:
@@ -2795,9 +2978,14 @@ class GnomeSpeaksService:
         The id check and the cancel happen under _queue_current_lock together.
         The dispatcher takes that same lock to claim and to clear the current
         item, so holding it here means the item we verified cannot be swapped
-        out from under the cancel. cancel_active() only sets an event and
-        signals tracked subprocesses — it never takes this lock, so there is
-        no deadlock path.
+        out from under the cancel. The registry never calls back into the
+        service (its lock is innermost) and cancel_active() only sets an event
+        and signals tracked subprocesses, so there is no deadlock path.
+
+        Cancelling the item's own token — not just the shared wire — is what
+        makes the skip stick: the item records "interrupted" even if a later
+        worker takes the wire down first, and an item cancelled between the
+        claim and its first note never starts at all.
         """
         with self._queue_current_lock:
             current = self._queue_current
@@ -2805,7 +2993,7 @@ class GnomeSpeaksService:
                 return None
             if item_id is not None and current.id != item_id:
                 return None
-            state.cancel_active()
+            self._cancels.cancel(self._queue_token)
             return current.id
 
     def _spell_speak(self, text, voice=None):
@@ -3037,8 +3225,10 @@ class GnomeSpeaksService:
                 self._stop_event.clear()
                 self._set_state("speaking")
                 # Claim playback ownership so a preempted queue worker's
-                # cleanup can't reset our speaking state.
-                self._speak_token = object()
+                # cleanup can't reset our speaking state. The same object is
+                # this exchange's cancel verdict.
+                token = self._cancels.issue("talk")
+                self._speak_token = token
 
                 # Use an event to pass the result back from the worker thread
                 result_holder = {"reply": ""}
@@ -3046,7 +3236,7 @@ class GnomeSpeaksService:
 
                 self._talk_thread = threading.Thread(
                     target=self._talk_worker,
-                    args=(text.strip(), result_holder, done_event),
+                    args=(text.strip(), result_holder, done_event, token),
                     daemon=True,
                 )
                 self._talk_thread.start()
@@ -3057,10 +3247,15 @@ class GnomeSpeaksService:
         finally:
             self._release_user_speech()
 
-    def _talk_worker(self, text, result_holder, done_event):
+    def _talk_worker(self, text, result_holder, done_event, token=None):
         """Background thread: full-duplex TTS+STT via speech_tts.talk_fullduplex()."""
+        if token is None:
+            token = self._cancels.issue("talk")
+        started = self._cancels.begin(token)
         try:
-            state._cancel_event.clear()
+            if not started:
+                result_holder["reply"] = ""
+                return
             # Show text being spoken as live subtitle on badge
             GLib.idle_add(self._emit_partial_transcription, text)
 
@@ -3088,7 +3283,9 @@ class GnomeSpeaksService:
             if result.get("error"):
                 GLib.idle_add(self._emit_error, result["error"])
                 result_holder["reply"] = f"error: {result['error']}"
-            elif result.get("cancelled"):
+            elif result.get("cancelled") or token.cancelled:
+                # token.cancelled outranks the library's verdict: a worker that
+                # started after this one may already have taken the wire down.
                 result_holder["reply"] = ""
             else:
                 user_reply = result.get("text", "")
@@ -3100,6 +3297,7 @@ class GnomeSpeaksService:
             GLib.idle_add(self._emit_error, f"Talk failed: {exc}")
             result_holder["reply"] = f"error: {exc}"
         finally:
+            self._cancels.retire(token)
             self._set_state("idle")
             _schedule_warmup()
             done_event.set()
@@ -3127,7 +3325,9 @@ class GnomeSpeaksService:
         if self.current_state == "listening":
             log.info("Restarting listen for conversation mode change")
             self._stop_event.set()
-            state.cancel_active()
+            # Same authority as a stop: the in-flight utterance is being
+            # abandoned, so its transcript must not surface after the restart.
+            self._cancels.cancel_all()
             def _restart_when_idle():
                 if self.current_state not in ("idle", "processing"):
                     return True  # keep polling
@@ -3436,6 +3636,10 @@ class GnomeSpeaksService:
         # AI replies are user-initiated speech: hold the agent speech queue
         # for the whole turn (LLM streaming + sentence TTS).
         self._hold_user_speech()
+        # Issued at the first spoken sentence, exactly where the old code
+        # cleared the wire — before that point a stop is carried by
+        # _stop_event and the LLM stream, not by the TTS wire.
+        cancel_token = None
         try:
             provider = CONFIG.get("llm_provider", "anthropic")
             model = CONFIG.get("llm_model", "claude-opus-4.6")
@@ -3536,8 +3740,10 @@ class GnomeSpeaksService:
                     if first_sentence:
                         # Transition to speaking state on first sentence
                         self._set_state("speaking")
-                        self._speak_token = object()  # claim playback ownership
-                        state._cancel_event.clear()
+                        # One object claims playback AND carries the verdict.
+                        cancel_token = self._cancels.issue("ai-reply")
+                        self._speak_token = cancel_token
+                        self._cancels.begin(cancel_token)
                         # On headphones, prewarm recorder during TTS
                         if not CONFIG.get("half_duplex", False):
                             _schedule_warmup()
@@ -3565,8 +3771,9 @@ class GnomeSpeaksService:
             if remainder and not self._stop_event.is_set():
                 if first_sentence:
                     self._set_state("speaking")
-                    self._speak_token = object()  # claim playback ownership
-                    state._cancel_event.clear()
+                    cancel_token = self._cancels.issue("ai-reply")
+                    self._speak_token = cancel_token
+                    self._cancels.begin(cancel_token)
                     if not CONFIG.get("half_duplex", False):
                         _schedule_warmup()
                     first_sentence = False
@@ -3603,9 +3810,13 @@ class GnomeSpeaksService:
 
                 # Handle <type> tags from accumulated reply (terminal mode)
                 type_text, _speak_text = self._parse_type_tags(reply)
-                if type_text:
+                if type_text and not (cancel_token is not None
+                                      and cancel_token.cancelled):
                     log.info("Typing %d chars at cursor (from streamed reply)", len(type_text))
                     get_injector().paste(type_text)
+                elif type_text:
+                    log.info("AI reply cancelled — %d chars NOT typed",
+                             len(type_text))
 
             # Half-duplex drain
             if spoke_anything and CONFIG.get("half_duplex", False):
@@ -3630,6 +3841,7 @@ class GnomeSpeaksService:
                     else False
                 ))
         finally:
+            self._cancels.retire(cancel_token)
             self._release_user_speech()
 
     # -- Conversation worker ------------------------------------------------
@@ -3672,8 +3884,15 @@ class GnomeSpeaksService:
         # Signal our stop event for the STT sender loop
         self._stop_event.set()
 
-        # Kill all active procs and signal cancellation
-        state.cancel_active()
+        # Record the verdict on every live operation, then kill active procs
+        # and raise the wire. Verdicts first, and before the joins below: a
+        # worker that outlives its 3s join can still tell that it was stopped,
+        # which is the difference between "the transcript is discarded" and
+        # "the transcript is typed after the user asked for silence".
+        cancelled = self._cancels.cancel_all()
+        if cancelled:
+            log.info("Stop: cancelled %s",
+                     ", ".join(repr(t) for t in cancelled))
 
         # Wait for threads to finish with short timeouts
         # Skip joining the current thread (e.g. conversation mode calls speak() from STT thread)
