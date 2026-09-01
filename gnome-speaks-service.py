@@ -966,6 +966,78 @@ _VOICE_COMMANDS = [
 ]
 
 
+# Terminal-mode spoken symbols. Azure's lexical form (terminal mode) spells
+# symbols as words — "claude hyphen hyphen resume" — and the prose table in
+# _VOICE_COMMANDS is wrong for a shell ("dash" becomes an em-dash, "- -"
+# never fuses). This pass converts the shell alphabet with join rules:
+#   both  — glue to both neighbours:  example dot com -> example.com
+#   right — keep the space before, glue after:  ls hyphen la -> ls -la
+# Adjacent symbols always fuse, so "hyphen hyphen resume" -> --resume.
+# "enter"/"new line" are DELIBERATELY absent: a misheard word must never
+# be able to execute a command.
+_TERM_TWO_WORD = {
+    ("hyphen", "hyphen"): ("--", "right"), ("dash", "dash"): ("--", "right"),
+    ("at", "sign"): ("@", "both"), ("question", "mark"): ("?", "right"),
+    ("forward", "slash"): ("/", "both"), ("back", "slash"): ("\\", "both"),
+    ("open", "paren"): ("(", "right"), ("close", "paren"): (")", "both"),
+    ("open", "bracket"): ("[", "right"), ("close", "bracket"): ("]", "both"),
+    ("open", "brace"): ("{", "right"), ("close", "brace"): ("}", "both"),
+    ("less", "than"): ("<", "right"), ("greater", "than"): (">", "right"),
+    ("double", "quote"): ('"', "right"), ("single", "quote"): ("'", "right"),
+    ("dollar", "sign"): ("$", "right"), ("percent", "sign"): ("%", "right"),
+    ("exclamation", "mark"): ("!", "right"), ("exclamation", "point"): ("!", "right"),
+    ("vertical", "bar"): ("|", "right"),
+}
+_TERM_ONE_WORD = {
+    "dot": (".", "both"), "period": (".", "both"),
+    "slash": ("/", "both"), "backslash": ("\\", "both"),
+    "hyphen": ("-", "right"), "dash": ("-", "right"), "minus": ("-", "right"),
+    "underscore": ("_", "both"), "equals": ("=", "both"),
+    "colon": (":", "both"), "semicolon": (";", "right"),
+    "comma": (",", "right"),
+    "tilde": ("~", "right"), "pipe": ("|", "right"),
+    "star": ("*", "right"), "asterisk": ("*", "right"),
+    "ampersand": ("&", "right"), "percent": ("%", "right"),
+    "hash": ("#", "right"), "dollar": ("$", "right"),
+    "caret": ("^", "right"), "backtick": ("`", "right"),
+    "bang": ("!", "right"),
+}
+
+
+def _terminal_symbols(text):
+    """Convert spoken symbol words to characters with shell join rules."""
+    words = text.split()
+    out = []            # list of (chunk, is_symbol, glue)
+    i = 0
+    while i < len(words):
+        w = words[i].lower()
+        two = (w, words[i + 1].lower()) if i + 1 < len(words) else None
+        if two in _TERM_TWO_WORD:
+            ch, glue = _TERM_TWO_WORD[two]
+            out.append((ch, True, glue))
+            i += 2
+            continue
+        if w in _TERM_ONE_WORD:
+            ch, glue = _TERM_ONE_WORD[w]
+            out.append((ch, True, glue))
+            i += 1
+            continue
+        out.append((words[i], False, None))
+        i += 1
+
+    result = []
+    glue_next = False
+    prev_symbol = False
+    for chunk, is_symbol, glue in out:
+        joined = glue_next or (is_symbol and (glue == "both" or prev_symbol))
+        if result and not joined:
+            result.append(" ")
+        result.append(chunk)
+        glue_next = is_symbol           # any symbol glues to what follows
+        prev_symbol = is_symbol
+    return "".join(result)
+
+
 def apply_voice_commands(text):
     """Replace spoken punctuation commands with actual characters."""
     if not CONFIG.get("voice_commands", True):
@@ -1873,6 +1945,7 @@ class GnomeSpeaksService:
             user_text = _strip_end_word(user_text, end_word)
             if use_lexical and user_text:
                 user_text = _terminal_lowercase(user_text)
+                user_text = _terminal_symbols(user_text)
             _log(f"FINAL: {repr(user_text[:100])}")
 
             # Spell incantations ("cast …") short-circuit typing/LLM routing;
@@ -1893,9 +1966,12 @@ class GnomeSpeaksService:
                     continue
                 break
 
-            # 8. Post-process: voice commands and auto-corrections
+            # 8. Post-process: voice commands and auto-corrections.
+            # Terminal text already went through _terminal_symbols — the
+            # prose table would mangle it ("dash" -> em-dash).
             if user_text:
-                user_text = apply_voice_commands(user_text)
+                if not use_lexical:
+                    user_text = apply_voice_commands(user_text)
                 user_text = apply_auto_corrections(user_text)
 
             # 9. Emit results and type/copy

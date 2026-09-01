@@ -897,6 +897,17 @@ export default class GnomeSpeaksExtension extends Extension {
         });
         pill._pillLabel = label;
         pill.connect('clicked', (actor, button) => {
+            // A release that ends a badge DRAG can land on a pill: the stage
+            // grab routes events into the badge subtree, the pill consumes
+            // the release, and the badge's own release handler never runs.
+            // Two consequences unless handled here: the pill activates from
+            // what the user meant as a drag (AI mode toggling itself), and
+            // _isDragging stays armed so the next pointer motion teleports
+            // the badge across the screen with stale drag anchors.
+            let wasDragging = this._isDragging;
+            this._endDrag();
+            if (wasDragging)
+                return;
             // St.Button reports button 0 for keyboard activation — the only
             // honest signal of "this came from the keyboard", which the
             // Chronicle needs so it only steals focus when a keyboard asked.
