@@ -175,7 +175,8 @@ mkdir -p "$SYSTEMD_USER_DIR"
 
 # Copy the service file and update ExecStart to use the actual project path
 if [[ -f "$PROJECT_DIR/gnome-speaks.service" ]]; then
-    sed "s|^ExecStart=.*|ExecStart=$SERVICE_EXEC|" \
+    sed -e "s|^ExecStart=.*|ExecStart=$SERVICE_EXEC|" \
+        -e "s|^ExecStopPost=.*|ExecStopPost=-$SERVICE_EXEC --restore-ime|" \
         "$PROJECT_DIR/gnome-speaks.service" > "$SYSTEMD_FILE"
     success "Installed systemd service to $SYSTEMD_FILE"
 else

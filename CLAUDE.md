@@ -11,6 +11,8 @@ Two-process design connected by session D-Bus (`org.gnome.Speaks`):
 |------|---------|------|-------|
 | `extension.js` | GNOME Shell (GJS) | UI: badge + pills + 📜 rune, panel indicator, subtitle overlay, chronicle scroll, keybindings, drag | ~2,620 |
 | `gnome-speaks-service.py` | systemd user service (Python) | Audio, STT, TTS, speech queue, chronicle, LLM, typing, clipboard, wake watcher | ~3,720 |
+| `injector.py` | imported by the service | The `Injector` seam: the contract both injection backends implement | ~120 |
+| `ibus_injector.py` | imported by the service | `IbusInjector` — text injection as an IBus engine (D-Bus commits, preedit, crash recovery) | ~660 |
 | `spellbook.py` | imported by the service | Incantation matcher + executor ("cast …" → local actions); denylist | ~390 |
 | `spellbook.json` | data | 14 repo spells (self-control); user overlay at `~/.config/speech-to-cli/spellbook.json` merges + hot-reloads | — |
 | `spiel_provider.py` | imported by the service | Spiel/libspiel synthesis side (`org.gnome.Speaks.Speech.Provider`); off unless `spiel_provider` | ~120 |
@@ -106,6 +108,7 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 | Talk | D-Bus API for external apps (blocking call) |
 | Half/Full Duplex | Auto-detected speaker vs headphone routing |
 | Wake word | Idle-only mic stream to LAN openwakeword; detection = dictation hotkey. Toggle: "cast wake word" |
+| Injection | How text reaches the cursor. `injection_method`: `ydotool` (default, synthesizes keys) · `ibus` (D-Bus commits, no stuck keys) · `auto` (ibus when reachable). Falls back to ydotool for every failure, never to nothing |
 | Spellbook | "cast …"/"invoke …" transcripts run local spells (never typed/LLM'd); `POST /cast` is the text seam |
 | Chronicle | Not a mode -- always-on ledger of both directions; 📜 badge rune (8 lines) + panel submenu (12), click to respeak. Spells: "cast echo" / "chronicle" / "seal the chronicle" |
 
@@ -117,6 +120,18 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 - **stylesheet.css**: GNOME Shell CSS (subset of CSS3). No SCSS or preprocessors.
 
 ## Key Gotchas
+
+- **IBus crash state is "no input method", not "the wrong one"**: measured on GNOME 50.1 — if the
+  service dies between `SetGlobalEngine(ours)` and the restore, the global engine is left **empty**
+  and the daemon does **not** auto-revert. On a desktop where the keymap comes from an IBus engine
+  that can mean no working keyboard. Hence the four mitigations in `ibus_injector.py`
+  (`$XDG_RUNTIME_DIR/gnome-speaks/prior-engine` written *before* the swap, restore-on-start,
+  `ExecStopPost=… --restore-ime`, and a session watchdog). Do not treat any of them as optional,
+  and keep `restore_prior_engine()` dependency-free — it must run with no config and no instance.
+- **`commit_text("\n")` is not the Enter key**: it inserts a newline *character*, so a shell never
+  runs the command. `press_enter()` is a distinct seam method for this reason and delegates to a
+  key-event backend even when IBus is active (spec §5.4, "non-text targets"). Never collapse it
+  into `commit`/`type_raw`.
 
 - **ydotool stuck keys**: If a ydotool command is interrupted between key-down and key-up, the virtual device retains that key as pressed. The service auto-restarts `ydotoold` to recover. Scripts: `fix-ydotool.sh`, `install-ydotool.sh`.
 - **pw-record ignores SIGTERM**: Must use SIGKILL (`proc.kill()`) to stop PipeWire recorder processes.

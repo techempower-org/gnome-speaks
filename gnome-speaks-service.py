@@ -35,6 +35,17 @@ from dataclasses import dataclass
 import queue
 
 import spellbook
+from injector import Injector
+
+# The IBus backend is optional at runtime: a machine without the IBus typelib,
+# or a partial install, must still start on ydotool rather than not at all.
+try:
+    from ibus_injector import IbusInjector, restore_prior_engine
+except Exception as _ibus_exc:  # pragma: no cover - platform dependent
+    IbusInjector = None
+
+    def restore_prior_engine(reason="startup"):
+        return False
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
@@ -895,64 +906,18 @@ def replace_typed_text(old_text, new_text):
 # Injection seam
 # ---------------------------------------------------------------------------
 # Every path that puts text in front of the user's cursor goes through an
-# Injector.  Today there is exactly one backend (ydotool/xdotool, the functions
-# above); the seam exists so an IBus backend can be added beside it without
-# touching the STT cycle.  See the IBus spec, phase 1 — this extraction is a
-# pure refactor and deliberately changes no behavior.
+# Injector.  The contract lives in injector.py; the two backends are
+# YdotoolInjector below (synthesized key events) and IbusInjector in
+# ibus_injector.py (D-Bus text commits).
 #
-# YdotoolInjector delegates to the module-level functions rather than absorbing
-# them: it keeps their bodies byte-identical (so every timing quirk survives by
-# construction) and keeps them patchable by name, which the test harnesses rely
-# on to stay off the real uinput device.
-
-
-class Injector:
-    """Backend-agnostic text injection.
-
-    Subclasses implement the five injection primitives the STT cycle uses.
-    ``prepare``/``recover``/``available``/``supports_preedit`` have safe
-    defaults so a partial backend degrades instead of crashing.
-    """
-
-    name = "base"
-
-    def prepare(self):
-        """One-time backend startup. Called off the main thread at boot."""
-
-    def available(self):
-        """True if this backend can type live at the cursor."""
-        return False
-
-    def supports_preedit(self):
-        """True if partials can go to a volatile pre-edit region."""
-        return False
-
-    def commit(self, text):
-        """Put final ``text`` at the cursor. Returns True on success."""
-        raise NotImplementedError
-
-    def type_raw(self, text):
-        """Type ``text`` with no focus-settle delay and no fallback."""
-        raise NotImplementedError
-
-    def send_backspaces(self, count):
-        """Retract ``count`` characters already put at the cursor."""
-        raise NotImplementedError
-
-    def replace_text(self, old_text, new_text):
-        """Update live-typed text from ``old_text`` to ``new_text``."""
-        raise NotImplementedError
-
-    def paste(self, text):
-        """Deliver ``text`` via the clipboard. Returns True on success."""
-        raise NotImplementedError
-
-    def recover(self):
-        """Clear any wedged backend state (called on shutdown)."""
+# YdotoolInjector delegates to the module-level functions above rather than
+# absorbing them: it keeps their bodies byte-identical (so every timing quirk
+# survives by construction) and keeps them patchable by name, which the test
+# harnesses rely on to stay off the real uinput device.
 
 
 class YdotoolInjector(Injector):
-    """The shipping backend: ydotool (or xdotool), synthesizing key events.
+    """The original backend: ydotool (or xdotool), synthesizing key events.
 
     Thin adapter over the module-level typing functions above — same code,
     same timings, same quirks.
@@ -976,6 +941,9 @@ class YdotoolInjector(Injector):
     def type_raw(self, text):
         return _type_raw(text)
 
+    def press_enter(self):
+        return _type_raw("\n")
+
     def send_backspaces(self, count):
         return _send_backspaces(count)
 
@@ -992,36 +960,74 @@ class YdotoolInjector(Injector):
 _INJECTION_METHODS = ("ydotool", "ibus", "auto")
 
 _injector = None
+_injector_method = None
 _injector_lock = threading.Lock()
 
 
 def _make_injector():
     """Pick a backend from CONFIG['injection_method'].
 
-    Only ydotool is implemented; every other value falls back to it.  The
-    config key must also be whitelisted in speech-to-cli's state.py
-    load_config(), or it reads "ydotool" forever.
+    Falls back to ydotool for every failure: an unknown value, IBus bindings
+    missing, the daemon unreachable, registration refused.  Never falls back
+    to nothing — losing dictation to a misconfigured key is a worse outcome
+    than ignoring the key.  (The key must also be whitelisted in
+    speech-to-cli's state.py load_config(), or it reads "ydotool" forever.)
     """
     method = str(CONFIG.get("injection_method") or "ydotool").strip().lower()
     if method not in _INJECTION_METHODS:
         log.warning("Unknown injection_method %r (expected one of %s), using ydotool",
                     method, ", ".join(_INJECTION_METHODS))
-    elif method == "ibus":
-        log.warning("injection_method=ibus is not implemented yet, using ydotool")
-    elif method == "auto":
-        log.info("injection_method=auto resolves to ydotool (no IBus backend yet)")
-    return YdotoolInjector()
+        method = "ydotool"
+
+    ydotool = YdotoolInjector()
+    if method == "ydotool":
+        return ydotool
+
+    if IbusInjector is None:
+        # "auto" resolving to ydotool because this machine has no IBus is the
+        # designed outcome, not a fault — warning about it would cry wolf on
+        # every non-GNOME session. An explicit "ibus" request is different:
+        # the user asked for something they are not getting.
+        if method == "ibus":
+            log.warning("injection_method=ibus requested but the IBus backend "
+                        "could not be imported; using ydotool")
+        else:
+            log.info("injection_method=auto: no IBus backend available, "
+                     "using ydotool")
+        return ydotool
+
+    ibus = IbusInjector(fallback=ydotool)
+    if ibus.available():
+        return ibus
+    if method == "ibus":
+        log.warning("injection_method=ibus requested but IBus is unavailable; "
+                    "using ydotool")
+    else:
+        log.info("injection_method=auto: IBus unavailable, using ydotool")
+    return ydotool
 
 
 def get_injector():
-    """The process-wide injection backend (lazy, built once)."""
-    global _injector
-    if _injector is None:
-        with _injector_lock:
-            if _injector is None:
-                _injector = _make_injector()
-                log.info("Injection backend: %s", _injector.name)
-    return _injector
+    """The process-wide injection backend (lazy, rebuilt when config changes)."""
+    global _injector, _injector_method
+    method = str(CONFIG.get("injection_method") or "ydotool").strip().lower()
+    if _injector is not None and method == _injector_method:
+        return _injector
+    with _injector_lock:
+        if _injector is not None and method == _injector_method:
+            return _injector
+        previous = _injector
+        if previous is not None:
+            # Hand the desktop back before swapping backends underneath it.
+            try:
+                previous.cancel()
+            except Exception:
+                log.debug("Previous injector cancel failed", exc_info=True)
+        _injector = _make_injector()
+        _injector_method = method
+        log.info("Injection backend: %s (injection_method=%s)",
+                 _injector.name, method)
+        return _injector
 
 
 # ── Terminal-mode smart lowercasing ──────────────────────────────────────
@@ -1444,6 +1450,10 @@ class GnomeSpeaksService:
         "conversation_mode", "continuous_dictation", "dictation_mode",
         "terminal_mode", "skip_final_paste", "read_notifications",
         "wake_word", "wake_word_model", "llm_thinking",
+        # Backend escape hatch: editing this key alone must be enough to get
+        # off IBus, because the reason for getting off IBus may be that the
+        # user cannot type.
+        "injection_method",
         "speed", "pitch", "volume", "chronicle",
         # LLM provider config
         "llm_provider", "llm_model", "llm_api_key", "llm_system_prompt",
@@ -1560,6 +1570,17 @@ class GnomeSpeaksService:
             self._state = new_state
             GLib.idle_add(self._emit_state_changed, new_state)
         log.info("State %s -> %s", old, new_state)
+        if new_state == "idle":
+            # Idle means no utterance is in flight, so it is the one place
+            # every path — streaming, single-shot, conversation, error — is
+            # guaranteed to pass through. end() is idempotent and flushes any
+            # coalesced commit, so the IBus backend hands the user's input
+            # method back here rather than depending on each call site to
+            # remember. The watchdog covers the case where even this is missed.
+            try:
+                get_injector().end()
+            except Exception:
+                log.debug("Injector end() failed", exc_info=True)
         self._reset_inactivity_timer()
 
     def _emit_state_changed(self, state_str):
@@ -2823,7 +2844,7 @@ class GnomeSpeaksService:
             # into the field; it does not press Return, so a shell never
             # runs the command. This site must stay on a key-event backend
             # (spec 5.4, "non-text targets") even after IBus lands.
-            get_injector().type_raw("\n")
+            get_injector().press_enter()
             return None
         elif op == "loop_toggle":
             new = not CONFIG.get("continuous_dictation", False)
@@ -4355,7 +4376,25 @@ def main():
         default=int(os.environ.get("GNOME_SPEAKS_HTTP_PORT", "7710")),
         help="HTTP REST API port (default: 7710, env: GNOME_SPEAKS_HTTP_PORT)",
     )
+    parser.add_argument(
+        "--restore-ime", action="store_true",
+        help="Restore a stranded IBus global engine and exit (ExecStopPost hook)",
+    )
     args = parser.parse_args()
+
+    # Crash recovery for the IBus backend, BEFORE anything else happens.
+    # Deliberately unconditional -- not gated on injection_method: the run that
+    # stranded the engine is not the run that has to clean up after it, and by
+    # now the user may well have flipped the config back to ydotool precisely
+    # BECAUSE their input method is broken. Measured on GNOME 50.1: a crash
+    # mid-session leaves NO global engine and the daemon does not auto-revert,
+    # so on a desktop where the keymap comes from an IBus engine this is the
+    # difference between self-healing and no working keyboard.
+    if args.restore_ime:
+        # ExecStopPost= path: restore and exit, never start a service.
+        restore_prior_engine("service stop")
+        return
+    restore_prior_engine("service start")
 
     # Validate config
     if not CONFIG.get("key"):
