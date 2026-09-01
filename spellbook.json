@@ -165,6 +165,21 @@
         "op": "chronicle_toggle"
       },
       "gate": "instant"
+    },
+    {
+      "name": "loop",
+      "patterns": [
+        "loop",
+        "keep listening",
+        "the loop",
+        "stop the loop",
+        "loop mode"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "loop_toggle"
+      },
+      "gate": "instant"
     }
   ]
 }

@@ -1554,6 +1554,10 @@ class GnomeSpeaksService:
                     f.write(f"[{_log_tag} {time.strftime('%H:%M:%S')}] {msg}\n")
 
         end_word = CONFIG.get("end_word", "over")
+        # Re-read each cycle (see loop bottom): captured once, a Loop toggle
+        # mid-session silently did nothing until the NEXT session — which
+        # reads as "the loop is broken" to anyone flipping the pill or
+        # casting the spell while the mic is open.
         is_loop = CONFIG.get("continuous_dictation", False)
 
         # 1. Get prewarmed recorder (or start fresh) — reused across all
@@ -1618,6 +1622,8 @@ class GnomeSpeaksService:
         natural_end = False  # set each cycle; needed in cleanup for single-shot restart
         while True:
             cycle += 1
+            # Pick up a mid-session Loop toggle in BOTH directions.
+            is_loop = CONFIG.get("continuous_dictation", False)
             _log(f"=== cycle {cycle} (loop={is_loop}) ===")
 
             # 3. Init new WS session for this utterance
@@ -2512,6 +2518,13 @@ class GnomeSpeaksService:
             new = not CONFIG.get("read_notifications", False)
             self._save_config_flag("read_notifications", new)
             return "The notification herald is %s." % ("on" if new else "off")
+        elif op == "loop_toggle":
+            new = not CONFIG.get("continuous_dictation", False)
+            self._save_config_flag("continuous_dictation", new)
+            if new:
+                return ("The loop is woven — I will keep listening "
+                        "after each phrase.")
+            return "The loop is broken — one phrase at a time."
         elif op == "wake_word_toggle":
             new = not CONFIG.get("wake_word", False)
             self._save_config_flag("wake_word", new)
