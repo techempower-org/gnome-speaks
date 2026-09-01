@@ -8,6 +8,11 @@ Wants=graphical-session.target
 Type=dbus
 BusName=org.gnome.Speaks
 ExecStart=@SERVICE_EXEC@
+# Release blocker, not polish: a crash between SetGlobalEngine(ours) and
+# SetGlobalEngine(prior) leaves NO global engine and the daemon does not
+# auto-revert (measured, GNOME 50.1). This runs on every stop, including
+# restart and OOM-kill. '-' so a failed restore never blocks the stop.
+ExecStopPost=-@SERVICE_EXEC@ --restore-ime
 Restart=always
 RestartSec=2
 TimeoutStopSec=10

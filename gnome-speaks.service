@@ -9,6 +9,9 @@ Wants=graphical-session.target
 Type=dbus
 BusName=org.gnome.Speaks
 ExecStart=/home/jp/Projects/gnome-speaks/gnome-speaks-service.py
+# Restore a stranded IBus global engine on every stop (restart, OOM-kill).
+# '-' so a failed restore never blocks the stop.
+ExecStopPost=-/home/jp/Projects/gnome-speaks/gnome-speaks-service.py --restore-ime
 # Always restart so the HTTP API on :7710 stays reachable; the inactivity
 # timeout is disabled below for the same reason.
 Restart=always
