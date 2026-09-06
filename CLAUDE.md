@@ -107,7 +107,7 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 | Terminal | Lowercase, no punctuation, lexical output |
 | Talk | D-Bus API for external apps (blocking call) |
 | Half/Full Duplex | Auto-detected speaker vs headphone routing |
-| Wake word | Idle-only mic stream to LAN openwakeword; detection = dictation hotkey. Toggle: "cast wake word" |
+| Wake word | Idle-only mic stream to LAN openwakeword; detection = dictation hotkey. Toggle: "cast wake word". Opt-in `wake_word_secure_gate` (prefs: "Only Type Into Known Fields"): a wake-opened session types only if IBus reported a non-secure content-type — ONE verdict per session, taken where `live_typing` is computed (gating just the final paste missed live partials and Keep-Live-Text, #55); `start_listening(quick=True)` keeps the wake mark. `python3 verify_wake_gate.py` checks it |
 | Injection | How text reaches the cursor. `injection_method`: `ydotool` (default, synthesizes keys) · `ibus` (D-Bus commits, no stuck keys) · `auto` (ibus when reachable). Falls back to ydotool for every failure, never to nothing |
 | Spellbook | "cast …"/"invoke …" transcripts run local spells (never typed/LLM'd); `POST /cast` is the text seam |
 | Chronicle | Not a mode -- always-on ledger of both directions; 📜 badge rune (8 lines) + panel submenu (12), click to respeak. Spells: "cast echo" / "chronicle" / "seal the chronicle" |

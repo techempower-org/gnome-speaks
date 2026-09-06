@@ -363,7 +363,10 @@ if HAS_IBUS:
 
         def do_focus_out_id(self, object_path):
             self.focused = False
-            # Anything provisional dies with the focus it belonged to.
+            # Anything provisional dies with the focus it belonged to -- and
+            # so does what we knew about the field: the next FocusIn may come
+            # from a client that never sends SetContentType.
+            self.saw_content_type = False
             self.clear_preedit()
             log.debug("IBus focus out")
 
@@ -539,8 +542,12 @@ class IbusInjector(Injector):
     # ── session lifecycle ────────────────────────────────────────────────
 
     def purpose_known(self):
+        # The daemon told us the field's purpose, and it is not a secure one.
+        # FREE_FORM is 0 -- every ordinary editor, textarea and terminal -- so
+        # the test is "did SetContentType arrive", never "is purpose truthy":
+        # the latter refused every plain text field (#55).
         eng = self._engine
-        return bool(eng is not None and eng.focused and eng.purpose
+        return bool(eng is not None and eng.focused and eng.saw_content_type
                     and not eng.is_secure())
 
     def acquire(self):

@@ -286,7 +286,7 @@ Open GNOME Extensions app → GNOME Speaks → Preferences, or:
 gnome-extensions prefs gnome-speaks@jphein
 ```
 
-Settings include voice selection (HD/fast), silence timeout, keyboard shortcuts, conversation mode (LLM provider and model), auto-corrections, and badge positioning.
+Settings include voice selection (HD/fast), silence timeout, keyboard shortcuts, conversation mode (LLM provider and model), auto-corrections, badge positioning, the typing engine (Dictation → Typing → **Typing Engine**: `ydotool` virtual keyboard, `ibus` input method, or `auto`), and the wake-word gate (Wake Word → **Only Type Into Known Fields**, see below).
 
 ## Keyboard shortcuts
 
@@ -521,6 +521,18 @@ during dictation or TTS playback — and a detection behaves exactly like the
 dictation keybinding (chime, current mode applies, "cast …" spells work).
 Toggle by voice with "cast wake word". If the wake server is unreachable the
 watcher backs off quietly and everything else keeps working.
+
+**Only Type Into Known Fields** (`wake_word_secure_gate`, default off): a
+hotkey press is you vouching for the field under the cursor; a wake word is
+not. With this on, a wake-word-opened session types only when the input method
+has told us the field's content-type and it is not a password/PIN field —
+otherwise nothing is typed (no live partials either) and the service says
+"Unknown field — press the hotkey to dictate here". The verdict is taken once,
+when the session opens, and survives loop restarts. It needs the IBus
+**Typing Engine** (`injection_method: "ibus"` or `"auto"`) — the virtual
+keyboard can never know what it is typing into — and on native Wayland, where
+the content-type never reaches IBus, it refuses *all* hands-free typing. That
+is the trade, which is why it is opt-in.
 
 Safety: spells are gated `instant` (read-only/reversible) or `confirm` (the service
 speaks a challenge and requires a spoken "confirm"); a hardcoded executor denylist
