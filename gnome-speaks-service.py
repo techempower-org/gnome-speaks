@@ -1866,13 +1866,20 @@ class GnomeSpeaksService:
         Used for tight loop restarts where config hasn't changed.
         """
         self._wake_initiated = bool(wake)
-        # Prevent concurrent STT threads from rapid clicks.
+        # Prevent concurrent STT threads from rapid clicks -- and from the
+        # "stop, it didn't stop, press again" sequence: stop() keeps the
+        # reference to a worker that outlived its join, so a second worker is
+        # never spawned beside one that still owns the recorder and the WS.
         # For quick (loop) restarts, briefly wait for the old thread to finish
-        # since the loop restart fires before the thread fully exits.
-        if hasattr(self, '_stt_thread') and self._stt_thread and self._stt_thread.is_alive():
+        # since the loop restart fires before the thread fully exits.  A
+        # worker restarting from its own thread must not join itself.
+        me = threading.current_thread()
+        with self._stt_lock:
+            prev = self._stt_thread
+        if prev is not None and prev is not me and prev.is_alive():
             if quick:
-                self._stt_thread.join(timeout=1.0)
-            if self._stt_thread and self._stt_thread.is_alive():
+                prev.join(timeout=1.0)
+            if prev.is_alive():
                 log.warning("STT thread already running, ignoring start_listening")
                 return "error: STT thread already running"
 
@@ -1909,12 +1916,13 @@ class GnomeSpeaksService:
             # Issued before the thread exists: a stop() arriving in the gap
             # between here and the worker's first instruction is remembered by
             # the token, and the worker then refuses to start.
-            self._stt_thread = threading.Thread(
-                target=self._batch_stt_worker,
-                args=(mode, self._cancels.issue("stt")),
-                daemon=True,
-            )
-            self._stt_thread.start()
+            with self._stt_lock:
+                self._stt_thread = threading.Thread(
+                    target=self._batch_stt_worker,
+                    args=(mode, self._cancels.issue("stt")),
+                    daemon=True,
+                )
+                self._stt_thread.start()
             return "ok"
 
         # Streaming mode (default)
@@ -1929,12 +1937,13 @@ class GnomeSpeaksService:
         self._stop_event.clear()
         self._set_state("listening")
 
-        self._stt_thread = threading.Thread(
-            target=self._streaming_stt_worker,
-            args=(self._cancels.issue("stt-stream"),),
-            daemon=True,
-        )
-        self._stt_thread.start()
+        with self._stt_lock:
+            self._stt_thread = threading.Thread(
+                target=self._streaming_stt_worker,
+                args=(self._cancels.issue("stt-stream"),),
+                daemon=True,
+            )
+            self._stt_thread.start()
         return "ok"
 
     def _idle_after_stt(self):
@@ -2562,7 +2571,8 @@ class GnomeSpeaksService:
         if thread is not None:
             thread.join(timeout=10)
             with self._stt_lock:
-                self._stt_thread = None
+                if self._stt_thread is thread and not thread.is_alive():
+                    self._stt_thread = None
 
         # The worker thread already emitted TranscriptionReady and set state to idle.
         # Return empty here — the result was emitted via signal.
@@ -4007,6 +4017,14 @@ class GnomeSpeaksService:
 
         # Wait for threads to finish with short timeouts
         # Skip joining the current thread (e.g. conversation mode calls speak() from STT thread)
+        #
+        # A reference is dropped only once its worker is really gone. A join
+        # that timed out (stt_fixed is mid-POST to Azure for up to 30s and
+        # never sees the stop) leaves a zombie that still owns the recorder
+        # and the shared WebSocket; forgetting it would let the next hotkey
+        # spawn a second worker beside it (#40). Keeping the reference makes
+        # start_listening() refuse until the zombie exits, and lets a later
+        # stop() join it again.
         me = threading.current_thread()
 
         with self._stt_lock:
@@ -4016,7 +4034,8 @@ class GnomeSpeaksService:
             if stt_t.is_alive():
                 log.warning("STT thread did not finish in 3s")
         with self._stt_lock:
-            self._stt_thread = None
+            if self._stt_thread is stt_t and stt_t is not None and not stt_t.is_alive():
+                self._stt_thread = None
 
         with self._speak_lock:
             speak_t = self._speak_thread
@@ -4025,7 +4044,8 @@ class GnomeSpeaksService:
             if speak_t.is_alive():
                 log.warning("Speak thread did not finish in 3s")
         with self._speak_lock:
-            self._speak_thread = None
+            if self._speak_thread is speak_t and speak_t is not None and not speak_t.is_alive():
+                self._speak_thread = None
 
         with self._talk_lock:
             talk_t = self._talk_thread
@@ -4034,7 +4054,8 @@ class GnomeSpeaksService:
             if talk_t.is_alive():
                 log.warning("Talk thread did not finish in 3s")
         with self._talk_lock:
-            self._talk_thread = None
+            if self._talk_thread is talk_t and talk_t is not None and not talk_t.is_alive():
+                self._talk_thread = None
 
         self._set_state("idle")
         return True
