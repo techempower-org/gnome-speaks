@@ -524,15 +524,25 @@ watcher backs off quietly and everything else keeps working.
 
 **Only Type Into Known Fields** (`wake_word_secure_gate`, default off): a
 hotkey press is you vouching for the field under the cursor; a wake word is
-not. With this on, a wake-word-opened session types only when the input method
-has told us the field's content-type and it is not a password/PIN field —
-otherwise nothing is typed (no live partials either) and the service says
-"Unknown field — press the hotkey to dictate here". The verdict is taken once,
-when the session opens, and survives loop restarts. It needs the IBus
-**Typing Engine** (`injection_method: "ibus"` or `"auto"`) — the virtual
-keyboard can never know what it is typing into — and on native Wayland, where
-the content-type never reaches IBus, it refuses *all* hands-free typing. That
-is the trade, which is why it is opt-in.
+not. With this on, a wake-word-opened session types only into a *focused* field
+that the application has **not** declared as password or PIN — otherwise
+nothing is typed (no live partials either) and the service says "Unknown field
+— press the hotkey to dictate here". The verdict is taken once, when the
+session opens, and survives loop restarts. It needs the IBus **Typing Engine**
+(`injection_method: "ibus"` or `"auto"`); the virtual keyboard never learns
+anything about its target.
+
+Read the guarantee narrowly — it is *refuse the declared*, not *allow only the
+vouched-for*:
+
+- **It cannot catch an undeclared password field.** A client that never calls
+  `SetContentType` reaches the input method as purpose `0`, hints `0` — the
+  same bytes as a field that deliberately declares FREE_FORM. The two are
+  indistinguishable, so the gate **fails open** on anything that declares
+  nothing. It stops GTK/Adwaita/Firefox/Chromium password boxes, which do
+  declare; it does not stop a hand-rolled one that doesn't.
+- **It is not X11-only.** The content-type does reach IBus on GNOME 50 native
+  Wayland, so hands-free dictation keeps working there.
 
 Safety: spells are gated `instant` (read-only/reversible) or `confirm` (the service
 speaks a challenge and requires a spoken "confirm"); a hardcoded executor denylist

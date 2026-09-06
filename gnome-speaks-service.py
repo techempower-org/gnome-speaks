@@ -3222,14 +3222,28 @@ class GnomeSpeaksService:
             log.warning("Spell reply dropped: speech queue full")
 
     def _wake_gate_blocks(self):
-        """spec §4.3 (opt-in, wake_word_secure_gate): a wake-word session may
-        only type into a field whose content-type is KNOWN non-secure.
+        """spec §4.3 (opt-in, wake_word_secure_gate): a wake-word session types
+        only into a focused field the app has NOT declared password/PIN.
 
-        A deliberate hotkey press is the user vouching for the target; a
-        wake word is not. Only the IBus backend can know a field's purpose
-        (ydotool never can), and on native Wayland IBus never receives it
-        either — so with the gate on, hands-free dictation is refused there.
-        That is the documented capability trade; default is OFF.
+        A deliberate hotkey press is the user vouching for the target; a wake
+        word is not. Only the IBus backend sees a purpose at all (ydotool never
+        can), so the gate needs injection_method ibus/auto.
+
+        What this does NOT do — measured, not assumed:
+
+        * ibus-daemon (1.5.34) forwards SetContentType to a freshly created
+          engine unconditionally, so after acquire()'s FOCUS_WAIT +
+          CONTENT_TYPE_GRACE a focused engine has ALWAYS seen a content-type.
+          purpose_known() therefore reduces to "focused and not PASSWORD/PIN".
+        * A client that never declares a purpose arrives as (0, 0) — bit-for-bit
+          identical to a declared FREE_FORM. So the gate FAILS OPEN on an
+          undeclared field and CANNOT detect an undeclared password box.
+        * It is not X11-only. On GNOME 50 native Wayland the purpose does
+          arrive (journal 2026-09-01T07:39:11: "IBus content type purpose=10
+          hints=0", wayland session). Any claim that this refuses all
+          hands-free typing on Wayland is false.
+
+        Default is OFF.
         """
         if not getattr(self, "_wake_initiated", False):
             return False

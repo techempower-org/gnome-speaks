@@ -8,7 +8,9 @@ speech queue all mocked out. Exit code 0 = every check passed.
 """
 import importlib.util
 import os
+import re
 import sys
+import threading
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -39,18 +41,30 @@ FREE_FORM, PASSWORD, PIN, EMAIL = 0, 8, 9, 6
 
 inj._engine = None
 check("no engine object -> unknown", inj.purpose_known() is False)
-inj._engine = engine(FREE_FORM, saw_content_type=False)
-check("focused, SetContentType never arrived -> unknown", inj.purpose_known() is False)
 inj._engine = engine(FREE_FORM, focused=False)
-check("content-type seen but not focused -> unknown", inj.purpose_known() is False)
+check("not focused -> unknown", inj.purpose_known() is False)
 inj._engine = engine(FREE_FORM)
-check("FREE_FORM (0) after SetContentType -> KNOWN non-secure", inj.purpose_known() is True)
+check("FREE_FORM (0) -> allowed", inj.purpose_known() is True)
 inj._engine = engine(EMAIL)
-check("EMAIL (6) -> known non-secure", inj.purpose_known() is True)
+check("EMAIL (6) -> allowed", inj.purpose_known() is True)
 inj._engine = engine(PASSWORD)
 check("PASSWORD (8) -> refused", inj.purpose_known() is False)
 inj._engine = engine(PIN)
 check("PIN (9) -> refused", inj.purpose_known() is False)
+
+# The gate FAILS OPEN, and that is the property worth pinning down: a client
+# that never calls SetContentType is delivered to the engine as (0, 0), which
+# is bit-for-bit a declared FREE_FORM.  ibus-daemon 1.5.34 forwards the content
+# type to a fresh engine unconditionally, so "SetContentType never arrived" is
+# not a state a focused engine can be in -- the old row asserting it was dead
+# weight.  What is real is that the two are indistinguishable:
+undeclared = engine(0)          # client declared nothing -> daemon sends (0,0)
+declared_free_form = engine(0)  # client declared FREE_FORM -> also (0,0)
+check("undeclared field is indistinguishable from FREE_FORM",
+      (undeclared.purpose, undeclared.hints)
+      == (declared_free_form.purpose, declared_free_form.hints))
+inj._engine = undeclared
+check("undeclared field is ALLOWED (documented fail-open)", inj.purpose_known() is True)
 
 # ── 2. the service: verdict + wake mark across quick restarts ────────────────
 spec = importlib.util.spec_from_file_location("gss", os.path.join(HERE, "gnome-speaks-service.py"))
@@ -113,7 +127,12 @@ class BusyThread:
 def mark_after(start_wake, **kw):
     """Drive start_listening only as far as the wake mark (a live STT thread
     makes it return before touching audio or state)."""
-    self = types.SimpleNamespace(_wake_initiated=start_wake, _stt_thread=BusyThread())
+    # start_listening reads _stt_lock/_stt_thread before its early return
+    # (#63: "stop, it didn't stop, press again" guard), so the stand-in has to
+    # carry a real lock or it dies with AttributeError before the assertion.
+    self = types.SimpleNamespace(_wake_initiated=start_wake,
+                                 _stt_lock=threading.Lock(),
+                                 _stt_thread=BusyThread())
     Service.start_listening(self, **kw)
     return self._wake_initiated
 
@@ -129,7 +148,31 @@ cycle = src[src.index("def _streaming_stt_cycle"):src.index("def enqueue_speech"
 check("streaming cycle computes wake_blocked next to live_typing",
       "wake_blocked = (" in cycle and cycle.index("wake_blocked = (") > cycle.index("live_typing = ("))
 check("streaming cycle asks the gate exactly once", cycle.count("self._wake_gate_blocks()") == 1)
-check("a blocked session never live-types", "if wake_blocked:\n            live_typing = False" in cycle)
+check("a blocked session never live-types",
+      re.search(r"if wake_blocked:\n\s+live_typing = False", cycle) is not None)
+# Mode scoping: conversation mode types nothing at the cursor, so it must not
+# even ask -- an unknown field is none of its business, and asking would speak
+# a refusal into an LLM turn.
+# A missing marker must FAIL, not raise: on the parent commit none of these
+# exist, and a traceback would hide every check after it.
+_gate_start = cycle.find("wake_blocked = (")
+_gate_end = cycle.find("use_lexical =", _gate_start if _gate_start >= 0 else 0)
+gate_expr = cycle[_gate_start:_gate_end] if _gate_start >= 0 <= _gate_end else ""
+check("the gate is never evaluated in conversation mode",
+      'not CONFIG.get("conversation_mode", False)' in gate_expr
+      and 'CONFIG.get("dictation_mode", True)' in gate_expr)
+# Two call sites in the whole service and no more: the streaming cycle (once
+# per session) and the batch/REST worker (once per utterance, no live typing
+# to gate).  A third would mean the per-path gating of #55 is creeping back.
+check("exactly two gate call sites in the service", src.count("self._wake_gate_blocks()") == 2)
+batch = src[src.index("def _batch_stt_worker"):src.index("def _streaming_stt_cycle")]
+check("the batch worker gates inside its dictation branch, after conversation mode",
+      batch.count("self._wake_gate_blocks()") == 1
+      and batch.index('if CONFIG.get("conversation_mode", False):')
+      < batch.index("self._wake_gate_blocks()"))
+check("the final dictation branch honours the session verdict",
+      re.search(r"if CONFIG\.get\(\"dictation_mode\", True\):\n\s+if wake_blocked:", cycle)
+      is not None)
 
 print()
 if failures:
