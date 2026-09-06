@@ -2087,6 +2087,13 @@ class GnomeSpeaksService:
         # 1. Get prewarmed recorder (or start fresh) — reused across all
         #    cycles in loop mode.
         proc = _take_prewarmed_rec()
+        if proc is not None and proc.poll() is not None:
+            # The prewarm handed over a corpse: pw-record exits when the
+            # (on-demand USB) mic is absent, and the prewarm never polls it.
+            # Start fresh so the failure below is diagnosed against a live
+            # attempt, not against a recorder that died minutes ago.
+            _log(f"prewarmed recorder already exited (rc={proc.returncode}), discarding")
+            proc = None
         if proc is None:
             try:
                 proc = subprocess.Popen(
@@ -2175,6 +2182,7 @@ class GnomeSpeaksService:
             partial_holder = [""]
             end_word_event = threading.Event()
             sender_done = threading.Event()
+            rec_dead = threading.Event()  # recorder exited under us (mic gone)
             raw_frames = []
             typed_partial = [""]
             raw_partial = [""]
@@ -2185,7 +2193,7 @@ class GnomeSpeaksService:
             #    that is handled by the outer cleanup below.
             def send_audio(_req_id=request_id, _raw_frames=raw_frames,
                            _end_word_event=end_word_event,
-                           _sender_done=sender_done):
+                           _sender_done=sender_done, _rec_dead=rec_dead):
                 try:
                     # Calibrate noise threshold (cached — reads only 1 frame after first call)
                     energy_threshold, cal_frames = calibrate_noise(proc)
@@ -2225,6 +2233,21 @@ class GnomeSpeaksService:
                         chunk = proc.stdout.read(FRAME_BYTES)
                         if not chunk or len(chunk) < FRAME_BYTES:
                             _log(f"recorder EOF at frame {total_frames}")
+                            # A short read on a pipe is EOF, and pw-record only
+                            # closes stdout on exit -- the mic is unplugged or
+                            # absent. Without this the cycle ends as an ordinary
+                            # "no speech" and loop mode spins on the dead proc
+                            # every ~3 s forever with the badge still listening.
+                            # Skip the verdict when WE are stopping: stop()
+                            # kills the recorder, and that EOF is not a fault.
+                            if not _stopping():
+                                try:
+                                    proc.wait(timeout=0.5)
+                                except subprocess.TimeoutExpired:
+                                    pass
+                                if proc.poll() is not None:
+                                    _log(f"recorder exited rc={proc.returncode} -- microphone unavailable")
+                                    _rec_dead.set()
                             break
 
                         # Only buffer frames after speech starts (saves memory in loop idle)
@@ -2298,7 +2321,8 @@ class GnomeSpeaksService:
             got_phrase = False
             natural_end = False
 
-            while time.time() < deadline and not _stopping():
+            while (time.time() < deadline and not _stopping()
+                   and not rec_dead.is_set()):
                 try:
                     ws.settimeout(1.0)
                     msg = ws.recv()
@@ -2398,6 +2422,18 @@ class GnomeSpeaksService:
                 if live_typing and typed_partial[0]:
                     get_injector().send_backspaces(len(typed_partial[0]))
                     typed_partial[0] = ""
+                GLib.idle_add(self._emit_transcription_ready, "")
+                user_text = ""
+                break
+
+            if rec_dead.is_set():
+                # One Error signal, then leave the cycle loop: there is no
+                # recorder to loop on, and the badge must stop saying so.
+                if live_typing and typed_partial[0]:
+                    get_injector().send_backspaces(len(typed_partial[0]))
+                    typed_partial[0] = ""
+                GLib.idle_add(self._emit_error,
+                              "Microphone unavailable: recorder exited")
                 GLib.idle_add(self._emit_transcription_ready, "")
                 user_text = ""
                 break
@@ -2538,7 +2574,7 @@ class GnomeSpeaksService:
         # If stop_event was set by turn_end (natural_end) in single-shot mode,
         # and continuous dictation is on, restart via start_listening (legacy path
         # for non-loop mode, e.g. conversation_mode toggled on mid-session).
-        if (not is_loop and not cancel_token.cancelled
+        if (not is_loop and not cancel_token.cancelled and not rec_dead.is_set()
                 and CONFIG.get("continuous_dictation", False)
                 and (natural_end or not self._stop_event.is_set())):
             if natural_end:
@@ -3213,6 +3249,7 @@ class GnomeSpeaksService:
         """Daemon thread: streams mic audio to the Wyoming wake-word server
         while idle; a detection acts like the dictation hotkey."""
         last_fail_log = 0.0
+        rec_backoff = 5.0  # seconds; doubles per dead recorder, caps at 60 s
         while True:
             if (not CONFIG.get("wake_word", False)
                     or not CONFIG.get("wyoming_host", "")
@@ -3229,15 +3266,33 @@ class GnomeSpeaksService:
                                         stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL)
 
+                rec_eof = [False]
+
                 def _chunks():
                     while (CONFIG.get("wake_word", False)
                            and self.current_state == "idle"):
                         data = proc.stdout.read(3200)  # ~100 ms @ 16 kHz s16
                         if not data:
+                            rec_eof[0] = True
                             return
                         yield data
 
                 name = wyoming_mod.detect_stream(host, port, model, _chunks())
+                if rec_eof[0] and proc.poll() is not None:
+                    # pw-record exits when the mic is absent; the read returns
+                    # EOF instantly and this loop would re-fork the recorder
+                    # and reconnect to the wake server with zero sleep (#48,
+                    # #41). Back off instead of hot-looping.
+                    now = time.time()
+                    if now - last_fail_log > 300:
+                        log.warning("Wake watcher: recorder exited (rc=%s) -- "
+                                    "microphone unavailable; retrying with backoff",
+                                    proc.returncode)
+                        last_fail_log = now
+                    time.sleep(rec_backoff)
+                    rec_backoff = min(rec_backoff * 2, 60.0)
+                    continue
+                rec_backoff = 5.0
                 if name and self.current_state == "idle":
                     log.info("Wake word detected (%s) — opening mic", name)
                     GLib.idle_add(lambda: (self.start_listening(quick=True,
