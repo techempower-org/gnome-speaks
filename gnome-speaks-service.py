@@ -3168,12 +3168,21 @@ class GnomeSpeaksService:
             self._save_config_flag("read_notifications", new)
             return "The notification herald is %s." % ("on" if new else "off")
         elif op == "injection_toggle":
-            cur = CONFIG.get("injection_method", "ydotool")
-            new = "ydotool" if cur == "ibus" else "ibus"
+            # The spell is the voice-recoverable way out of an IBus trial, so
+            # "auto" (which may already be on IBus) must leave to ydotool, not
+            # re-request ibus and change nothing (#56). Unknown values are
+            # ydotool in _make_injector(), so they toggle to ibus.
+            cur = str(CONFIG.get("injection_method") or "ydotool").strip().lower()
+            new = "ydotool" if cur in ("ibus", "auto") else "ibus"
             self._save_config_flag("injection_method", new)
-            if new == "ibus":
+            # Report what was actually built, not what was asked for: an
+            # "ibus" request falls back to ydotool when IBus is unreachable.
+            if get_injector().name == "ibus":
                 return ("Typing through the input method — no key can stick. "
                         "Say the same words to go back.")
+            if new == "ibus":
+                return ("The input method is unreachable — still typing "
+                        "through the virtual keyboard.")
             return "Typing through the virtual keyboard."
         elif op == "press_enter":
             # Hands-free Enter. Deliberately a SPELL ("cast run it") and not
