@@ -171,7 +171,93 @@ PY
 
 # ── Per-PID broadway display ─────────────────────────────────────────────────
 DISP=""
-start=$(( 20 + ($$ % 60) ))
+
+# ---------------------------------------------------------------------------
+# Reap orphaned broadwayds before probing (#94).
+#
+# A hard-killed run.sh (SIGKILL from a tool timeout, or an OOM kill) leaves its
+# broadwayd ALIVE -- the EXIT trap covers TERM and INT, but nothing catches
+# KILL. A live orphan is not stale: sock_live() correctly reads it as
+# "occupied" and skips that display FOREVER, so orphans monotonically exhaust
+# the 26-slot probe window. Same shape as the stale-socket bug, different
+# cause, and it survives that fix.
+#
+# PIDs are resolved THROUGH THE SOCKET -- socket path -> inode from
+# /proc/net/unix -> the process holding that inode in /proc/<pid>/fd -- and
+# never by matching a process name. A name pattern is how a reaper kills its
+# own shell: bracketing the first character protects the pattern from matching
+# itself, but not from the bare token appearing elsewhere in the same command.
+# There is no name here for a pattern to match.
+#
+# Two restrictions keep this from touching anything that is not ours: the
+# process must hold one of OUR sockets, and its stdout must be a
+# .../run-<pid>/broadwayd.log that NO LONGER EXISTS. A live run's log exists,
+# so a live run is never reaped; a broadwayd someone started by hand has a
+# different stdout, so it is never reaped either.
+# ---------------------------------------------------------------------------
+reap_orphaned_broadwayd() {
+    python3 - "$(id -u)" <<'REAPPY'
+import os, sys
+
+rundir = "/run/user/%s" % sys.argv[1]
+inode = {}
+try:
+    with open("/proc/net/unix") as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) >= 8 and parts[-1].startswith(rundir + "/broadway"):
+                inode[parts[6]] = parts[-1]
+except OSError:
+    sys.exit(0)
+if not inode:
+    sys.exit(0)
+
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    try:
+        fds = os.listdir("/proc/%s/fd" % pid)
+    except OSError:
+        continue                      # gone, or not ours to look at
+    sock = None
+    for fd in fds:
+        try:
+            target = os.readlink("/proc/%s/fd/%s" % (pid, fd))
+        except OSError:
+            continue
+        if target.startswith("socket:[") and target[8:-1] in inode:
+            sock = inode[target[8:-1]]
+            break
+    if sock is None:
+        continue
+    try:
+        out = os.readlink("/proc/%s/fd/1" % pid)
+    except OSError:
+        continue
+    path = out[:-10] if out.endswith(" (deleted)") else out
+    if not path.endswith("/broadwayd.log") or "/run-" not in path:
+        continue                      # not this rig's broadwayd
+    if os.path.exists(path):
+        continue                      # a LIVE run owns this display
+    try:
+        os.kill(int(pid), 15)
+    except OSError:
+        continue
+    try:
+        os.unlink(sock)
+    except OSError:
+        pass
+    print("reaped orphaned broadwayd pid=%s %s" % (pid, sock))
+REAPPY
+}
+
+# GS_REAP_DISABLE is the OTHER half of the test seam: verify_reaper.sh must be
+# able to show the control going RED without the reaper, or it proves nothing.
+[ -n "${GS_REAP_DISABLE:-}" ] || reap_orphaned_broadwayd
+
+# GS_BROADWAY_START is a TEST SEAM: verify_reaper.sh needs a deterministic
+# window to fill with orphans, and the default is derived from $$.
+start=${GS_BROADWAY_START:-$(( 20 + ($$ % 60) ))}
 for n in $(seq $start $((start + 25))); do
     sock="/run/user/$(id -u)/broadway$((n + 1)).socket"   # display :N -> socket N+1
     sock_live "$sock" && continue                          # genuinely in use

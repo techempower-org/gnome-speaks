@@ -186,6 +186,43 @@ form has its own short-form failure. If you do add `-e`, write every count as
   merely currently-true — if stub ownership ever moves into the harness, check H
   before trusting it.
 
+## Orphaned broadwayds, and a control that can fail
+
+A hard-killed `run.sh` (SIGKILL from a tool timeout, or an OOM kill) leaves its
+`gtk4-broadwayd` **alive** — the EXIT trap covers TERM and INT, but nothing
+catches KILL. A live orphan is not stale: the liveness probe correctly reads it
+as *occupied* and skips that display forever, so orphans **monotonically
+exhaust** the 26-slot probe window. Same shape as the stale-socket bug, a
+different cause, and it survives that fix.
+
+`run.sh` reaps them before probing. PIDs are resolved **through the socket** —
+socket path → inode from `/proc/net/unix` → the process holding that inode in
+`/proc/<pid>/fd` — and never by matching a process name. A name pattern is how
+a reaper kills its own shell: bracketing the first character protects the
+pattern from matching *itself*, but not from the bare token appearing elsewhere
+in the same command. There is no name here for a pattern to match.
+
+Two restrictions keep it off anything that is not ours: the process must hold
+one of our sockets, **and** its stdout must be a `.../run-<pid>/broadwayd.log`
+that no longer exists. A live run's log exists; a hand-started broadwayd has a
+different stdout. Both are verified, not assumed.
+
+`verify_reaper.sh` is the control, and it is checked **in both directions**:
+
+```
+A. reaper DISABLED  -> rc=2  !! SETUP FAILURE: no free broadway display in :200..:225
+B. reaper ENABLED   -> rc=0  26 orphans reaped
+```
+
+> The candidate control for the sibling socket bug returned `0 -> 0` against
+> **unfixed** code — it would have passed on the bug it was meant to catch, and
+> was dropped for that reason. **A gate that is green on broken code
+> manufactures confidence.** If a control has never been watched to fail, it is
+> not yet a control.
+
+It is not wired into `run_all.sh`: it starts 26 processes and verifies the
+reaper, not the service. Run it when touching the probe or the reaper.
+
 ## prefs-rig is not python
 
 `prefs-rig/` is a GJS/bash rig (`run.sh` → `gjs` + `gtk4-broadwayd`) testing
