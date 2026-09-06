@@ -643,9 +643,18 @@ def _chronicle_find(entry_id):
 # Clipboard helpers (our own — do not import from speech-to-cli)
 # ---------------------------------------------------------------------------
 
-def clipboard_read():
-    """Read text from the clipboard (Wayland-first, X11 fallback)."""
-    for cmd in [["wl-paste", "--no-newline"], ["xclip", "-selection", "clipboard", "-o"]]:
+def _read_via(cmds, label):
+    """Read text with the first of `cmds` that exists (Wayland-first, X11
+    fallback).
+
+    The clipboard and the PRIMARY selection differ only in which tools to ask
+    and what to call the failure in the log -- everything else (the 5 s
+    timeout, "returncode 0 means the text is stdout verbatim", falling through
+    on FileNotFoundError, and "" when nothing worked) is the same contract.
+    Deliberately returns stdout UNSTRIPPED: callers that want it trimmed do
+    their own trimming, and one of them also truncates.
+    """
+    for cmd in cmds:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
@@ -653,8 +662,16 @@ def clipboard_read():
         except FileNotFoundError:
             continue
         except subprocess.TimeoutExpired:
-            log.debug("Clipboard read timed out: %s", cmd[0])
+            log.debug("%s read timed out: %s", label, cmd[0])
     return ""
+
+
+def clipboard_read():
+    """Read text from the clipboard (Wayland-first, X11 fallback)."""
+    return _read_via(
+        [["wl-paste", "--no-newline"],
+         ["xclip", "-selection", "clipboard", "-o"]],
+        "Clipboard")
 
 
 def clipboard_write(text):
@@ -1152,16 +1169,10 @@ def _terminal_lowercase(text):
 
 def selection_read():
     """Read the currently highlighted/selected text (PRIMARY selection)."""
-    for cmd in [["wl-paste", "--primary", "--no-newline"], ["xclip", "-selection", "primary", "-o"]]:
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                return result.stdout
-        except FileNotFoundError:
-            continue
-        except subprocess.TimeoutExpired:
-            log.debug("Selection read timed out: %s", cmd[0])
-    return ""
+    return _read_via(
+        [["wl-paste", "--primary", "--no-newline"],
+         ["xclip", "-selection", "primary", "-o"]],
+        "Selection")
 
 
 # Voice commands: spoken punctuation → actual characters
@@ -2276,10 +2287,9 @@ class GnomeSpeaksService:
         _schedule_warmup()
 
         if user_text and CONFIG.get("continuous_dictation", False) and not self._stop_event.is_set():
-            GLib.idle_add(lambda: (self.start_listening(quick=True), False)[-1]
-                          if (CONFIG.get("continuous_dictation", False)
-                              and not self._stop_event.is_set())
-                          else False)
+            GLib.idle_add(self._restart_listening_cb(
+                lambda: (CONFIG.get("continuous_dictation", False)
+                         and not self._stop_event.is_set())))
 
     def _report_recorder_dead(self, cycle):
         """The single place the lost-microphone verdict reaches the user.
@@ -3595,11 +3605,10 @@ class GnomeSpeaksService:
                     and CONFIG.get("conversation_mode", False)
                     and not self._stop_event.is_set()):
                 log.info("Hands-free: auto-restarting listening after TTS")
-                GLib.idle_add(lambda: (self.start_listening(quick=True), False)[-1]
-                              if (CONFIG.get("continuous_dictation", False)
-                                  and CONFIG.get("conversation_mode", False)
-                                  and not self._stop_event.is_set())
-                              else False)
+                GLib.idle_add(self._restart_listening_cb(
+                    lambda: (CONFIG.get("continuous_dictation", False)
+                             and CONFIG.get("conversation_mode", False)
+                             and not self._stop_event.is_set())))
         return outcome
 
     def speak_clipboard(self):
@@ -3724,6 +3733,25 @@ class GnomeSpeaksService:
         self._spell_speak("Unknown field — press the hotkey to dictate here.")
         return True
 
+    def _toggle_config_flag(self, key, default=False):
+        """Flip a boolean mode flag, persist it, and return the NEW value.
+
+        Only the flip-and-persist is shared. What stays at each call site:
+        the spoken reply (some are one template, some are two distinct
+        sentences), and subtitles_toggle's extra GSettings dual-write.
+
+        `default` is a PARAMETER, not a constant: live_subtitles and
+        chronicle default to True and the rest to False, so a wrong default
+        here would silently invert which way a spell toggles on first use.
+
+        Always goes through _save_config_flag, never `CONFIG[key] = ...`:
+        that is the seam keeping the runtime dict and config.json from
+        drifting (CLAUDE.md, config dual-write).
+        """
+        new = not CONFIG.get(key, default)
+        self._save_config_flag(key, new)
+        return new
+
     def _spell_ctx_dbus(self, op):
         """Self-directed spell operations (dbus_self action type)."""
         if op == "stop":
@@ -3740,8 +3768,7 @@ class GnomeSpeaksService:
             self._save_config_flag("conversation_mode", False)
             self._save_config_flag("terminal_mode", False)
         elif op == "read_notifications_toggle":
-            new = not CONFIG.get("read_notifications", False)
-            self._save_config_flag("read_notifications", new)
+            new = self._toggle_config_flag("read_notifications")
             return "The notification herald is %s." % ("on" if new else "off")
         elif op == "injection_toggle":
             # The spell is the voice-recoverable way out of an IBus trial, so
@@ -3773,26 +3800,22 @@ class GnomeSpeaksService:
             get_injector().press_enter()
             return None
         elif op == "loop_toggle":
-            new = not CONFIG.get("continuous_dictation", False)
-            self._save_config_flag("continuous_dictation", new)
+            new = self._toggle_config_flag("continuous_dictation")
             if new:
                 return ("The loop is woven — I will keep listening "
                         "after each phrase.")
             return "The loop is broken — one phrase at a time."
         elif op == "wake_word_toggle":
-            new = not CONFIG.get("wake_word", False)
-            self._save_config_flag("wake_word", new)
+            new = self._toggle_config_flag("wake_word")
             return "The waking watch is %s." % ("on" if new else "off")
         elif op == "thinking_toggle":
-            new = not CONFIG.get("llm_thinking", False)
-            self._save_config_flag("llm_thinking", new)
+            new = self._toggle_config_flag("llm_thinking")
             if new:
                 return ("Deep thought engaged — replies will be slow "
                         "and thorough.")
             return "Deep thought off — fast replies."
         elif op == "subtitles_toggle":
-            new = not CONFIG.get("live_subtitles", True)
-            self._save_config_flag("live_subtitles", new)
+            new = self._toggle_config_flag("live_subtitles", default=True)
             # Dual-write: the extension gates its overlay on GSettings —
             # keep both layers in sync (see the config dual-write gotcha).
             schema_dir = os.path.expanduser(
@@ -3825,8 +3848,7 @@ class GnomeSpeaksService:
                 parts.append(f"{who}: {text}")
             return " … ".join(parts)
         elif op == "chronicle_toggle":
-            new = not CONFIG.get("chronicle", True)
-            self._save_config_flag("chronicle", new)
+            new = self._toggle_config_flag("chronicle", default=True)
             if new:
                 return "The chronicle records once more."
             return "The chronicle is sealed — nothing will be written."
@@ -4320,6 +4342,32 @@ class GnomeSpeaksService:
             history = list(self._conversation_history[-40:])
         return system_prompt, history
 
+    def _restart_listening_cb(self, still_wanted):
+        """A one-shot GLib source callback that restarts listening.
+
+        Collapses `lambda: (self.start_listening(quick=True), False)[-1] if
+        <guard> else False`, which appeared four times. The tuple-index trick
+        exists only to force the False that makes a GLib source fire once, and
+        it is easy to get subtly wrong -- that is what is worth having in one
+        place.
+
+        What deliberately STAYS at each call site:
+          * the guard, because all four differ (loop only; loop AND
+            conversation; stop-event only), and
+          * the scheduler, because `idle_add` and `timeout_add(2000)` are a
+            timing decision, not boilerplate.
+
+        `still_wanted` is re-checked HERE, when the source fires, not when it
+        was scheduled: between the two the user can stop or toggle the loop
+        off, and the restart must not happen then. That re-check is why the
+        guard is passed as a callable.
+        """
+        def _cb():
+            if still_wanted():
+                self.start_listening(quick=True)
+            return False
+        return _cb
+
     def _maybe_loop_restart(self):
         """Restart listening in AI+Loop mode. Called from worker thread."""
         if (CONFIG.get("continuous_dictation", False)
@@ -4331,9 +4379,8 @@ class GnomeSpeaksService:
             # audio detection since nothing changed within the loop.
             # Use GLib.idle_add because start_listening touches state
             # that must be set from the main thread context.
-            GLib.idle_add(lambda: (self.start_listening(quick=True), False)[-1]
-                          if not self._stop_event.is_set()
-                          else False)
+            GLib.idle_add(self._restart_listening_cb(
+                lambda: not self._stop_event.is_set()))
         else:
             _schedule_warmup()
 
@@ -4627,11 +4674,8 @@ class GnomeSpeaksService:
                     and CONFIG.get("conversation_mode", False)
                     and not self._stop_event.is_set()):
                 log.info("AI+Loop: retry after error (2s delay)")
-                GLib.timeout_add(2000, lambda: (
-                    (self.start_listening(quick=True), False)[-1]
-                    if not self._stop_event.is_set()
-                    else False
-                ))
+                GLib.timeout_add(2000, self._restart_listening_cb(
+                    lambda: not self._stop_event.is_set()))
         finally:
             self._cancels.retire(cancel_token)
             self._release_user_speech()
