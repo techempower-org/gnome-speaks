@@ -245,6 +245,58 @@ No test suite. Validate changes by:
    between runs. Get a baseline on `main` before blaming your branch, and wipe the suite's
    state dir if a second run disagrees with the first.
 
+8. **prefs.js changes: the broadway rig.** Lives in the same scratch dir as the suites above,
+   as `luna-prefs-async-repros/`. ⚠️ **`gnome-extensions prefs
+   gnome-speaks@jphein` CANNOT verify a worktree** -- it goes through the live shell and opens
+   the copy **installed** in `~/.local/share/gnome-shell/extensions`, so it renders the OLD
+   prefs.js and reports success. Item 5 does not cover this either: gnome-shell never loads
+   prefs.js at all (the prefs window is a separate process), so a clean headless shell says
+   nothing about it.
+
+   ```bash
+   cd ~/.claude/projects/-home-jp/scratch/gnome-speaks-dreamteam/luna-prefs-async-repros
+   ./run.sh ~/Projects/gnome-speaks-wt/<wt>/prefs.js                     # one file
+   ./run.sh ~/Projects/gnome-speaks-wt/<wt>/prefs.js /path/to/main.js    # + baseline diff
+   ```
+
+   It builds a **real, mapped `Adw.PreferencesWindow`** on a `gtk4-broadwayd` virtual display,
+   so **no window appears and no focus is stolen -- safe to run while JP is dictating**. `HOME`
+   is sandboxed and `GSETTINGS_BACKEND=memory` is forced, so a run can never write
+   `~/.config/speech-to-cli/config.json` or dconf. It reports per combo row: options and
+   selected index **synchronously** and again **after async probes land**; `WRITES` (must be
+   `none` -- swapping a `Gtk.StringList` moves `selected` and emits `notify::selected`, which
+   `_addComboRow` treats as a user choice, so a careless async fill rewrites the setting it is
+   still loading); and `BLANK_RENDERED`.
+
+   ⭐ **`BLANK_RENDERED` exists because a property snapshot cannot see a markup failure.** When
+   `set_markup` fails, the *property* keeps the string and the *label* is left EMPTY, so the
+   bug is invisible both in the code and in any check that reads properties. It flags anything
+   whose text is set but renders blank. On `main` before the markup fix it found 5 -- four shortcut rows
+   whose subtitles are raw accelerators (`<Super><Alt>space` parses as an unclosed tag) and the
+   `Privacy & Debug` group title.
+
+   **Always pass a baseline.** A run that CRASHED also produces "no new warnings", so `run.sh`
+   requires the harness to print `EXIT_CLEAN` before it believes any stderr comparison -- two
+   crashes have identical stderr and would otherwise read as a pass.
+
+   **Exit contract:** 0 = both runs completed; 1 = a run did not complete, or the branch emits
+   MORE warnings than the baseline. A differing stderr is **not** failure -- a fix is supposed
+   to change stderr, and keying the exit code on `diff` made a successful run report 1.
+
+   **Isolation contract** -- the same shape the service-side suites enforce, and none of it is
+   optional:
+   - Everything a run writes lives under `run-$$` and is deleted on exit. **No fixed paths**,
+     so two rigs running at once cannot share a sandbox, a schema dir, or a broadway socket
+     (the display number is per-PID and probed until one binds). Verified by running two
+     concurrently: distinct dirs, distinct displays, identical verdicts, no leftovers.
+   - The `config.json` handed to prefs.js is a **rig-owned fixture with pinned keys**.
+     `~/.config/speech-to-cli/config.json` is **never read** -- an earlier version copied it
+     and let 47 of JP's live keys steer the verdict, and cached that copy forever behind an
+     `if [ ! -f ]`. Device ids in the fixture come from live `wpctl`, so the "config names a
+     device" path is exercised on any machine.
+   - `HOME` and `GSETTINGS_BACKEND=memory` are exported into the gjs child only, never into
+     the calling shell, so a run cannot write the real config or dconf.
+
 ## Git
 
 Conventional commits (`feat:`, `fix:`, `refactor:`). Branch naming: `<type>/<short-description>`.
