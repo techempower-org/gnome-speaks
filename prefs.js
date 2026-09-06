@@ -92,11 +92,15 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         this._settings = this.getSettings();
         this._saveTimeoutId = null;
         this._ccaSaveTimeoutId = null;
+        // Cancels any async system probe still in flight when the window
+        // closes, so its callback never touches a destroyed row.
+        this._probeCancellable = new Gio.Cancellable();
 
         window.set_default_size(720, 860);
         window.set_search_enabled(true);
 
         window.connect('close-request', () => {
+            this._probeCancellable.cancel();
             this._flushConfigSave();
             this._flushCcaConfigSave();
             return false;
@@ -667,9 +671,6 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         });
 
         // ── Audio Devices ──
-        const sinks = this._enumeratePipeWireDevices('sinks');
-        const sources = this._enumeratePipeWireDevices('sources');
-
         const devGroup = new Adw.PreferencesGroup({title: 'Audio Devices'});
         page.add(devGroup);
 
@@ -685,8 +686,25 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         }
         this._addComboRow(devGroup, 'Player', 'player', playerOptions, 'auto');
 
-        this._addComboRow(devGroup, 'Speaker', 'speaker_sink',
-            [['', 'System Default'], ...sinks], '');
+        // Speaker and Microphone are filled in when the async `wpctl status`
+        // below answers. Until then the row offers System Default plus a
+        // stand-in for whatever the config already names — a row that shows
+        // "System Default" while the config says otherwise is a row lying
+        // about the current setting.
+        const pendingOptions = configKey => {
+            const saved = this._config[configKey];
+            const options = [['', 'System Default']];
+            if (saved !== undefined && saved !== null && String(saved) !== '')
+                options.push([String(saved), 'Current device — checking…']);
+            return options;
+        };
+
+        const speakerWhat = 'Where speech comes out.';
+        const micWhat = 'Where dictation is heard from.';
+
+        const speakerRow = this._addComboRow(devGroup, 'Speaker', 'speaker_sink',
+            pendingOptions('speaker_sink'), '');
+        speakerRow.subtitle = `${speakerWhat} Looking for devices…`;
 
         const recorderOptions = [['auto', 'Auto-detect']];
         for (const [cmd, label] of [
@@ -698,8 +716,14 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         }
         this._addComboRow(devGroup, 'Recorder', 'recorder', recorderOptions, 'auto');
 
-        this._addComboRow(devGroup, 'Microphone', 'mic_source',
-            [['', 'System Default'], ...sources], '');
+        const micRow = this._addComboRow(devGroup, 'Microphone', 'mic_source',
+            pendingOptions('mic_source'), '');
+        micRow.subtitle = `${micWhat} Looking for devices…`;
+
+        this._enumeratePipeWireDevicesAsync((sinks, sources) => {
+            this._fillDeviceRow(speakerRow, sinks, speakerWhat);
+            this._fillDeviceRow(micRow, sources, micWhat);
+        });
 
         const duplexRow = this._addComboRow(devGroup, 'Speak While Listening', 'half_duplex', [
             ['auto', 'Auto — speakers take turns, headphones overlap'],
@@ -823,7 +847,7 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
     // ═══════════════════════════════════════════════════════════════════
 
     _addComboRow(group, title, configKey, options, defaultValue) {
-        const values = options.map(o => o[0]);
+        let values = options.map(o => o[0]);
         const labels = options.map(o => o[1]);
 
         const currentValue = this._config[configKey] ?? defaultValue;
@@ -837,7 +861,14 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
             selected: selectedIdx,
         });
 
+        // Raised only while the model is swapped programmatically (an async
+        // probe landing). Swapping a model moves `selected`, and that
+        // notify is not a user choice — letting it reach the config would
+        // silently rewrite the very setting the row is still loading.
+        let suppressWrite = false;
+
         row.connect('notify::selected', () => {
+            if (suppressWrite) return;
             const idx = row.get_selected();
             if (idx >= 0 && idx < values.length) {
                 const val = values[idx];
@@ -847,6 +878,22 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
                     this._setConfigValue(configKey, val);
             }
         });
+
+        // Replace the option list in place, re-selecting whatever the config
+        // holds. Safe to call at any time; writes nothing.
+        row._gsSetOptions = newOptions => {
+            values = newOptions.map(o => o[0]);
+            const value = this._config[configKey] ?? defaultValue;
+            let idx = values.findIndex(v => String(v) === String(value));
+            if (idx < 0) idx = 0;
+            suppressWrite = true;
+            try {
+                row.model = Gtk.StringList.new(newOptions.map(o => o[1]));
+                row.selected = idx;
+            } finally {
+                suppressWrite = false;
+            }
+        };
 
         group.add(row);
         return row;
@@ -1177,16 +1224,54 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Enumerate PipeWire sinks or sources by parsing `wpctl status`.
+     * Run `wpctl status` off the main loop — ONCE — and hand both device
+     * lists to the callback. `wpctl` can take arbitrarily long when
+     * PipeWire is busy (at login, say), and this used to run twice
+     * synchronously while the prefs window waited to paint.
+     *
+     * The callback never fires after the window closes. Any failure
+     * (wpctl missing, non-zero exit) yields empty lists — exactly what the
+     * old synchronous probe did.
+     */
+    _enumeratePipeWireDevicesAsync(callback) {
+        let proc;
+        try {
+            proc = Gio.Subprocess.new(['wpctl', 'status'],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
+        } catch (e) {
+            callback([], []);   // wpctl not installed
+            return;
+        }
+
+        proc.communicate_utf8_async(null, this._probeCancellable, (obj, res) => {
+            if (this._probeCancellable.is_cancelled()) return;
+            let output = '';
+            try {
+                const [, stdout] = obj.communicate_utf8_finish(res);
+                if (obj.get_successful()) output = stdout ?? '';
+            } catch (e) {
+                output = '';    // wpctl died — empty lists, as before
+            }
+            callback(this._parsePipeWireDevices(output, 'sinks'),
+                this._parsePipeWireDevices(output, 'sources'));
+        });
+    }
+
+    /** Swap an audio-device row's placeholder list for the probed one. */
+    _fillDeviceRow(row, devices, what) {
+        row._gsSetOptions([['', 'System Default'], ...devices]);
+        row.subtitle = devices.length
+            ? `${what} Default: System Default`
+            : `${what} No PipeWire devices found — using the system default.`;
+    }
+
+    /**
+     * Pull PipeWire sinks or sources out of `wpctl status` output.
      * Returns [[nodeId, label], ...] suitable for _addComboRow.
      */
-    _enumeratePipeWireDevices(type) {
+    _parsePipeWireDevices(output, type) {
         const devices = [];
         try {
-            const [ok, stdout, stderr, exitCode] = GLib.spawn_command_line_sync('wpctl status');
-            if (!ok || exitCode !== 0) return devices;
-
-            const output = new TextDecoder('utf-8').decode(stdout);
             const lines = output.split('\n');
 
             const header = type === 'sinks' ? 'Sinks:' : 'Sources:';
@@ -1228,18 +1313,17 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
                 }
             }
         } catch (e) {
-            // wpctl not available — return empty list
+            // Unparseable output — return empty list
         }
         return devices;
     }
 
+    /**
+     * PATH lookup with no fork — `which` used to be spawned synchronously
+     * six times before the Audio page could paint.
+     */
     _commandExists(cmd) {
-        try {
-            const [ok, stdout, stderr, exitCode] = GLib.spawn_command_line_sync(`which ${cmd}`);
-            return ok && exitCode === 0;
-        } catch (e) {
-            return false;
-        }
+        return GLib.find_program_in_path(cmd) !== null;
     }
 
     // ═══════════════════════════════════════════════════════════════════
