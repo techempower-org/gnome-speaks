@@ -4898,18 +4898,6 @@ def main():
         get_injector().prepare()
     threading.Thread(target=_init_typing, daemon=True).start()
 
-    # Detect audio output device and auto-enable echo cancellation
-    _refresh_audio_detection()
-    dev_type = CONFIG.get("_detected_output", "unknown")
-    ec_present = has_echo_cancel()
-    if ec_present and dev_type == "headphones":
-        CONFIG["enable_echo_cancel"] = True
-        log.info("Auto-enabled echo cancellation (headphones + PipeWire EC detected)")
-    log.info("Audio output: %s, echo_cancel=%s, half_duplex=%s",
-             dev_type, ec_present, CONFIG.get("half_duplex", False))
-
-    # Prewarm recorder, WebSocket, and HTTP session so first call is instant
-    _prewarm_recorder()
     # Pre-warm STT WebSocket and TTS HTTP connection in background
     def _prewarm_connections():
         try:
@@ -4930,8 +4918,30 @@ def main():
 
     # Create service and handler
     service = GnomeSpeaksService()
-    service._audio_detected = True  # startup detection already ran above
     handler = DBusHandler(service)
+
+    # Detect audio output, auto-enable echo cancellation, and prewarm the
+    # recorder in background. These shell out to wpctl/pw-dump/pw-cli (3 s
+    # timeout each) and measured 3.9 s at login while PipeWire was still
+    # coming up; run synchronously they held back Gio.bus_own_name and the
+    # HTTP bind, so systemd (Type=dbus) and the extension saw no service for
+    # the whole window (#50). start_listening()/speak() lazily refresh
+    # detection via _audio_detected until this finishes, and every helper
+    # here is lock-guarded, so a hotkey racing the thread is harmless.
+    def _init_audio():
+        _refresh_audio_detection()
+        dev_type = CONFIG.get("_detected_output", "unknown")
+        ec_present = has_echo_cancel()
+        if ec_present and dev_type == "headphones":
+            CONFIG["enable_echo_cancel"] = True
+            log.info("Auto-enabled echo cancellation (headphones + PipeWire EC detected)")
+        log.info("Audio output: %s, echo_cancel=%s, half_duplex=%s",
+                 dev_type, ec_present, CONFIG.get("half_duplex", False))
+        service._audio_detected = True
+        # Prewarm recorder so the first listen is instant. Same order as the
+        # old synchronous startup: detection and the EC decision first.
+        _prewarm_recorder()
+    threading.Thread(target=_init_audio, daemon=True).start()
 
     # Set up main loop
     loop = GLib.MainLoop()
