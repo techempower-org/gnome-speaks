@@ -2984,6 +2984,19 @@ class GnomeSpeaksService:
                         if live_typing:
                             inj.send_backspaces(len(typed_partial[0]))
                             time.sleep(0.02)
+                        # The pin is handed down so the reply's <type> paste
+                        # uses THIS utterance's backend: one utterance, one
+                        # backend, the same rule that put the pin into
+                        # _LiveTyper (#46/#61).
+                        #
+                        # ⚠️ This depends on the call being SYNCHRONOUS on the
+                        # cycle thread. The cleanup below releases `inj`, and
+                        # it only runs after this returns. Make the reply
+                        # async and inj.end() lands BEFORE the paste -- the
+                        # paste would then go through an ended backend, which
+                        # is worse than the fresh get_injector() this replaced.
+                        # (Note that every reply repro drives the worker on
+                        # its own thread, so none of them would catch it.)
                         self._conversation_worker(user_text, inj)
                         if not CONFIG.get("continuous_dictation", False):
                             self._save_config_flag("conversation_mode", False)
