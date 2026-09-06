@@ -6,17 +6,45 @@ speech queue all mocked out. Exit code 0 = every check passed.
 
     python3 verify_wake_gate.py
 """
+import atexit
 import importlib.util
 import os
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# Redirect the IBus runtime dir BEFORE importing the backend, the way
+# verify_ibus_injector.py already does. Nothing in this file currently reaches
+# write_prior_engine() -- it only constructs IbusInjector and calls
+# purpose_known(), which is pure attribute reads -- so this is a guard against
+# what a future check might do, not a fix for a live leak.
+#
+# It is worth the four lines because of the blast radius: ibus_injector's
+# _state_dir() reads $XDG_RUNTIME_DIR at CALL time, so any check that grew as
+# far as acquire() would silently write the developer's REAL prior-engine
+# breadcrumb -- and on a desktop whose keymap comes from an IBus engine, a
+# bungled restore leaves no working keyboard (see CLAUDE.md, "IBus crash state
+# is 'no input method', not 'the wrong one'"). A test must not be able to reach
+# that file at all.
+_RUNTIME = tempfile.mkdtemp(prefix="verify-wake-gate-")
+os.environ["XDG_RUNTIME_DIR"] = _RUNTIME
+atexit.register(shutil.rmtree, _RUNTIME, True)
+
 import ibus_injector  # noqa: E402
+
+# Prove the redirect took, rather than trusting it: _state_dir() is evaluated
+# per call, so this also catches a later import order change.
+_crumb = os.path.realpath(ibus_injector.prior_engine_path())
+if not _crumb.startswith(os.path.realpath(_RUNTIME) + os.sep):
+    raise SystemExit(
+        f"refusing to run: prior-engine path {_crumb!r} is outside the "
+        f"test runtime dir {_RUNTIME!r}")
 
 failures = []
 
