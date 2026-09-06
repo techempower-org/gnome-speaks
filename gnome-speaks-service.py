@@ -4432,7 +4432,6 @@ class GnomeSpeaksService:
                 spoken in full (#79).
                 """
                 nonlocal cancel_token, first_sentence
-                self._set_state("speaking")
                 # One object claims playback AND carries the verdict.
                 cancel_token = self._cancels.issue("ai-reply")
                 self._speak_token = cancel_token
@@ -4440,6 +4439,11 @@ class GnomeSpeaksService:
                     log.info("AI reply cancelled before its first note — "
                              "nothing spoken")
                     return False
+                # Only now: announcing "speaking" for a reply that will never
+                # be spoken puts the badge in the same disagreement the token
+                # exists to prevent. The queue hold does not depend on this —
+                # _hold_user_speech() has held since the turn began.
+                self._set_state("speaking")
                 # On headphones, prewarm recorder during TTS
                 if not CONFIG.get("half_duplex", False):
                     _schedule_warmup()
