@@ -2193,6 +2193,15 @@ class GnomeSpeaksService:
         # 1. Get prewarmed recorder (or start fresh) — reused across all
         #    cycles in loop mode.
         proc = _take_prewarmed_rec()
+        _stale_rc = proc.poll() if proc is not None else None
+        if _stale_rc is not None:
+            # The prewarm hands over whatever it started and never polls it
+            # again; pw-record exits immediately when the (on-demand USB) mic
+            # is absent.  Without this the session opens on a corpse and the
+            # failure below is diagnosed against a recorder that died minutes
+            # ago, in a different device state.
+            _log(f"prewarmed recorder already exited (rc={_stale_rc}), discarding")
+            proc = None
         if proc is None:
             try:
                 proc = subprocess.Popen(
@@ -2216,6 +2225,12 @@ class GnomeSpeaksService:
         cycle = 0
         user_text = ""       # set each cycle; needed in cleanup for conversation_mode check
         natural_end = False  # set each cycle; needed in cleanup for single-shot restart
+        # The recorder died under us -- USB mic yanked, pw-record gone.  A
+        # property of the SESSION, not of a cycle, and bound HERE beside the
+        # other two for the same reason: the WS-init failure `break` below
+        # leaves the cycle loop before any per-cycle state exists, and the
+        # cleanup after it reads this flag.
+        recorder_dead = threading.Event()
         failed = None
         try:
             # 2. Get persistent WebSocket (with exponential backoff retry).
@@ -2305,7 +2320,8 @@ class GnomeSpeaksService:
                 #    that is handled by the outer cleanup below.
                 def send_audio(_req_id=request_id, _raw_frames=raw_frames,
                                _end_word_event=end_word_event,
-                               _sender_done=sender_done):
+                               _sender_done=sender_done,
+                               _rec_dead=recorder_dead):
                     try:
                         # Calibrate noise threshold (cached — reads only 1 frame after first call)
                         energy_threshold, cal_frames = calibrate_noise(proc)
@@ -2345,6 +2361,29 @@ class GnomeSpeaksService:
                             chunk = proc.stdout.read(FRAME_BYTES)
                             if not chunk or len(chunk) < FRAME_BYTES:
                                 _log(f"recorder EOF at frame {total_frames}")
+                                # A short read on this pipe is EOF, and
+                                # pw-record closes stdout only when it exits --
+                                # but "the pipe went quiet" is not by itself
+                                # proof of a lost mic, so poll() is the
+                                # positive control for the claim.
+                                #
+                                # cancel_token is the only signal that says WE
+                                # asked for this death: stop() cancels every
+                                # live token BEFORE it kills the procs.
+                                # _stop_event cannot serve -- stop_listening()
+                                # sets it, and so does turn.end in single-shot
+                                # mode, which is exactly how the report ends up
+                                # masked by the session's own natural end.
+                                if not cancel_token.cancelled:
+                                    try:
+                                        proc.wait(timeout=0.5)
+                                    except subprocess.TimeoutExpired:
+                                        pass
+                                    _rc = proc.poll()
+                                    if _rc is not None:
+                                        _log(f"recorder exited rc={_rc}"
+                                             f" -- microphone lost")
+                                        _rec_dead.set()
                                 break
 
                             # Only buffer frames after speech starts (saves memory in loop idle)
@@ -2529,6 +2568,18 @@ class GnomeSpeaksService:
                     user_text = ""
                     break
 
+                # A recorder can also die without the sender seeing EOF: the
+                # cycle may have ended on the end word or the silence timeout
+                # first.  Latch it HERE, because _reap_recorder() in the
+                # cleanup below kills proc -- after that poll() can no longer
+                # tell a lost mic from a routine teardown.
+                if not recorder_dead.is_set() and not cancel_token.cancelled:
+                    _rc = proc.poll()
+                    if _rc is not None:
+                        _log(f"recorder gone outside EOF (rc={_rc})"
+                             f" -- microphone lost")
+                        recorder_dead.set()
+
                 if not user_text and raw_frames and not got_phrase:
                     _log(f"WS returned nothing, falling back to REST STT (frames={len(raw_frames)})")
                     user_text = _rest_stt_fallback(raw_frames, _log) or ""
@@ -2551,6 +2602,7 @@ class GnomeSpeaksService:
                         get_injector().send_backspaces(len(typed_partial[0]))
                     GLib.idle_add(self._emit_transcription_ready, user_text)
                     if (is_loop and not _stopping()
+                            and not recorder_dead.is_set()
                             and CONFIG.get("continuous_dictation", False)):
                         # Let the spell's spoken reply play before re-opening the mic
                         self._drain_speech_gap()
@@ -2571,7 +2623,8 @@ class GnomeSpeaksService:
                 # 9. Emit results and type/copy
                 # In loop mode, skip the "processing" flicker if nothing was said —
                 # just silently re-enter listening on the next cycle.
-                if is_loop and not user_text and not _stopping():
+                if (is_loop and not user_text and not _stopping()
+                        and not recorder_dead.is_set()):
                     if live_typing and typed_partial[0]:
                         get_injector().send_backspaces(len(typed_partial[0]))
                     _log("no speech in loop cycle, continuing")
@@ -2633,8 +2686,10 @@ class GnomeSpeaksService:
                         get_injector().send_backspaces(len(typed_partial[0]))
                     GLib.idle_add(self._emit_transcription_ready, "")
 
-                # 10. Decide whether to loop or exit
-                if is_loop and not _stopping():
+                # 10. Decide whether to loop or exit.  A dead recorder ends
+                # the session: there is nothing left to listen with, and the
+                # loop would otherwise read every EOF as "no speech" and spin.
+                if is_loop and not _stopping() and not recorder_dead.is_set():
                     # Re-check continuous_dictation in case user toggled it mid-session
                     if not CONFIG.get("continuous_dictation", False):
                         _log("continuous_dictation toggled off, exiting loop")
@@ -2657,8 +2712,23 @@ class GnomeSpeaksService:
             # ---------------------------------------------------------------
             self._reap_recorder(proc)
 
+        # Reported ONCE per session, and only here: after every exit above
+        # has already delivered whatever Azure did recognize.  A mic yanked
+        # mid-utterance must not cost the user the words that were already
+        # transcribed -- the report is additional to the text, never instead
+        # of it.  Gated on the token, not on _stopping(): by this point a
+        # single-shot turn.end has set _stop_event and would silence it.
+        if recorder_dead.is_set() and not cancel_token.cancelled:
+            log.warning("Recorder exited mid-session (cycle %d) -- microphone lost",
+                        cycle)
+            GLib.idle_add(self._emit_error,
+                          "Microphone disconnected — plug it in and press the hotkey")
+
         if failed is not None:
-            GLib.idle_add(self._emit_error, f"STT failed: {failed}")
+            # A dead recorder is upstream of most ways this cycle can raise;
+            # a second toast about the symptom buries the actionable one.
+            if not recorder_dead.is_set():
+                GLib.idle_add(self._emit_error, f"STT failed: {failed}")
             self._idle_after_stt()
             _schedule_warmup()
             return
@@ -2673,6 +2743,7 @@ class GnomeSpeaksService:
         # and continuous dictation is on, restart via start_listening (legacy path
         # for non-loop mode, e.g. conversation_mode toggled on mid-session).
         if (not is_loop and not cancel_token.cancelled
+                and not recorder_dead.is_set()
                 and CONFIG.get("continuous_dictation", False)
                 and (natural_end or not self._stop_event.is_set())):
             if natural_end:
