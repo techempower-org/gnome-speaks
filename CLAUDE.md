@@ -157,7 +157,7 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 - **Disposed notification sources**: During shell init/restart, `MessageTray` `source-added` can fire with already-disposed `FdoNotificationDaemonSource` objects. Any signal connection on them crashes the shell. Always wrap `source.connect()` in try-catch and listen for `source-removed` to drop references before GC disposes them.
 - **Azure content filter**: Avoid `[SYSTEM:]` prefix in system prompts -- Azure GPT content filter blocks it.
 - **speech-to-cli `load_config()` whitelists keys**: unknown config.json keys are silently dropped. Adding a config key means adding it to the whitelist in `state.py` too, or the feature reads a default forever. Scope: this only binds keys the **Python** side reads -- keys consumed only by extension.js (`subtitles_user`, `subtitles_tts`) bypass it entirely, since GJS parses config.json raw. Don't "fix" their absence from `state.py`, and don't assume a working extension key means the Python side can see it.
-- **`Shell.Eval` is dead** (returns `(false,'')`; Introspect/Screenshot are AccessDenied) -- `_get_focused_app()` is silently a no-op (#7). Desktop actuation needs D-Bus methods exported from extension.js.
+- **`Shell.Eval` is dead** (returns `(false,'')`; Introspect/Screenshot are AccessDenied) -- the service cannot ask the compositor anything directly (#7). The replacement is the `org.gnome.Speaks.Desktop` interface **exported by extension.js** (`GetFocusedApp` → `wm_class, title`), which `_get_focused_app()` calls via `gdbus`; it works only while the extension is loaded and returns `None` headless. Any further desktop actuation goes the same way: a method on that interface, answered from inside the Shell.
 - **Public repo**: LAN hostnames/IPs, the HA domain, and the wake-word model name (it's the wake phrase) never enter git -- they live in `~/.config/speech-to-cli/config.json` and the user spellbook overlay. Scan patch history before pushing.
 - **systemctl scope trap**: this file prescribes `systemctl --user` for the voice service — but `systemctl --user is-active <system-unit>` answers `inactive` with **exit 0** for units that live in the system scope (e.g. litrpg-engine on this machine). A confidently wrong answer; check the scope before believing "inactive", and never build a health check or spell on the --user reading of a system unit.
 - **Speech-queue state ownership**: `_speak_token` fences playback cleanup -- a preempted worker must not reset state it no longer owns. Keep the token claims when adding new speech paths.
@@ -180,6 +180,14 @@ No test suite. Validate changes by:
 5. Shell-side changes: headless session (`--nested` is dead on 50, see gotchas) --
    `dbus-run-session -- gnome-shell --headless --virtual-monitor 1280x720`, then
    enable/disable/re-enable and require **zero** JS errors, shell CRITICALs, and St warnings.
+6. Service-side changes: the de-facto verification bar is the four scratch repro suites under
+   `~/.claude/projects/-home-jp/scratch/gnome-speaks-dreamteam/` -- `lucid-service-audit-repros`
+   (queue invariants, dispatch gate, config), `lucid-chronicle-perf-repros` (chronicle contract,
+   archive, HTTP endpoints), `lucid-cancel-tokens-repros` (cancel-token verdicts, stop vs
+   stop_listening), `morpheus-injector-seam-repros` (Injector seam, IbusInjector). Each script
+   imports the service from `GS_SVC_PATH=<path to gnome-speaks-service.py>` (defaults to the main
+   checkout, so point it at your worktree) and needs no running service or D-Bus. Run the suite(s)
+   covering the area you touched before opening a PR.
 
 ## Git
 

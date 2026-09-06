@@ -94,7 +94,7 @@ GNOME Speaks has several modes that can be combined for different workflows:
 
 ### Type Mode (default)
 
-Click the badge or press `Super+Alt+Space` → speak → text is typed at the cursor position. Click again, say "over", or pause for silence to stop. The transcription appears character-by-character as you speak (live typing via ydotool).
+Click the badge or press `Super+Alt+Space` → speak → text is typed at the cursor position. Click again, say "over", or pause for silence to stop. The transcription appears character-by-character as you speak (live typing through the [typing engine](#typing-engine) — the ydotool virtual keyboard by default, or the IBus input method).
 
 ### AI Mode
 
@@ -169,6 +169,13 @@ sudo systemctl enable --now ydotool.service
 
 The service auto-detects whether `ydotoold` is running and adjusts accordingly.
 
+#### IBus (alternative typing engine)
+
+Instead of faking keystrokes, the service can type as an IBus input method
+(`injection_method: "ibus"`, see [Typing engine](#typing-engine)). It needs the
+GObject bindings — `gir1.2-ibus-1.0` on Debian/Ubuntu — and a running `ibus-daemon`
+(GNOME's default). ydotool stays required: every IBus failure falls back to it.
+
 ## Installation
 
 ### Quick install
@@ -241,6 +248,26 @@ Create `~/.config/speech-to-cli/config.json`:
 | `language` | STT/TTS language code |
 
 You can get a free Azure Speech key at [Azure Portal](https://portal.azure.com) — the free tier includes 500K characters/month for TTS and 5 hours/month for STT.
+
+### Typing engine
+
+`injection_method` in `~/.config/speech-to-cli/config.json` picks how dictated text
+reaches the cursor (also the *Typing Engine* row in preferences, or "cast typing engine"
+by voice):
+
+| Value | How it types |
+|-------|--------------|
+| `ydotool` (default) | Virtual keyboard via `/dev/uinput` — synthesizes key events |
+| `ibus` | Registers as an IBus input method and commits text over D-Bus — no key can stick |
+| `auto` | IBus when the daemon is reachable, otherwise ydotool |
+
+Every failure — an unknown value, missing `gir1.2-ibus-1.0`, no `ibus-daemon`,
+registration refused — falls back to ydotool, never to nothing: losing dictation to a
+misconfigured key is worse than ignoring the key. The IBus engine refuses to type into
+password fields, but **only on X11/XWayland**: on native Wayland the field's content-type
+never reaches IBus, so the refusal cannot fire. `press_enter` ("cast run it") always goes
+through a key-event backend, since committing `"\n"` inserts a character rather than
+pressing Enter.
 
 ### Prosody
 
