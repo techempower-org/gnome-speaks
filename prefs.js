@@ -751,7 +751,9 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         this._addCorrectionsRow(correctGroup);
 
         // ── Privacy & Debug ──
-        const privGroup = new Adw.PreferencesGroup({title: 'Privacy & Debug'});
+        // Group titles are markup-parsed and have no use-markup toggle, so a
+        // bare '&' blanked this heading entirely. Renders as 'Privacy & Debug'.
+        const privGroup = new Adw.PreferencesGroup({title: 'Privacy &amp; Debug'});
         page.add(privGroup);
 
         this._addEntryRow(privGroup, 'Save Spoken Audio To', 'save_audio_dir', '',
@@ -1124,10 +1126,22 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         const shortcuts = this._settings.get_strv(settingsKey);
         const currentShortcut = shortcuts.length > 0 ? shortcuts[0] : 'Disabled';
 
+        // An accelerator like `<Super><Alt>space` is not Pango markup, but
+        // AdwActionRow parses its subtitle as markup, so `<Super>` reads as an
+        // unclosed tag and the label is left EMPTY -- the row silently stopped
+        // showing the user their own keybinding.
+        //
+        // Two non-obvious parts, both measured; do not "tidy" either away:
+        //   1. `use_markup` governs the subtitle too, not just the title.
+        //   2. The subtitle must be assigned AFTER construction. Passing it in
+        //      the same literal still warns and still blanks, whichever order
+        //      the properties are written in -- construct-time property order
+        //      is not ours to choose.
         const row = new Adw.ActionRow({
             title: title,
-            subtitle: currentShortcut,
+            use_markup: false,
         });
+        row.subtitle = currentShortcut;
 
         const editButton = new Gtk.Button({
             label: 'Change',
