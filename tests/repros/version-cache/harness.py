@@ -11,12 +11,8 @@ Run any repro with:
     GS_SVC_PATH=<path to a gnome-speaks-service.py> python3 <script>
 exit 0 = clean, exit 1 = bug present.
 """
-import atexit
-import contextlib
 import importlib.util
-import json
 import os
-import shutil
 import sys
 
 # ENV CONTRACT: GS_SVC_PATH is the ONE input -- the service.py under test.
@@ -35,6 +31,11 @@ SVC_DEFAULT = os.path.join(REPO_ROOT, "gnome-speaks-service.py")
 # and it read exactly like a service regression.
 SCRATCH_ROOT = os.path.join(REPO_ROOT, "tmp", "repros")
 
+# The shared isolation core (#90).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import isolation  # noqa: E402
+
+
 SVC_PATH = os.environ.get(
     "GS_SVC_PATH",
     SVC_DEFAULT)
@@ -48,20 +49,13 @@ WT = os.environ.get("GS_WT") or os.path.dirname(os.path.abspath(SVC_PATH))
 # inherited by it -- whereupon the child's atexit would delete the still-running
 # parent's directory.  So the child gets its own, and we only clean up a
 # directory we chose ourselves; a caller-pinned path is left alone.
-_OWNED = "GS_REPRO_SCRATCH" not in os.environ
-SCRATCH = os.environ.get("GS_REPRO_SCRATCH",
-                         os.path.join(SCRATCH_ROOT, "version-cache-%d" % os.getpid()))
-STATE_DIR = os.path.join(SCRATCH, "state")
-os.environ["XDG_STATE_HOME"] = STATE_DIR
-os.environ.setdefault("SPEECH_ENGINE_PATH", os.path.expanduser("~/Projects/speech-to-cli"))
-if _OWNED:
-    # Reset at start as well as exit: a verdict must never depend on who ran
-    # here before. Gated on _OWNED for the reason above -- and because rmtree
-    # at start on a SHARED path is what made the chronicle suite destroy a peer
-    # agent's live directory (see that suite's ISOLATION note).
-    shutil.rmtree(SCRATCH, ignore_errors=True)
-    atexit.register(shutil.rmtree, SCRATCH, True)   # disposable byproduct, not state
-os.makedirs(STATE_DIR, exist_ok=True)
+# NOTE the prefix: "version-cache", not "<x>-repros". It does not match the
+# "*-repros-*" sweep glob, so this suite has never been swept and still is
+# not -- deriving the prefix would have changed that silently. This suite
+# SPAWNS a child (dump_payload.py), which is why the shared helper reads
+# GS_REPRO_SCRATCH with get() and never setdefault: an exported path would
+# be inherited and the child's atexit would delete the running parent's dir.
+SCRATCH, STATE_DIR = isolation.setup_scratch("version-cache", SCRATCH_ROOT)
 
 
 class _CompletedProcess:
@@ -111,80 +105,13 @@ class CountingSubprocess:
 
 
 
-CONFIG_PINS = {
-    "key": "test-key", "wake_word": False, "wake_word_model": "",
-    "wake_word_secure_gate": False, "chronicle": False,
-    "continuous_dictation": False, "conversation_mode": False,
-    "dictation_mode": True, "terminal_mode": False, "skip_final_paste": False,
-    "injection_method": "ydotool", "read_notifications": False,
-    "llm_thinking": False, "spiel_provider": False, "debug": False,
-    "live_subtitles": False, "phrase_list": [], "wyoming_host": "",
-}
+CONFIG_PINS = dict(isolation.CONFIG_PINS)
 
-REAL_STATE = os.path.join(os.path.expanduser("~/.local/state"), "gnome-speaks")
-
-
-def _isolate_config(mod):
-    """Rebuild CONFIG from the service's OWN defaults plus CONFIG_PINS.
-
-    CONFIG arrived holding JP's LIVE ~/.config/speech-to-cli/config.json (~47
-    keys), and _reload_config_flags() re-reads that file MID-RUN for every
-    _SYNC_FLAGS key, so pinning a couple of keys after load() was never
-    enough. Mutated IN PLACE: `from state import CONFIG` means audio, stt,
-    speech_tts and wyoming share the one dict object, so rebinding mod.CONFIG
-    would isolate the service module and miss all of them. CONFIG_PATH is
-    repointed at a file holding the same values, so the mid-run re-read
-    becomes a no-op and _save_config_flag() can never touch the real file.
-    """
-    real_defaults = mod.state.DEFAULTS_PATH
-    try:
-        mod.state.DEFAULTS_PATH = os.path.join(SCRATCH, "absent-config.json")
-        baseline = mod.state.load_config()
-    finally:
-        mod.state.DEFAULTS_PATH = real_defaults
-    baseline.update(CONFIG_PINS)
-    path = os.path.join(SCRATCH, "config.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(baseline, f)
-    mod.CONFIG_PATH = path
-    mod.CONFIG.clear()
-    mod.CONFIG.update(baseline)
-    return baseline
-
-
-@contextlib.contextmanager
-def config_scope(mod, **overrides):
-    """Run ONE scenario with its own CONFIG flags, restored afterwards."""
-    saved = dict(mod.CONFIG)
-    mod.CONFIG.update(overrides)
-    try:
-        yield mod.CONFIG
-    finally:
-        mod.CONFIG.clear()
-        mod.CONFIG.update(saved)
+config_scope = isolation.config_scope
 
 
 def assert_isolated(mod):
-    """Prove the module cannot reach JP's live state, BEFORE any scenario.
-
-    CHRONICLE_PATH is computed at MODULE IMPORT from $XDG_STATE_HOME, so this
-    only holds if the env var was set before exec_module -- one moved import
-    away from breaking. Raises rather than warns: a repro that has quietly
-    attached itself to the real ledger must not report a verdict.
-    """
-    root = os.path.realpath(SCRATCH)
-    for name in ("CHRONICLE_PATH", "CONFIG_PATH"):
-        value = getattr(mod, name, None)
-        if value is None:
-            raise AssertionError(f"{name} is unset -- cannot prove isolation")
-        real = os.path.realpath(value)
-        if not (real == root or real.startswith(root + os.sep)):
-            raise AssertionError(
-                f"{name}={value!r} resolves OUTSIDE the isolated scratch "
-                f"{SCRATCH!r} -- refusing to run")
-        if os.path.realpath(REAL_STATE) in (real, os.path.dirname(real)):
-            raise AssertionError(f"{name} points at JP's live state dir")
-    return True
+    return isolation.assert_isolated(mod, SCRATCH)
 
 
 def load():
@@ -195,7 +122,7 @@ def load():
     sys.modules["gsvc_under_test"] = mod
     spec.loader.exec_module(mod)  # main() is __main__-guarded; nothing starts
 
-    _isolate_config(mod)   # BEFORE anything reads CONFIG
+    isolation.isolate_config(mod, SCRATCH, CONFIG_PINS)   # BEFORE anything reads CONFIG
     assert_isolated(mod)   # and prove it, before any scenario
     mod._schedule_warmup = lambda *a, **k: None
     mod._refresh_audio_detection = lambda *a, **k: None
