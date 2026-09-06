@@ -3733,6 +3733,25 @@ class GnomeSpeaksService:
         self._spell_speak("Unknown field — press the hotkey to dictate here.")
         return True
 
+    def _toggle_config_flag(self, key, default=False):
+        """Flip a boolean mode flag, persist it, and return the NEW value.
+
+        Only the flip-and-persist is shared. What stays at each call site:
+        the spoken reply (some are one template, some are two distinct
+        sentences), and subtitles_toggle's extra GSettings dual-write.
+
+        `default` is a PARAMETER, not a constant: live_subtitles and
+        chronicle default to True and the rest to False, so a wrong default
+        here would silently invert which way a spell toggles on first use.
+
+        Always goes through _save_config_flag, never `CONFIG[key] = ...`:
+        that is the seam keeping the runtime dict and config.json from
+        drifting (CLAUDE.md, config dual-write).
+        """
+        new = not CONFIG.get(key, default)
+        self._save_config_flag(key, new)
+        return new
+
     def _spell_ctx_dbus(self, op):
         """Self-directed spell operations (dbus_self action type)."""
         if op == "stop":
@@ -3749,8 +3768,7 @@ class GnomeSpeaksService:
             self._save_config_flag("conversation_mode", False)
             self._save_config_flag("terminal_mode", False)
         elif op == "read_notifications_toggle":
-            new = not CONFIG.get("read_notifications", False)
-            self._save_config_flag("read_notifications", new)
+            new = self._toggle_config_flag("read_notifications")
             return "The notification herald is %s." % ("on" if new else "off")
         elif op == "injection_toggle":
             # The spell is the voice-recoverable way out of an IBus trial, so
@@ -3782,26 +3800,22 @@ class GnomeSpeaksService:
             get_injector().press_enter()
             return None
         elif op == "loop_toggle":
-            new = not CONFIG.get("continuous_dictation", False)
-            self._save_config_flag("continuous_dictation", new)
+            new = self._toggle_config_flag("continuous_dictation")
             if new:
                 return ("The loop is woven — I will keep listening "
                         "after each phrase.")
             return "The loop is broken — one phrase at a time."
         elif op == "wake_word_toggle":
-            new = not CONFIG.get("wake_word", False)
-            self._save_config_flag("wake_word", new)
+            new = self._toggle_config_flag("wake_word")
             return "The waking watch is %s." % ("on" if new else "off")
         elif op == "thinking_toggle":
-            new = not CONFIG.get("llm_thinking", False)
-            self._save_config_flag("llm_thinking", new)
+            new = self._toggle_config_flag("llm_thinking")
             if new:
                 return ("Deep thought engaged — replies will be slow "
                         "and thorough.")
             return "Deep thought off — fast replies."
         elif op == "subtitles_toggle":
-            new = not CONFIG.get("live_subtitles", True)
-            self._save_config_flag("live_subtitles", new)
+            new = self._toggle_config_flag("live_subtitles", default=True)
             # Dual-write: the extension gates its overlay on GSettings —
             # keep both layers in sync (see the config dual-write gotcha).
             schema_dir = os.path.expanduser(
@@ -3834,8 +3848,7 @@ class GnomeSpeaksService:
                 parts.append(f"{who}: {text}")
             return " … ".join(parts)
         elif op == "chronicle_toggle":
-            new = not CONFIG.get("chronicle", True)
-            self._save_config_flag("chronicle", new)
+            new = self._toggle_config_flag("chronicle", default=True)
             if new:
                 return "The chronicle records once more."
             return "The chronicle is sealed — nothing will be written."
