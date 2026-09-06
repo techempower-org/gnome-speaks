@@ -20,10 +20,24 @@
 # audio-level throttles, pipe back-pressure) and overlapping runs make their
 # measurements unreliable.
 set -u
+# pipefail so a pipeline's status reflects the interesting command, not just the
+# last one. Prophylactic here -- no pipeline in this file has its status consumed
+# today -- and set uniformly across all five runners so the next one added cannot
+# inherit `... | grep X | tail -1`, which returns 0 when the grep matched nothing.
+#
+# ⚠️ NOT `set -e`, deliberately: `grep -c` exits 1 on a zero count, and a zero
+# count is the PASSING case for a warning counter. `set -euo pipefail` aborts on
+# success. If you add -e, write every count as `$(grep -c X f || true)` first.
+set -o pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 SVC="${1:-$REPO/gnome-speaks-service.py}"
 [ -f "$SVC" ] || { echo "no such service file: $SVC" >&2; exit 2; }
+# Resolve while the caller's cwd is still ours. The check above validates HERE,
+# but every suite runs via `cd "$HERE/$suite"` and resolves GS_SVC_PATH THERE --
+# so a relative path passes validation and then fails every suite with
+# FileNotFoundError naming a path inside the suite directory.
+case "$SVC" in /*) ;; *) SVC="$PWD/$SVC" ;; esac
 export GS_SVC_PATH="$SVC"
 rc=0
 

@@ -1,6 +1,8 @@
 // Standalone prefs harness: loads a prefs.js by path, builds a REAL mapped
 // Adw.PreferencesWindow on a broadway display, and reports on the Audio page.
-// Usage: gjs -m tmp/harness.js <abs-path-to-prefs.js>
+// Usage: gjs -m harness.js <ABSOLUTE-path-to-prefs.js>
+// run.sh resolves relative paths before invoking this; a bare gjs call must
+// pass an absolute one (see the guard below for why).
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk?version=4.0';
@@ -11,6 +13,20 @@ Gio.resources_register(Gio.resource_load(
     '/usr/share/gnome-shell/org.gnome.Shell.Extensions.src.gresource'));
 
 const PREFS = system.programArgs[0];
+
+// A module URI needs an absolute path. `import('file://../prefs.js')` resolves
+// against THIS file's directory, not the caller's shell, and fails with
+// `ImportError: Unable to load file async from: file://../prefs.js` -- an error
+// naming a path the reader never typed. Resolving it here would be worse than
+// failing: gjs is invoked with cwd set to the run dir, so a path relative to the
+// caller's cwd would silently resolve somewhere else and test the WRONG FILE.
+// run.sh does the resolution while it still knows the caller's cwd; this only
+// has to refuse to guess.
+if (!PREFS || !GLib.path_is_absolute(PREFS)) {
+    printerr(`harness.js: need an ABSOLUTE path to prefs.js, got "${PREFS ?? ''}".`);
+    printerr('Use run.sh (which resolves relative paths), or pass an absolute path.');
+    system.exit(2);
+}
 const EXTDIR = GLib.getenv('GS_PREFS_EXTDIR') ||
     (GLib.get_current_dir() + '/fakeext');
 

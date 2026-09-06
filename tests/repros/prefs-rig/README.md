@@ -16,9 +16,17 @@ It sandboxes `HOME` and forces `GSETTINGS_BACKEND=memory`, so a run can never
 write the real `~/.config/speech-to-cli/config.json` or touch dconf.
 
 ```bash
-./run.sh ~/Projects/gnome-speaks-wt/<wt>/prefs.js                # one file
-./run.sh ~/Projects/gnome-speaks-wt/<wt>/prefs.js /tmp/main.js   # + baseline diff
+./run.sh <checkout>/prefs.js                                  # one file
+./run.sh <checkout>/prefs.js --baseline-rev $(git merge-base origin/main HEAD)
+./run.sh <checkout>/prefs.js <some-dir>/prefs.js              # explicit baseline file
 ```
+
+Relative paths are fine. `--baseline-rev` extracts the baseline into the run
+dir, so there is no path of yours for the `>` in a `git show … > <file>` recipe
+to land on by accident.
+
+**Baseline against the MERGE BASE, not a moving `origin/main`** — otherwise a
+main that advances mid-review manufactures regressions that are not yours.
 
 It reports, for the Audio page: build time, each combo row's options and
 selected index **synchronously** and again **after the async probes land**, and

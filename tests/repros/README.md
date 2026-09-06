@@ -16,6 +16,14 @@ tests/run-repros.sh /path/to/service.py   # a worktree, or an extracted SHA
 `GS_SVC_PATH` — the `gnome-speaks-service.py` under test — is the **only** input
 a suite needs, and `run-repros.sh` sets it. Everything else is derived:
 
+⚠️ **It must be ABSOLUTE.** Each suite runs via `cd "$HERE/<suite>"`, so a
+relative path resolves against the *suite* directory and every suite dies with
+`FileNotFoundError` naming a path inside it. The trap is that `run_all.sh`
+validates the path with `[ -f "$SVC" ]` in the *caller's* cwd, so a relative one
+passes the check and fails everywhere after — validated here, used there.
+`run_all.sh` now resolves its argument for you; pass an absolute path anyway if
+you export `GS_SVC_PATH` yourself for a single suite.
+
 | | |
 |---|---|
 | worktree dir (sibling modules: `spellbook.py`, `injector.py`, `ibus_injector.py`) | `dirname(GS_SVC_PATH)`; `GS_WT` overrides it only to mix trees deliberately |
@@ -123,6 +131,15 @@ Both forms have bitten this tree, and the **silent** one is the dangerous half:
 Same root cause: taking a pipeline's exit status as the answer to a question it
 never answered. `$?` after a pipe reads the LAST command, not the interesting
 one — that form once reported two red suites as green here.
+
+⚠️ **And do not "fix" this by reaching for `set -euo pipefail`, which is the
+obvious next move after reading the above.** `set -o pipefail` alone is right and
+all five runners now set it. **`-e` is not**: `grep -c` exits `1` when the count
+is `0`, and a zero count is the *passing* case for a warning counter, so `-e`
+aborts a run precisely when it succeeds — measured on `prefs-rig/run.sh`, whose
+two `grep -c` lines it kills on a clean run. The hardening against the silent
+form has its own short-form failure. If you do add `-e`, write every count as
+`$(grep -c X f || true)` first.
 
 ## Instruments that must survive a refactor
 
