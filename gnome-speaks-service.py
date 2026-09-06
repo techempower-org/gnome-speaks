@@ -1541,6 +1541,125 @@ class TTSQueueItem:
     source: str | None = None       # coalescing key: "only my latest matters"
 
 
+# Frames the kernel pipe between the recorder and this process can hold:
+# 65536 B / 960 B = 68 frames = 2.048 s of 16 kHz mono PCM (measured with
+# F_GETPIPE_SZ). Used as the loop-mode carry-over bound below, so a tapped
+# session keeps the same amount of inter-utterance audio the pipe used to
+# keep on its own.
+_PIPE_FRAMES = 65536 // FRAME_BYTES
+
+
+class _RecorderTap:
+    """Owns a recorder's stdout: a reader thread drains the pipe into memory
+    from the moment recording starts, independent of what the session is
+    doing upstream.
+
+    Why this exists (#49): the pipe holds 2.048 s of audio and a WebSocket
+    connect attempt can last 10 s. With nothing reading, the recorder blocks
+    once the pipe fills and the audio of that interval is lost AT THE SOURCE
+    -- no downstream handoff can recover what was never captured. The tap
+    keeps the recorder unblocked, so a connect that ultimately fails can
+    still hand the *whole* utterance to the offline recognizer.
+
+    Consumers read frames exactly as they read the pipe before: the tap
+    exposes `.stdout` (itself) and a `read(FRAME_BYTES)` that returns one
+    frame, or b"" at EOF -- so `calibrate_noise(tap)` and the sender loop are
+    unchanged apart from the object they read from.
+    """
+
+    def __init__(self, proc, frame_bytes=FRAME_BYTES, max_frames=None):
+        self._proc = proc
+        self._frame_bytes = frame_bytes
+        if max_frames is None:
+            # The honest bound. It has to cover a whole utterance PLUS the
+            # longest connect window in front of it: 4 attempts x a 10 s
+            # websocket connect timeout, plus 1+2+4 s of backoff = 47 s.
+            # 90 s at 16 kHz mono is ~2.9 MB, and beyond it the OLDEST frames
+            # go (counted in .dropped and logged) rather than the newest.
+            max_frames = int((MAX_LISTEN_SECONDS + 60) * 1000 / FRAME_MS)
+        self._buf = deque(maxlen=max_frames)
+        self._cv = threading.Condition()
+        self._eof = False
+        self._closed = False
+        self._dropped = 0
+        self._thread = threading.Thread(
+            target=self._pump, name="rec-tap", daemon=True)
+        self._thread.start()
+
+    # -- producer ---------------------------------------------------------
+    def _pump(self):
+        try:
+            while not self._closed:
+                chunk = self._proc.stdout.read(self._frame_bytes)
+                if not chunk or len(chunk) < self._frame_bytes:
+                    break
+                with self._cv:
+                    if len(self._buf) == self._buf.maxlen:
+                        self._dropped += 1
+                    self._buf.append(chunk)
+                    self._cv.notify()
+        except Exception as exc:
+            log.debug("Recorder tap ended: %s", exc)
+        finally:
+            with self._cv:
+                self._eof = True
+                self._cv.notify_all()
+
+    # -- consumer ---------------------------------------------------------
+    @property
+    def stdout(self):
+        """calibrate_noise() takes a proc and reads proc.stdout."""
+        return self
+
+    def read(self, _n=None, timeout=10.0):
+        """One frame, blocking; b"" at EOF. Mirrors proc.stdout.read(n).
+
+        A live recorder delivers a frame every 30 ms, so the timeout only
+        fires when it has genuinely stalled -- where reading the pipe would
+        have blocked forever. Reported as EOF, and logged so a stall is
+        distinguishable from a recorder that simply exited.
+        """
+        with self._cv:
+            while not self._buf:
+                if self._eof or self._closed:
+                    return b""
+                if not self._cv.wait(timeout=timeout):
+                    log.warning("Recorder tap: no audio for %.0fs -- "
+                                "treating as end of stream", timeout)
+                    return b""
+            return self._buf.popleft()
+
+    def drain(self):
+        """Every frame buffered right now, oldest first. Never blocks."""
+        with self._cv:
+            out = list(self._buf)
+            self._buf.clear()
+            return out
+
+    def trim(self, keep):
+        """Drop all but the newest `keep` frames. Returns how many went.
+
+        Called between loop-mode cycles: audio recorded while the previous
+        utterance was being processed (and its reply spoken) is not part of
+        the next one, and buffering all of it would feed the recognizer the
+        service's own TTS.
+        """
+        with self._cv:
+            excess = max(0, len(self._buf) - keep)
+            for _ in range(excess):
+                self._buf.popleft()
+            return excess
+
+    def close(self):
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
+    @property
+    def dropped(self):
+        return self._dropped
+
+
 class GnomeSpeaksService:
     """Core service logic using speech-to-cli building blocks."""
 
@@ -1975,6 +2094,15 @@ class GnomeSpeaksService:
             else:
                 mode = "fixed"
 
+        # Azure marked down (60 s breaker) or SPEECH_FORCE_OFFLINE: the
+        # streaming path has no offline seam of its own, so the session goes
+        # to the batch path, which carries the Wyoming fallback. Without this
+        # every press during an outage paid the full WS backoff and lost the
+        # speech (#49).
+        if mode == "streaming" and wyoming_mod.skip_azure():
+            mode = "vad" if HAS_VAD else "fixed"
+            log.info("Azure marked down — routing STT to %s (offline fallback)", mode)
+
         # Use non-streaming STT backends (whisper, vad, fixed)
         if mode in ("whisper", "vad", "fixed"):
             if mode == "whisper" and not HAS_WHISPER:
@@ -2071,58 +2199,7 @@ class GnomeSpeaksService:
                 self._idle_after_stt()
                 return
             result = stt_dispatch(mode=mode)
-
-            if cancel_token.cancelled or result.get("cancelled"):
-                log.info("STT cancelled — transcript discarded (%d chars)",
-                         len(result.get("text") or ""))
-                GLib.idle_add(self._emit_transcription_ready, "")
-                self._idle_after_stt()
-                _schedule_warmup()
-                return
-
-            user_text = result.get("text", "")
-
-            self._set_state("processing")
-
-            # Spell incantations ("cast …") short-circuit typing/LLM routing;
-            # matched on the raw transcript before punctuation substitution.
-            if user_text and self._try_cast(user_text):
-                GLib.idle_add(self._emit_transcription_ready, user_text)
-                self._idle_after_stt()
-                _schedule_warmup()
-                return
-
-            if user_text:
-                user_text = apply_voice_commands(user_text)
-                user_text = apply_auto_corrections(user_text)
-                GLib.idle_add(self._emit_transcription_ready, user_text)
-                log.info("Transcription (%s): %s", mode, user_text[:100])
-
-                if CONFIG.get("conversation_mode", False):
-                    self._conversation_worker(user_text)
-                    # One-shot: turn off after AI responds
-                    if not CONFIG.get("continuous_dictation", False):
-                        self._save_config_flag("conversation_mode", False)
-                    # Warmup + restart already handled inside _conversation_worker
-                    return
-
-                if CONFIG.get("dictation_mode", True):
-                    if not self._wake_gate_blocks():
-                        get_injector().commit(user_text)
-                else:
-                    clipboard_write(user_text)
-            else:
-                log.info("No speech detected (%s)", mode)
-                GLib.idle_add(self._emit_transcription_ready, "")
-
-            self._idle_after_stt()
-            _schedule_warmup()
-
-            if user_text and CONFIG.get("continuous_dictation", False) and not self._stop_event.is_set():
-                GLib.idle_add(lambda: (self.start_listening(quick=True), False)[-1]
-                              if (CONFIG.get("continuous_dictation", False)
-                                  and not self._stop_event.is_set())
-                              else False)
+            self._deliver_stt_result(result, mode, cancel_token)
         except Exception as exc:
             log.exception("Batch STT (%s) failed: %s", mode, exc)
             GLib.idle_add(self._emit_error, f"STT failed: {exc}")
@@ -2130,6 +2207,159 @@ class GnomeSpeaksService:
             _schedule_warmup()
         finally:
             self._cancels.retire(cancel_token)
+
+    def _deliver_stt_result(self, result, mode, cancel_token):
+        """Route one finished batch-STT result: spellbook, LLM, cursor, or
+        clipboard, then idle/loop. Shared by the batch worker and the
+        streaming path's offline fallback."""
+        if cancel_token.cancelled or result.get("cancelled"):
+            log.info("STT cancelled — transcript discarded (%d chars)",
+                     len(result.get("text") or ""))
+            GLib.idle_add(self._emit_transcription_ready, "")
+            self._idle_after_stt()
+            _schedule_warmup()
+            return
+
+        user_text = result.get("text", "")
+
+        self._set_state("processing")
+
+        # Spell incantations ("cast …") short-circuit typing/LLM routing;
+        # matched on the raw transcript before punctuation substitution.
+        if user_text and self._try_cast(user_text):
+            GLib.idle_add(self._emit_transcription_ready, user_text)
+            self._idle_after_stt()
+            _schedule_warmup()
+            return
+
+        if user_text:
+            user_text = apply_voice_commands(user_text)
+            user_text = apply_auto_corrections(user_text)
+            GLib.idle_add(self._emit_transcription_ready, user_text)
+            log.info("Transcription (%s): %s", mode, user_text[:100])
+
+            if CONFIG.get("conversation_mode", False):
+                self._conversation_worker(user_text)
+                # One-shot: turn off after AI responds
+                if not CONFIG.get("continuous_dictation", False):
+                    self._save_config_flag("conversation_mode", False)
+                # Warmup + restart already handled inside _conversation_worker
+                return
+
+            if CONFIG.get("dictation_mode", True):
+                if not self._wake_gate_blocks():
+                    get_injector().commit(user_text)
+            else:
+                clipboard_write(user_text)
+        else:
+            log.info("No speech detected (%s)", mode)
+            GLib.idle_add(self._emit_transcription_ready, "")
+
+        self._idle_after_stt()
+        _schedule_warmup()
+
+        if user_text and CONFIG.get("continuous_dictation", False) and not self._stop_event.is_set():
+            GLib.idle_add(lambda: (self.start_listening(quick=True), False)[-1]
+                          if (CONFIG.get("continuous_dictation", False)
+                              and not self._stop_event.is_set())
+                          else False)
+
+    def _offline_stt_session(self, tap, cancel_token, stopping, _log,
+                             reason=None):
+        """Finish a streaming session whose WebSocket never came up.
+
+        Takes over the recorder's tap and hands the audio to
+        _rest_stt_fallback, which goes straight to Wyoming while Azure is
+        marked down. The recorder itself is left to the cycle's teardown
+        envelope (`finally: _reap_recorder`), which owns it.
+
+        ORDER MATTERS. The backlog the tap already holds -- everything
+        recorded since the recorder started, including the whole connect
+        attempt -- is drained FIRST and unconditionally. A stop request means
+        "finish this utterance", not "throw it away": stop_listening() (the
+        dictation hotkey) is the normal way a press ends while a connect is
+        still pending, and it wants the words. Only stop() discards, it does
+        so by cancelling the token, and that verdict is applied once, in
+        _deliver_stt_result. Consulting stopping() before the drain handed
+        the recognizer nothing but the calibration frames.
+        """
+        try:
+            # Reads the head of the backlog (already buffered -- never
+            # blocks) and gives those frames back, so the utterance stays in
+            # order.
+            energy_threshold, cal_frames = calibrate_noise(tap)
+            frames = list(cal_frames) + tap.drain()
+        except Exception as exc:
+            log.exception("Offline STT drain failed: %s", exc)
+            energy_threshold, frames = 500.0, []
+        _log(f"offline: {len(frames)} frames buffered before handoff "
+             f"({len(frames) * FRAME_MS / 1000.0:.2f}s)"
+             + (f", {tap.dropped} dropped" if tap.dropped else ""))
+        try:
+            vad = webrtcvad.Vad(state.VAD_AGGRESSIVENESS) if HAS_VAD else None
+            max_silence = int(state.SILENCE_TIMEOUT * 1000 / FRAME_MS)
+            max_no_speech = int(state.NO_SPEECH_TIMEOUT * 1000 / FRAME_MS)
+            min_speech = int(state.MIN_SPEECH_DURATION * 1000 / FRAME_MS)
+            max_frames = int(MAX_LISTEN_SECONDS * 1000 / FRAME_MS)
+            silence_frames = speech_frames = 0
+            # Seed the VAD counters from the backlog: the utterance may
+            # already be over (spoken and finished during a 10 s connect),
+            # and a loop starting from zero would then sit through the
+            # no-speech timeout before agreeing.
+            for _f in frames:
+                if is_speech_energy(_f, vad, energy_threshold):
+                    speech_frames += 1
+                    silence_frames = 0
+                else:
+                    silence_frames += 1
+            total_frames = len(frames)
+            done = ((speech_frames >= min_speech and silence_frames >= max_silence)
+                    or (speech_frames == 0 and total_frames >= max_no_speech))
+            while not done and not stopping() and total_frames < max_frames:
+                chunk = tap.read(FRAME_BYTES)
+                if not chunk or len(chunk) < FRAME_BYTES:
+                    _log(f"offline: recorder EOF at frame {total_frames}")
+                    break
+                frames.append(chunk)
+                total_frames += 1
+                is_speech = is_speech_energy(chunk, vad, energy_threshold)
+                if is_speech:
+                    speech_frames += 1
+                    silence_frames = 0
+                else:
+                    silence_frames += 1
+                if total_frames % 3 == 0:
+                    GLib.idle_add(self._emit_audio_level,
+                                  min(rms_energy(chunk) / 10000.0, 1.0))
+                    GLib.idle_add(self._emit_stt_status, is_speech,
+                                  min(silence_frames / max_silence if speech_frames
+                                      else total_frames / max_no_speech, 1.0))
+                if speech_frames >= min_speech and silence_frames >= max_silence:
+                    break
+                if speech_frames == 0 and total_frames >= max_no_speech:
+                    break
+            _log(f"offline: REC END speech={speech_frames} total={total_frames}")
+        except Exception as exc:
+            # Keep whatever was already captured: a broken capture loop is no
+            # reason to throw the user's words away as well.
+            log.exception("Offline STT capture failed: %s", exc)
+            GLib.idle_add(self._emit_error, f"STT failed: {exc}")
+        finally:
+            tap.close()
+
+        text = ""
+        if frames and not cancel_token.cancelled:
+            self._set_state("processing")
+            text = _rest_stt_fallback(frames, _log) or ""
+        if text:
+            # The words made it. Raising "STT WebSocket failed" at the user
+            # anyway would be a notification that contradicts the text
+            # appearing under their cursor; the log carries the diagnosis.
+            log.warning("Azure STT WebSocket unreachable (%s) — "
+                        "recognized offline instead", reason)
+        elif reason is not None and not cancel_token.cancelled:
+            GLib.idle_add(self._emit_error, f"STT WebSocket failed: {reason}")
+        self._deliver_stt_result({"text": text}, "offline", cancel_token)
 
     def _streaming_stt_worker(self, cancel_token=None):
         """Thread entry: run one streaming STT session and always retire its
@@ -2216,6 +2446,13 @@ class GnomeSpeaksService:
 
         state.register_proc(proc)
 
+        # Drain the recorder into memory from right here -- before the WS
+        # connect, not after it. A connect attempt can hold this thread for
+        # 10 s and the pipe only holds 2.048 s, so anything spoken after that
+        # used to be destroyed at the source while the connect was still
+        # pending. See _RecorderTap.
+        tap = _RecorderTap(proc)
+
         # Everything from here to the end of the cycle loop holds the
         # recorder.  Any raise past this point -- the WS, the REST fallback,
         # the spellbook, the injector, the LLM worker -- used to skip the
@@ -2236,7 +2473,11 @@ class GnomeSpeaksService:
             # 2. Get persistent WebSocket (with exponential backoff retry).
             ws = None
             ws_fresh = False
-            _ws_max_attempts = 4
+            # With a Wyoming fallback configured, one failed connect trips
+            # the breaker (the batch paths' one-strike rule) instead of
+            # spending 1+2+4 s of backoff on a wire that is already known to
+            # be down. The tap keeps recording throughout either way.
+            _ws_max_attempts = 1 if wyoming_mod.enabled() else 4
             _ws_backoff = 1.0  # seconds, doubles each attempt, caps at 30s
             for attempt in range(_ws_max_attempts):
                 try:
@@ -2246,9 +2487,13 @@ class GnomeSpeaksService:
                     _log(f"WS connect attempt {attempt + 1}/{_ws_max_attempts} failed: {exc}")
                     _invalidate_stt_ws()
                     if attempt == _ws_max_attempts - 1:
-                        GLib.idle_add(self._emit_error, f"STT WebSocket failed: {exc}")
-                        self._set_state("idle")
-                        _schedule_warmup()
+                        # Azure is unreachable: trip the breaker so the next
+                        # presses skip the WS entirely, and finish THIS
+                        # session offline instead of dropping words that are
+                        # already recorded.
+                        wyoming_mod.mark_azure_down()
+                        self._offline_stt_session(tap, cancel_token,
+                                                  _stopping, _log, reason=exc)
                         return
                     # Exponential backoff before next attempt
                     delay = min(_ws_backoff, 30.0)
@@ -2280,6 +2525,15 @@ class GnomeSpeaksService:
             # ---------------------------------------------------------------
             while True:
                 cycle += 1
+                if cycle > 1:
+                    # Audio recorded while the PREVIOUS utterance was being
+                    # processed (and its reply spoken) is not part of this
+                    # one. Trim to what the kernel pipe used to hold on its
+                    # own, so loop turnaround keeps its old behaviour instead
+                    # of feeding the recognizer the service's own TTS.
+                    dropped = tap.trim(_PIPE_FRAMES)
+                    if dropped:
+                        _log(f"trimmed {dropped} inter-cycle frames")
                 # Pick up a mid-session Loop toggle in BOTH directions.
                 is_loop = CONFIG.get("continuous_dictation", False)
                 _log(f"=== cycle {cycle} (loop={is_loop}) ===")
@@ -2324,7 +2578,7 @@ class GnomeSpeaksService:
                                _rec_dead=recorder_dead):
                     try:
                         # Calibrate noise threshold (cached — reads only 1 frame after first call)
-                        energy_threshold, cal_frames = calibrate_noise(proc)
+                        energy_threshold, cal_frames = calibrate_noise(tap)
                         _log(f"calibrated: threshold={energy_threshold:.0f}, cal_frames={len(cal_frames)}")
 
                         # Send buffered calibration frames to Azure
@@ -2358,7 +2612,7 @@ class GnomeSpeaksService:
                         _log(f"limits: max_silence={max_silence} max_no_speech={max_no_speech} min_speech={min_speech}")
 
                         while not _stopping():
-                            chunk = proc.stdout.read(FRAME_BYTES)
+                            chunk = tap.read(FRAME_BYTES)
                             if not chunk or len(chunk) < FRAME_BYTES:
                                 _log(f"recorder EOF at frame {total_frames}")
                                 # A short read on this pipe is EOF, and
@@ -2710,6 +2964,7 @@ class GnomeSpeaksService:
             # ---------------------------------------------------------------
             # Cleanup: the recorder was kept alive across cycles.
             # ---------------------------------------------------------------
+            tap.close()
             self._reap_recorder(proc)
 
         # Reported ONCE per session, and only here: after every exit above
