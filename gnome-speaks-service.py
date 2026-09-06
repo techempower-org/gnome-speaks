@@ -1958,6 +1958,25 @@ class GnomeSpeaksService:
         if owned:
             self._set_state("idle")
 
+    @staticmethod
+    def _reap_recorder(proc):
+        """Kill a recorder process and stop tracking it.
+
+        pw-record ignores SIGTERM -- escalate to SIGKILL after a short wait.
+        Safe to call on a process that already exited.
+        """
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                log.debug("Recorder ignored SIGTERM, sending SIGKILL")
+                proc.kill()
+                proc.wait(timeout=1.0)
+        except Exception as exc:
+            log.debug("Recorder cleanup error: %s", exc)
+        state.unregister_proc(proc)
+
     def _batch_stt_worker(self, mode, cancel_token=None):
         """Background thread: batch STT using stt() dispatcher (whisper, vad, fixed).
 
@@ -2065,7 +2084,11 @@ class GnomeSpeaksService:
         WS session reinit (~50ms), recorder startup, and thread-creation
         overhead that the old start_listening(quick=True) path incurred.
         """
-        self._cancels.begin(cancel_token)
+        if not self._cancels.begin(cancel_token):
+            log.info("Streaming STT cancelled before it began")
+            GLib.idle_add(self._emit_transcription_ready, "")
+            self._idle_after_stt()
+            return
 
         def _stopping():
             """This cycle must wind down. Says nothing about keeping the text."""
@@ -2110,442 +2133,440 @@ class GnomeSpeaksService:
 
         state.register_proc(proc)
 
-        # 2. Get persistent WebSocket (with exponential backoff retry).
-        ws = None
-        ws_fresh = False
-        _ws_max_attempts = 4
-        _ws_backoff = 1.0  # seconds, doubles each attempt, caps at 30s
-        for attempt in range(_ws_max_attempts):
-            try:
-                ws, ws_fresh = _get_stt_ws()
-                break
-            except Exception as exc:
-                _log(f"WS connect attempt {attempt + 1}/{_ws_max_attempts} failed: {exc}")
-                _invalidate_stt_ws()
-                if attempt == _ws_max_attempts - 1:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=0.5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=1.0)
-                    state.unregister_proc(proc)
-                    GLib.idle_add(self._emit_error, f"STT WebSocket failed: {exc}")
-                    self._set_state("idle")
-                    _schedule_warmup()
-                    return
-                # Exponential backoff before next attempt
-                delay = min(_ws_backoff, 30.0)
-                _log(f"WS retry in {delay:.1f}s")
-                time.sleep(delay)
-                _ws_backoff *= 2
-
-        # --- Mode flags (stable across cycles) ---
-        live_typing = (CONFIG.get("dictation_mode", True)
-                       and not CONFIG.get("conversation_mode", False)
-                       and get_injector().available())
-        use_lexical = CONFIG.get("terminal_mode", False)
-
-        # ---------------------------------------------------------------
-        # Main cycle loop — runs once in single-shot mode, loops in
-        # continuous dictation mode.  Recorder and WS stay alive.
-        # ---------------------------------------------------------------
+        # Everything from here to the end of the cycle loop holds the
+        # recorder.  Any raise past this point -- the WS, the REST fallback,
+        # the spellbook, the injector, the LLM worker -- used to skip the
+        # teardown below: pw-record leaked, the badge stuck on
+        # listening/processing, and start_listening() answered busy until a
+        # panic stop.  Same envelope as _batch_stt_worker.
         cycle = 0
         user_text = ""       # set each cycle; needed in cleanup for conversation_mode check
         natural_end = False  # set each cycle; needed in cleanup for single-shot restart
-        while True:
-            cycle += 1
-            # Pick up a mid-session Loop toggle in BOTH directions.
-            is_loop = CONFIG.get("continuous_dictation", False)
-            _log(f"=== cycle {cycle} (loop={is_loop}) ===")
-
-            # 3. Init new WS session for this utterance
-            request_id = uuid.uuid4().hex
-            try:
-                _init_stt_ws_session(ws, request_id, drain=not ws_fresh)
-            except Exception as exc:
-                _log(f"WS session init failed (cycle {cycle}): {exc}")
-                _invalidate_stt_ws()
-                # Try to reconnect once before giving up
+        failed = None
+        try:
+            # 2. Get persistent WebSocket (with exponential backoff retry).
+            ws = None
+            ws_fresh = False
+            _ws_max_attempts = 4
+            _ws_backoff = 1.0  # seconds, doubles each attempt, caps at 30s
+            for attempt in range(_ws_max_attempts):
                 try:
                     ws, ws_fresh = _get_stt_ws()
-                    _init_stt_ws_session(ws, request_id, drain=not ws_fresh)
-                except Exception as exc2:
-                    _log(f"WS reconnect also failed: {exc2}")
+                    break
+                except Exception as exc:
+                    _log(f"WS connect attempt {attempt + 1}/{_ws_max_attempts} failed: {exc}")
                     _invalidate_stt_ws()
-                    GLib.idle_add(self._emit_error, f"STT session init failed: {exc2}")
-                    break  # fall through to cleanup
-            ws_fresh = False  # subsequent cycles always drain
+                    if attempt == _ws_max_attempts - 1:
+                        GLib.idle_add(self._emit_error, f"STT WebSocket failed: {exc}")
+                        self._set_state("idle")
+                        _schedule_warmup()
+                        return
+                    # Exponential backoff before next attempt
+                    delay = min(_ws_backoff, 30.0)
+                    _log(f"WS retry in {delay:.1f}s")
+                    time.sleep(delay)
+                    _ws_backoff *= 2
 
-            # 4. Per-cycle shared state — reset partial throttle for new utterance
-            self._last_partial_text = ""
-            self._last_partial_time = 0
-            phrases = []
-            partial_holder = [""]
-            end_word_event = threading.Event()
-            sender_done = threading.Event()
-            raw_frames = []
-            typed_partial = [""]
-            raw_partial = [""]
+            # --- Mode flags (stable across cycles) ---
+            live_typing = (CONFIG.get("dictation_mode", True)
+                           and not CONFIG.get("conversation_mode", False)
+                           and get_injector().available())
+            use_lexical = CONFIG.get("terminal_mode", False)
 
-            # 5. Sender thread: calibrate noise, send audio with VAD.
-            #    A new sender thread is created each cycle, but the same proc
-            #    (recorder) feeds it.  The sender does NOT terminate proc —
-            #    that is handled by the outer cleanup below.
-            def send_audio(_req_id=request_id, _raw_frames=raw_frames,
-                           _end_word_event=end_word_event,
-                           _sender_done=sender_done):
+            # ---------------------------------------------------------------
+            # Main cycle loop — runs once in single-shot mode, loops in
+            # continuous dictation mode.  Recorder and WS stay alive.
+            # ---------------------------------------------------------------
+            while True:
+                cycle += 1
+                # Pick up a mid-session Loop toggle in BOTH directions.
+                is_loop = CONFIG.get("continuous_dictation", False)
+                _log(f"=== cycle {cycle} (loop={is_loop}) ===")
+
+                # 3. Init new WS session for this utterance
+                request_id = uuid.uuid4().hex
                 try:
-                    # Calibrate noise threshold (cached — reads only 1 frame after first call)
-                    energy_threshold, cal_frames = calibrate_noise(proc)
-                    _log(f"calibrated: threshold={energy_threshold:.0f}, cal_frames={len(cal_frames)}")
+                    _init_stt_ws_session(ws, request_id, drain=not ws_fresh)
+                except Exception as exc:
+                    _log(f"WS session init failed (cycle {cycle}): {exc}")
+                    _invalidate_stt_ws()
+                    # Try to reconnect once before giving up
+                    try:
+                        ws, ws_fresh = _get_stt_ws()
+                        _init_stt_ws_session(ws, request_id, drain=not ws_fresh)
+                    except Exception as exc2:
+                        _log(f"WS reconnect also failed: {exc2}")
+                        _invalidate_stt_ws()
+                        GLib.idle_add(self._emit_error, f"STT session init failed: {exc2}")
+                        break  # fall through to cleanup
+                ws_fresh = False  # subsequent cycles always drain
 
-                    # Send buffered calibration frames to Azure
-                    for frame in cal_frames:
-                        ws.send(_make_ws_audio_msg(_req_id, frame), opcode=websocket.ABNF.OPCODE_BINARY)
-                        _raw_frames.append(frame)
+                # 4. Per-cycle shared state — reset partial throttle for new utterance
+                self._last_partial_text = ""
+                self._last_partial_time = 0
+                phrases = []
+                partial_holder = [""]
+                end_word_event = threading.Event()
+                sender_done = threading.Event()
+                raw_frames = []
+                typed_partial = [""]
+                raw_partial = [""]
 
-                    vad = webrtcvad.Vad(state.VAD_AGGRESSIVENESS) if HAS_VAD else None
-                    silence_frames = 0
-                    speech_frames = 0
-                    total_frames = 0
-                    # In loop mode, use tighter silence timeout for faster turnaround.
-                    # Conversation mode gets a longer timeout (2.5s default) since
-                    # natural speech has longer thinking pauses than dictation (1.2s).
-                    if is_loop and CONFIG.get("conversation_mode", False):
-                        silence_sec = CONFIG.get("conversation_silence_timeout", 2.5)
-                    elif is_loop:
-                        silence_sec = CONFIG.get("loop_silence_timeout", 1.2)
-                    else:
-                        silence_sec = state.SILENCE_TIMEOUT
-                    max_silence = int(silence_sec * 1000 / FRAME_MS)
-                    # In loop mode, wait much longer for speech before cycling.
-                    # Default 7s causes ~8 restarts/min of silence, each with WS
-                    # session re-init overhead. 60s keeps the session alive and
-                    # responsive while burning near-zero resources in silence.
-                    no_speech_sec = 60.0 if is_loop else state.NO_SPEECH_TIMEOUT
-                    max_no_speech = int(no_speech_sec * 1000 / FRAME_MS)
-                    min_speech = int(state.MIN_SPEECH_DURATION * 1000 / FRAME_MS)
-                    max_frames = int(MAX_LISTEN_SECONDS * 1000 / FRAME_MS)
+                # 5. Sender thread: calibrate noise, send audio with VAD.
+                #    A new sender thread is created each cycle, but the same proc
+                #    (recorder) feeds it.  The sender does NOT terminate proc —
+                #    that is handled by the outer cleanup below.
+                def send_audio(_req_id=request_id, _raw_frames=raw_frames,
+                               _end_word_event=end_word_event,
+                               _sender_done=sender_done):
+                    try:
+                        # Calibrate noise threshold (cached — reads only 1 frame after first call)
+                        energy_threshold, cal_frames = calibrate_noise(proc)
+                        _log(f"calibrated: threshold={energy_threshold:.0f}, cal_frames={len(cal_frames)}")
 
-                    _log(f"limits: max_silence={max_silence} max_no_speech={max_no_speech} min_speech={min_speech}")
+                        # Send buffered calibration frames to Azure
+                        for frame in cal_frames:
+                            ws.send(_make_ws_audio_msg(_req_id, frame), opcode=websocket.ABNF.OPCODE_BINARY)
+                            _raw_frames.append(frame)
 
-                    while not _stopping():
-                        chunk = proc.stdout.read(FRAME_BYTES)
-                        if not chunk or len(chunk) < FRAME_BYTES:
-                            _log(f"recorder EOF at frame {total_frames}")
-                            break
-
-                        # Only buffer frames after speech starts (saves memory in loop idle)
-                        if speech_frames > 0 or not is_loop:
-                            _raw_frames.append(chunk)
-
-                        try:
-                            ws.send(_make_ws_audio_msg(_req_id, chunk), opcode=websocket.ABNF.OPCODE_BINARY)
-                        except Exception as exc:
-                            _log(f"WS send error at frame {total_frames}: {exc}")
-                            break
-
-                        energy = rms_energy(chunk)
-                        total_frames += 1
-
-                        is_speech = is_speech_energy(chunk, vad, energy_threshold)
-                        if is_speech:
-                            speech_frames += 1
-                            silence_frames = 0
+                        vad = webrtcvad.Vad(state.VAD_AGGRESSIVENESS) if HAS_VAD else None
+                        silence_frames = 0
+                        speech_frames = 0
+                        total_frames = 0
+                        # In loop mode, use tighter silence timeout for faster turnaround.
+                        # Conversation mode gets a longer timeout (2.5s default) since
+                        # natural speech has longer thinking pauses than dictation (1.2s).
+                        if is_loop and CONFIG.get("conversation_mode", False):
+                            silence_sec = CONFIG.get("conversation_silence_timeout", 2.5)
+                        elif is_loop:
+                            silence_sec = CONFIG.get("loop_silence_timeout", 1.2)
                         else:
-                            silence_frames += 1
+                            silence_sec = state.SILENCE_TIMEOUT
+                        max_silence = int(silence_sec * 1000 / FRAME_MS)
+                        # In loop mode, wait much longer for speech before cycling.
+                        # Default 7s causes ~8 restarts/min of silence, each with WS
+                        # session re-init overhead. 60s keeps the session alive and
+                        # responsive while burning near-zero resources in silence.
+                        no_speech_sec = 60.0 if is_loop else state.NO_SPEECH_TIMEOUT
+                        max_no_speech = int(no_speech_sec * 1000 / FRAME_MS)
+                        min_speech = int(state.MIN_SPEECH_DURATION * 1000 / FRAME_MS)
+                        max_frames = int(MAX_LISTEN_SECONDS * 1000 / FRAME_MS)
 
-                        # Emit audio level for badge visualization (~90ms interval).
-                        # In loop idle (no speech yet), throttle to every 27 frames
-                        # (~270ms) to reduce D-Bus traffic while waiting.
-                        emit_interval = 3 if speech_frames > 0 else 9
-                        if total_frames % emit_interval == 0:
-                            GLib.idle_add(self._emit_audio_level, min(energy / 10000.0, 1.0))
-                            # STT status: VAD state + timeout progress
-                            if speech_frames > 0:
-                                # During speech: show silence countdown
-                                tf = silence_frames / max_silence if max_silence > 0 else 0
+                        _log(f"limits: max_silence={max_silence} max_no_speech={max_no_speech} min_speech={min_speech}")
+
+                        while not _stopping():
+                            chunk = proc.stdout.read(FRAME_BYTES)
+                            if not chunk or len(chunk) < FRAME_BYTES:
+                                _log(f"recorder EOF at frame {total_frames}")
+                                break
+
+                            # Only buffer frames after speech starts (saves memory in loop idle)
+                            if speech_frames > 0 or not is_loop:
+                                _raw_frames.append(chunk)
+
+                            try:
+                                ws.send(_make_ws_audio_msg(_req_id, chunk), opcode=websocket.ABNF.OPCODE_BINARY)
+                            except Exception as exc:
+                                _log(f"WS send error at frame {total_frames}: {exc}")
+                                break
+
+                            energy = rms_energy(chunk)
+                            total_frames += 1
+
+                            is_speech = is_speech_energy(chunk, vad, energy_threshold)
+                            if is_speech:
+                                speech_frames += 1
+                                silence_frames = 0
                             else:
-                                # Waiting for speech: show no-speech countdown
-                                tf = total_frames / max_no_speech if max_no_speech > 0 else 0
-                            # Also treat high energy as "speech" for visual feedback
-                            # even if VAD hasn't confirmed — gives instant response
-                            visual_speech = is_speech or (energy / 10000.0) > 0.15
-                            GLib.idle_add(self._emit_stt_status, visual_speech, min(tf, 1.0))
+                                silence_frames += 1
 
-                        if _end_word_event.is_set():
-                            _log(f"STOP: end word '{end_word}' detected. speech={speech_frames}")
-                            break
-                        if speech_frames >= min_speech and silence_frames >= max_silence:
-                            _log(f"STOP: silence timeout. speech={speech_frames} silence={silence_frames}/{max_silence}")
-                            break
-                        if speech_frames == 0 and total_frames >= max_no_speech:
-                            _log(f"STOP: no speech timeout. total={total_frames}/{max_no_speech}")
-                            break
-                        if total_frames >= max_frames:
-                            _log(f"STOP: max duration. total={total_frames}")
-                            break
+                            # Emit audio level for badge visualization (~90ms interval).
+                            # In loop idle (no speech yet), throttle to every 27 frames
+                            # (~270ms) to reduce D-Bus traffic while waiting.
+                            emit_interval = 3 if speech_frames > 0 else 9
+                            if total_frames % emit_interval == 0:
+                                GLib.idle_add(self._emit_audio_level, min(energy / 10000.0, 1.0))
+                                # STT status: VAD state + timeout progress
+                                if speech_frames > 0:
+                                    # During speech: show silence countdown
+                                    tf = silence_frames / max_silence if max_silence > 0 else 0
+                                else:
+                                    # Waiting for speech: show no-speech countdown
+                                    tf = total_frames / max_no_speech if max_no_speech > 0 else 0
+                                # Also treat high energy as "speech" for visual feedback
+                                # even if VAD hasn't confirmed — gives instant response
+                                visual_speech = is_speech or (energy / 10000.0) > 0.15
+                                GLib.idle_add(self._emit_stt_status, visual_speech, min(tf, 1.0))
 
-                    _log(f"REC END: speech={speech_frames} total={total_frames}")
-                except Exception as exc:
-                    _log(f"sender exception: {exc}")
-                finally:
-                    # Send end-of-audio marker for this utterance
-                    try:
-                        ws.send(_make_ws_audio_msg(_req_id, b""), opcode=websocket.ABNF.OPCODE_BINARY)
+                            if _end_word_event.is_set():
+                                _log(f"STOP: end word '{end_word}' detected. speech={speech_frames}")
+                                break
+                            if speech_frames >= min_speech and silence_frames >= max_silence:
+                                _log(f"STOP: silence timeout. speech={speech_frames} silence={silence_frames}/{max_silence}")
+                                break
+                            if speech_frames == 0 and total_frames >= max_no_speech:
+                                _log(f"STOP: no speech timeout. total={total_frames}/{max_no_speech}")
+                                break
+                            if total_frames >= max_frames:
+                                _log(f"STOP: max duration. total={total_frames}")
+                                break
+
+                        _log(f"REC END: speech={speech_frames} total={total_frames}")
                     except Exception as exc:
-                        _log(f"WS final audio send failed: {exc}")
-                    # Do NOT terminate proc here — the outer loop handles cleanup.
-                    _sender_done.set()
-
-            sender = threading.Thread(target=send_audio, daemon=True)
-            sender.start()
-
-            # 6. Receive WS messages (on this thread)
-            deadline = time.time() + MAX_LISTEN_SECONDS + 5
-            got_phrase = False
-            natural_end = False
-
-            while time.time() < deadline and not _stopping():
-                try:
-                    ws.settimeout(1.0)
-                    msg = ws.recv()
-                except websocket.WebSocketTimeoutException:
-                    if sender_done.is_set():
-                        if got_phrase:
-                            break
+                        _log(f"sender exception: {exc}")
+                    finally:
+                        # Send end-of-audio marker for this utterance
                         try:
-                            ws.settimeout(2.0)
-                            msg = ws.recv()
+                            ws.send(_make_ws_audio_msg(_req_id, b""), opcode=websocket.ABNF.OPCODE_BINARY)
                         except Exception as exc:
-                            _log(f"WS recv after sender done: {exc}")
-                            break
-                    else:
-                        continue
-                except Exception as exc:
-                    _log(f"WS recv error: {exc}")
-                    break
+                            _log(f"WS final audio send failed: {exc}")
+                        # Do NOT terminate proc here — the outer loop handles cleanup.
+                        _sender_done.set()
 
-                mtype = _parse_ws_msg(msg, phrases, partial_holder, end_word_event, end_word, _log,
-                                      raw_partial_holder=raw_partial, use_lexical=use_lexical)
+                sender = threading.Thread(target=send_audio, daemon=True)
+                sender.start()
 
-                if mtype == "hypothesis":
-                    text = partial_holder[0]
-                    if text:
-                        self._throttled_partial_transcription(
-                            _terminal_lowercase(text) if use_lexical else text)
-                        if live_typing:
-                            # Terminal mode: smart lowercase (preserves filesystem casing)
-                            raw = _terminal_lowercase(raw_partial[0]) if use_lexical else raw_partial[0]
-                            get_injector().replace_text(typed_partial[0], raw)
-                            typed_partial[0] = raw
-                elif mtype == "phrase":
-                    got_phrase = True
-                    text = partial_holder[0]
-                    if text:
-                        GLib.idle_add(self._emit_partial_transcription, text)
-                    if sender_done.is_set():
-                        try:
-                            ws.settimeout(0.5)
-                            ws.recv()  # drain final message
-                        except Exception as exc:
-                            _log(f"WS drain after phrase (expected): {exc}")
-                        break
-                elif mtype == "turn_end":
-                    _log(f"turn.end received (phrases={len(phrases)})")
-                    got_phrase = True
-                    natural_end = True
-                    # Signal sender to stop reading audio for this cycle.
-                    # In loop mode we use a local flag instead of _stop_event
-                    # so the outer loop can continue.
-                    if is_loop:
-                        end_word_event.set()  # reuse end_word_event to stop sender
-                    else:
-                        self._stop_event.set()
-                    break
+                # 6. Receive WS messages (on this thread)
+                deadline = time.time() + MAX_LISTEN_SECONDS + 5
+                got_phrase = False
+                natural_end = False
 
-            # Wait for sender thread to finish this cycle
-            if self._stop_event.is_set() and not sender_done.is_set():
-                sender.join(timeout=2)
-            elif not sender_done.is_set():
-                sender.join(timeout=2)
-            else:
-                sender.join(timeout=0.5)
-
-            # Drain any remaining WS messages after sender is done
-            if sender_done.is_set():
-                drain_deadline = time.time() + 1.0
-                while time.time() < drain_deadline:
+                while time.time() < deadline and not _stopping():
                     try:
-                        ws.settimeout(0.5)
+                        ws.settimeout(1.0)
                         msg = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        if sender_done.is_set():
+                            if got_phrase:
+                                break
+                            try:
+                                ws.settimeout(2.0)
+                                msg = ws.recv()
+                            except Exception as exc:
+                                _log(f"WS recv after sender done: {exc}")
+                                break
+                        else:
+                            continue
                     except Exception as exc:
-                        _log(f"WS post-sender drain done: {exc}")
+                        _log(f"WS recv error: {exc}")
                         break
+
                     mtype = _parse_ws_msg(msg, phrases, partial_holder, end_word_event, end_word, _log,
                                           raw_partial_holder=raw_partial, use_lexical=use_lexical)
-                    if mtype == "phrase":
+
+                    if mtype == "hypothesis":
+                        text = partial_holder[0]
+                        if text:
+                            self._throttled_partial_transcription(
+                                _terminal_lowercase(text) if use_lexical else text)
+                            if live_typing:
+                                # Terminal mode: smart lowercase (preserves filesystem casing)
+                                raw = _terminal_lowercase(raw_partial[0]) if use_lexical else raw_partial[0]
+                                get_injector().replace_text(typed_partial[0], raw)
+                                typed_partial[0] = raw
+                    elif mtype == "phrase":
                         got_phrase = True
                         text = partial_holder[0]
                         if text:
                             GLib.idle_add(self._emit_partial_transcription, text)
+                        if sender_done.is_set():
+                            try:
+                                ws.settimeout(0.5)
+                                ws.recv()  # drain final message
+                            except Exception as exc:
+                                _log(f"WS drain after phrase (expected): {exc}")
+                            break
                     elif mtype == "turn_end":
+                        _log(f"turn.end received (phrases={len(phrases)})")
                         got_phrase = True
+                        natural_end = True
+                        # Signal sender to stop reading audio for this cycle.
+                        # In loop mode we use a local flag instead of _stop_event
+                        # so the outer loop can continue.
+                        if is_loop:
+                            end_word_event.set()  # reuse end_word_event to stop sender
+                        else:
+                            self._stop_event.set()
                         break
 
-            # 7. Final text
-            user_text = " ".join(phrases).strip()
-
-            # The stop that means "abandon". Everything downstream of here
-            # puts text somewhere the user can see it -- the REST fallback,
-            # the spellbook, the LLM, the cursor -- so this is the one gate
-            # that has to hold. _stop_event cannot serve: stop_listening()
-            # sets it too, and it wants the text typed.
-            if cancel_token.cancelled:
-                _log(f"cancelled — discarding transcript ({len(user_text)} chars)")
-                if live_typing and typed_partial[0]:
-                    get_injector().send_backspaces(len(typed_partial[0]))
-                    typed_partial[0] = ""
-                GLib.idle_add(self._emit_transcription_ready, "")
-                user_text = ""
-                break
-
-            if not user_text and raw_frames and not got_phrase:
-                _log(f"WS returned nothing, falling back to REST STT (frames={len(raw_frames)})")
-                user_text = _rest_stt_fallback(raw_frames, _log) or ""
-            elif not user_text and got_phrase:
-                _log(f"WS analyzed audio but found no speech (skipping REST fallback)")
-
-            user_text = _strip_end_word(user_text, end_word)
-            if use_lexical and user_text:
-                user_text = _terminal_lowercase(user_text)
-                user_text = _terminal_numbers(user_text)
-                user_text = _terminal_symbols(user_text)
-            _log(f"FINAL: {repr(user_text[:100])}")
-
-            # Spell incantations ("cast …") short-circuit typing/LLM routing;
-            # matched on the raw transcript before punctuation substitution.
-            # In loop mode the cycle continues listening; replies queue until
-            # the mic closes (never TTS over an open mic).
-            if user_text and self._try_cast(user_text):
-                if live_typing and typed_partial[0]:
-                    get_injector().send_backspaces(len(typed_partial[0]))
-                GLib.idle_add(self._emit_transcription_ready, user_text)
-                if (is_loop and not _stopping()
-                        and CONFIG.get("continuous_dictation", False)):
-                    # Let the spell's spoken reply play before re-opening the mic
-                    self._drain_speech_gap()
-                    if _stopping():
-                        break
-                    self._set_state("listening")
-                    continue
-                break
-
-            # 8. Post-process: voice commands and auto-corrections.
-            # Terminal text already went through _terminal_symbols — the
-            # prose table would mangle it ("dash" -> em-dash).
-            if user_text:
-                if not use_lexical:
-                    user_text = apply_voice_commands(user_text)
-                user_text = apply_auto_corrections(user_text)
-
-            # 9. Emit results and type/copy
-            # In loop mode, skip the "processing" flicker if nothing was said —
-            # just silently re-enter listening on the next cycle.
-            if is_loop and not user_text and not _stopping():
-                if live_typing and typed_partial[0]:
-                    get_injector().send_backspaces(len(typed_partial[0]))
-                _log("no speech in loop cycle, continuing")
-                # Quiet cycle = natural gap for starved queue items (agent
-                # messages, spell replies) to play before the mic reopens.
-                self._drain_speech_gap()
-                self._set_state("listening")
-                continue
-
-            self._set_state("processing")
-            if user_text:
-                GLib.idle_add(self._emit_transcription_ready, user_text)
-                log.info("Transcription: %s", user_text[:100])
-
-                # Conversation mode: send to LLM then speak response
-                if CONFIG.get("conversation_mode", False):
-                    if live_typing:
-                        get_injector().send_backspaces(len(typed_partial[0]))
-                        time.sleep(0.02)
-                    self._conversation_worker(user_text)
-                    if not CONFIG.get("continuous_dictation", False):
-                        self._save_config_flag("conversation_mode", False)
-                    # _conversation_worker handles its own restart/warmup
-                    break  # exit cycle loop; cleanup below
-
-                # Type at cursor (dictation mode) or just copy to clipboard
-                if CONFIG.get("dictation_mode", True):
-                    if live_typing and (is_loop or CONFIG.get("skip_final_paste", False)):
-                        inj = get_injector()
-                        if is_loop and typed_partial[0]:
-                            # Final correction: if Azure's final differs from what
-                            # was live-typed, surgically fix the divergent tail.
-                            if typed_partial[0] != user_text:
-                                inj.replace_text(typed_partial[0], user_text)
-                            # Separator before the next utterance. A pre-edit
-                            # backend's coalescer restores its own between
-                            # commits; typing one here would double it.
-                            if not inj.supports_preedit():
-                                inj.type_text(" ")
-                        # Keep the live text: on ydotool it is already really
-                        # typed (no-op); on IBus it is still a volatile pre-edit
-                        # that end() would DISCARD at idle, so commit it (#45).
-                        inj.finalize(user_text)
-                    elif live_typing:
-                        get_injector().send_backspaces(len(typed_partial[0]))
-                        time.sleep(0.02)
-                        if not self._wake_gate_blocks():
-                            get_injector().paste(user_text)
-                    elif not self._wake_gate_blocks():
-                        get_injector().commit(user_text)
+                # Wait for sender thread to finish this cycle
+                if self._stop_event.is_set() and not sender_done.is_set():
+                    sender.join(timeout=2)
+                elif not sender_done.is_set():
+                    sender.join(timeout=2)
                 else:
+                    sender.join(timeout=0.5)
+
+                # Drain any remaining WS messages after sender is done
+                if sender_done.is_set():
+                    drain_deadline = time.time() + 1.0
+                    while time.time() < drain_deadline:
+                        try:
+                            ws.settimeout(0.5)
+                            msg = ws.recv()
+                        except Exception as exc:
+                            _log(f"WS post-sender drain done: {exc}")
+                            break
+                        mtype = _parse_ws_msg(msg, phrases, partial_holder, end_word_event, end_word, _log,
+                                              raw_partial_holder=raw_partial, use_lexical=use_lexical)
+                        if mtype == "phrase":
+                            got_phrase = True
+                            text = partial_holder[0]
+                            if text:
+                                GLib.idle_add(self._emit_partial_transcription, text)
+                        elif mtype == "turn_end":
+                            got_phrase = True
+                            break
+
+                # 7. Final text
+                user_text = " ".join(phrases).strip()
+
+                # The stop that means "abandon". Everything downstream of here
+                # puts text somewhere the user can see it -- the REST fallback,
+                # the spellbook, the LLM, the cursor -- so this is the one gate
+                # that has to hold. _stop_event cannot serve: stop_listening()
+                # sets it too, and it wants the text typed.
+                if cancel_token.cancelled:
+                    _log(f"cancelled — discarding transcript ({len(user_text)} chars)")
                     if live_typing and typed_partial[0]:
                         get_injector().send_backspaces(len(typed_partial[0]))
-                    clipboard_write(user_text)
-            else:
-                log.info("No speech detected")
-                if live_typing and typed_partial[0]:
-                    get_injector().send_backspaces(len(typed_partial[0]))
-                GLib.idle_add(self._emit_transcription_ready, "")
-
-            # 10. Decide whether to loop or exit
-            if is_loop and not _stopping():
-                # Re-check continuous_dictation in case user toggled it mid-session
-                if not CONFIG.get("continuous_dictation", False):
-                    _log("continuous_dictation toggled off, exiting loop")
+                        typed_partial[0] = ""
+                    GLib.idle_add(self._emit_transcription_ready, "")
+                    user_text = ""
                     break
-                self._drain_speech_gap()
-                # Reset state to "listening" for the next cycle
-                self._set_state("listening")
-                _log(f"cycle {cycle} done, continuing loop")
-                continue
 
-            # Single-shot mode or stop requested — exit
-            break
+                if not user_text and raw_frames and not got_phrase:
+                    _log(f"WS returned nothing, falling back to REST STT (frames={len(raw_frames)})")
+                    user_text = _rest_stt_fallback(raw_frames, _log) or ""
+                elif not user_text and got_phrase:
+                    _log(f"WS analyzed audio but found no speech (skipping REST fallback)")
 
-        # ---------------------------------------------------------------
-        # Cleanup: terminate recorder and set final state.
-        # Only reached when exiting the cycle loop.
-        # ---------------------------------------------------------------
-        # Terminate the recorder process (it was kept alive across cycles)
-        # pw-record ignores SIGTERM — escalate to SIGKILL after timeout
-        try:
-            proc.terminate()
-            try:
-                proc.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                log.debug("Recorder ignored SIGTERM, sending SIGKILL")
-                proc.kill()
-                proc.wait(timeout=1.0)
+                user_text = _strip_end_word(user_text, end_word)
+                if use_lexical and user_text:
+                    user_text = _terminal_lowercase(user_text)
+                    user_text = _terminal_numbers(user_text)
+                    user_text = _terminal_symbols(user_text)
+                _log(f"FINAL: {repr(user_text[:100])}")
+
+                # Spell incantations ("cast …") short-circuit typing/LLM routing;
+                # matched on the raw transcript before punctuation substitution.
+                # In loop mode the cycle continues listening; replies queue until
+                # the mic closes (never TTS over an open mic).
+                if user_text and self._try_cast(user_text):
+                    if live_typing and typed_partial[0]:
+                        get_injector().send_backspaces(len(typed_partial[0]))
+                    GLib.idle_add(self._emit_transcription_ready, user_text)
+                    if (is_loop and not _stopping()
+                            and CONFIG.get("continuous_dictation", False)):
+                        # Let the spell's spoken reply play before re-opening the mic
+                        self._drain_speech_gap()
+                        if _stopping():
+                            break
+                        self._set_state("listening")
+                        continue
+                    break
+
+                # 8. Post-process: voice commands and auto-corrections.
+                # Terminal text already went through _terminal_symbols — the
+                # prose table would mangle it ("dash" -> em-dash).
+                if user_text:
+                    if not use_lexical:
+                        user_text = apply_voice_commands(user_text)
+                    user_text = apply_auto_corrections(user_text)
+
+                # 9. Emit results and type/copy
+                # In loop mode, skip the "processing" flicker if nothing was said —
+                # just silently re-enter listening on the next cycle.
+                if is_loop and not user_text and not _stopping():
+                    if live_typing and typed_partial[0]:
+                        get_injector().send_backspaces(len(typed_partial[0]))
+                    _log("no speech in loop cycle, continuing")
+                    # Quiet cycle = natural gap for starved queue items (agent
+                    # messages, spell replies) to play before the mic reopens.
+                    self._drain_speech_gap()
+                    self._set_state("listening")
+                    continue
+
+                self._set_state("processing")
+                if user_text:
+                    GLib.idle_add(self._emit_transcription_ready, user_text)
+                    log.info("Transcription: %s", user_text[:100])
+
+                    # Conversation mode: send to LLM then speak response
+                    if CONFIG.get("conversation_mode", False):
+                        if live_typing:
+                            get_injector().send_backspaces(len(typed_partial[0]))
+                            time.sleep(0.02)
+                        self._conversation_worker(user_text)
+                        if not CONFIG.get("continuous_dictation", False):
+                            self._save_config_flag("conversation_mode", False)
+                        # _conversation_worker handles its own restart/warmup
+                        break  # exit cycle loop; cleanup below
+
+                    # Type at cursor (dictation mode) or just copy to clipboard
+                    if CONFIG.get("dictation_mode", True):
+                        if live_typing and (is_loop or CONFIG.get("skip_final_paste", False)):
+                            inj = get_injector()
+                            if is_loop and typed_partial[0]:
+                                # Final correction: if Azure's final differs from what
+                                # was live-typed, surgically fix the divergent tail.
+                                if typed_partial[0] != user_text:
+                                    inj.replace_text(typed_partial[0], user_text)
+                                # Separator before the next utterance. A pre-edit
+                                # backend's coalescer restores its own between
+                                # commits; typing one here would double it.
+                                if not inj.supports_preedit():
+                                    inj.type_text(" ")
+                            # Keep the live text: on ydotool it is already really
+                            # typed (no-op); on IBus it is still a volatile pre-edit
+                            # that end() would DISCARD at idle, so commit it (#45).
+                            inj.finalize(user_text)
+                        elif live_typing:
+                            get_injector().send_backspaces(len(typed_partial[0]))
+                            time.sleep(0.02)
+                            if not self._wake_gate_blocks():
+                                get_injector().paste(user_text)
+                        elif not self._wake_gate_blocks():
+                            get_injector().commit(user_text)
+                    else:
+                        if live_typing and typed_partial[0]:
+                            get_injector().send_backspaces(len(typed_partial[0]))
+                        clipboard_write(user_text)
+                else:
+                    log.info("No speech detected")
+                    if live_typing and typed_partial[0]:
+                        get_injector().send_backspaces(len(typed_partial[0]))
+                    GLib.idle_add(self._emit_transcription_ready, "")
+
+                # 10. Decide whether to loop or exit
+                if is_loop and not _stopping():
+                    # Re-check continuous_dictation in case user toggled it mid-session
+                    if not CONFIG.get("continuous_dictation", False):
+                        _log("continuous_dictation toggled off, exiting loop")
+                        break
+                    self._drain_speech_gap()
+                    # Reset state to "listening" for the next cycle
+                    self._set_state("listening")
+                    _log(f"cycle {cycle} done, continuing loop")
+                    continue
+
+                # Single-shot mode or stop requested — exit
+                break
         except Exception as exc:
-            log.debug("Recorder cleanup error: %s", exc)
-        state.unregister_proc(proc)
+            failed = exc
+            log.exception("Streaming STT failed: %s", exc)
+            _invalidate_stt_ws()  # session state is unknown; reconnect next time
+        finally:
+            # ---------------------------------------------------------------
+            # Cleanup: the recorder was kept alive across cycles.
+            # ---------------------------------------------------------------
+            self._reap_recorder(proc)
+
+        if failed is not None:
+            GLib.idle_add(self._emit_error, f"STT failed: {failed}")
+            self._idle_after_stt()
+            _schedule_warmup()
+            return
 
         # If we exited due to conversation_mode, it already set state + scheduled warmup
         if CONFIG.get("conversation_mode", False) and user_text:
