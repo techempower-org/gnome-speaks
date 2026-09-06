@@ -3224,16 +3224,19 @@ class GnomeSpeaksService:
             port = int(CONFIG.get("wyoming_wake_port", 10400))
             model = CONFIG.get("wake_word_model", "")
             proc = None
+            recorder_eof = False
             try:
                 proc = subprocess.Popen(_build_rec_cmd(),
                                         stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL)
 
                 def _chunks():
+                    nonlocal recorder_eof
                     while (CONFIG.get("wake_word", False)
                            and self.current_state == "idle"):
                         data = proc.stdout.read(3200)  # ~100 ms @ 16 kHz s16
                         if not data:
+                            recorder_eof = True
                             return
                         yield data
 
@@ -3244,6 +3247,17 @@ class GnomeSpeaksService:
                                                                 wake=True),
                                            False)[-1])
                     time.sleep(2.0)  # cooldown; state flips to listening anyway
+                elif recorder_eof:
+                    # Success-shaped failure: pw-record exited or yielded no
+                    # audio (mic unplugged, stale mic_source). Without a sleep
+                    # this loop respawns the recorder and reconnects to the
+                    # wake server as fast as it can (#41).
+                    now = time.time()
+                    if now - last_fail_log > 300:
+                        log.warning("Wake watcher: recorder produced no audio "
+                                    "(rc=%s) (retrying every 10s)", proc.poll())
+                        last_fail_log = now
+                    time.sleep(10)
             except wyoming_mod.WyomingError as e:
                 now = time.time()
                 if now - last_fail_log > 300:
