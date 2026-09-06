@@ -187,7 +187,10 @@ for n in $(seq $start $((start + 25))); do
     _deadline=$(( $(date +%s) + 5 ))
     while ! sock_live "$sock" && [ "$(date +%s)" -lt "$_deadline" ]; do sleep 0.05; done
     if sock_live "$sock"; then DISP=":$n"; OURSOCK="$sock"; break; fi
-    kill "$BWPID" 2>/dev/null; BWPID=""
+    # Remove the socket of an ABANDONED attempt too. OURSOCK is set only for
+    # the display we keep (line 99), so this path left one file behind per
+    # attempt that started broadwayd but never went live.
+    kill "$BWPID" 2>/dev/null; rm -f "$sock"; BWPID=""
 done
 [ -n "$DISP" ] || setup_fail "no free broadway display in :$start..:$((start+25)); see $RUN/broadwayd.log"
 echo "DISPLAY broadway $DISP (per-PID), run dir $RUN"
