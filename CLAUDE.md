@@ -161,12 +161,18 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
   recorder never blocks and a failed connect can hand the WHOLE utterance to Wyoming. Consumers read
   frames from the tap, not the pipe (`calibrate_noise(tap)`, `tap.read(FRAME_BYTES)`); between loop
   cycles it is trimmed to `_PIPE_FRAMES` so the next utterance does not start with the service's own
-  TTS. Never reintroduce a bare `proc.stdout.read()` in the streaming cycle.
+  TTS. Never reintroduce a bare `proc.stdout.read()` in the streaming cycle. **The tap never touches
+  `proc`, so `proc.poll()` stays the positive control for a lost mic** — and because EOF surfaces only
+  after the buffer drains, the words already captured are delivered before it (#57/#48).
 - **`_offline_stt_session` drains BEFORE it honors `stopping()`** — and the order is the fix, not a
   detail. The dictation hotkey firing while a connect is still pending is the NORMAL case, and it
   means "finish this utterance", not "discard it"; a version that checked `stopping()` first handed
   the recognizer 960 B — one calibration frame — and silently lost the press. Only `stop()` discards,
   it says so by cancelling the token, and that verdict is applied once, in `_deliver_stt_result`.
+- **One session, at most one toast, and never instead of the words.** Both streaming exits report
+  through `_report_recorder_dead()`; a lost mic outranks "STT WebSocket failed", and text that
+  actually reached the cursor outranks both (an error notification next to text landing under the
+  cursor is a lie about the outcome). Keep the ranking in one place if a third failure is added.
 
 - **ydotool stuck keys**: If a ydotool command is interrupted between key-down and key-up, the virtual device retains that key as pressed. The service auto-restarts `ydotoold` to recover. Scripts: `fix-ydotool.sh`, `install-ydotool.sh`.
 - **pw-record ignores SIGTERM**: Must use SIGKILL (`proc.kill()`) to stop PipeWire recorder processes.
@@ -207,9 +213,7 @@ No test suite. Validate changes by:
    `lucid-service-audit-repros` (queue invariants, dispatch gate, config),
    `lucid-chronicle-perf-repros` (chronicle contract, archive, HTTP endpoints),
    `lucid-cancel-tokens-repros` (cancel-token verdicts, stop vs stop_listening),
-   `morpheus-injector-seam-repros` (Injector seam, IbusInjector),
-   `lucid-version-cache-repros` (/api/version fork storm + realm-sigil contract).
-   They import the service by
+   `morpheus-injector-seam-repros` (Injector seam, IbusInjector). They import the service by
    path and need no running service, D-Bus, mic or port 7710. Run the suite(s) covering the
    area you touched before opening a PR.
 
@@ -227,7 +231,6 @@ No test suite. Validate changes by:
    GS_SVC_PATH=$SVC       python3 lucid-cancel-tokens-repros/verify_cancel_invariants.py
    GS_SVC_PATH=$SVC       python3 morpheus-injector-seam-repros/verify_injector_seam.py
    GS_WT=$(dirname $SVC)  python3 morpheus-injector-seam-repros/verify_ibus_injector.py
-   GS_SVC_PATH=$SVC       python3 lucid-version-cache-repros/verify_version_cache.py
    ```
 
    `verify_ibus_injector.py` is the exception: it imports `ibus_injector` as a module rather
