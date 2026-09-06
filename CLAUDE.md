@@ -216,7 +216,8 @@ No test suite. Validate changes by:
    `lucid-service-audit-repros` (queue invariants, dispatch gate, config),
    `lucid-chronicle-perf-repros` (chronicle contract, archive, HTTP endpoints),
    `lucid-cancel-tokens-repros` (cancel-token verdicts, stop vs stop_listening),
-   `lucid-subtitle-token-repros` (subtitle progress reads its utterance's token, not the wire),
+   `lucid-subtitle-token-repros` (subtitle progress reads its utterance's token, not the wire;
+   e4 is the composed cycle-then-reply case),
    `morpheus-injector-seam-repros` (Injector seam, IbusInjector),
    `lucid-version-cache-repros` (/api/version fork storm + realm-sigil contract).
    They import the service by
