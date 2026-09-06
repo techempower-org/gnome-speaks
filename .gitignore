@@ -6,3 +6,16 @@ schemas/gschemas.compiled
 build/
 builddir/
 dist/
+
+# Per-run sandboxes created BESIDE a suite's own script. The prefs rig writes
+# run-<pid>/ next to run.sh, which was outside any repo in scratch and is
+# inside the checkout since #59 -- so every run left the tree dirty. The
+# cleanup trap does not survive SIGKILL, and this fleet has had OOM cascades,
+# which is exactly when a run dies hard and leaves a sandbox (holding a config
+# fixture) untracked in the tree. Wildcarded across suites, not named for the
+# rig, so any suite adopting the convention is covered too.
+#
+# NOTE the `schemas/gschemas.compiled` line above does NOT help here: it
+# contains a slash, so it is anchored to the repo root and never matches the
+# one compiled at tests/repros/*/run-*/fakeext/schemas/.
+tests/repros/*/run-*/

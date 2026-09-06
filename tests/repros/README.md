@@ -1,0 +1,158 @@
+# Repro suites
+
+Plain Python scripts, **no test framework** (project rule). Each exits `0` when
+clean and `1` when the defect it describes is present. Each imports the real
+`gnome-speaks-service.py` in-process with the microphone, the WebSocket, D-Bus,
+the injector and the network stubbed, so a run touches no device, no port and
+nothing on the developer's live desktop.
+
+```sh
+tests/run-repros.sh                       # the service in this repo
+tests/run-repros.sh /path/to/service.py   # a worktree, or an extracted SHA
+```
+
+## Env contract
+
+`GS_SVC_PATH` — the `gnome-speaks-service.py` under test — is the **only** input
+a suite needs, and `run-repros.sh` sets it. Everything else is derived:
+
+| | |
+|---|---|
+| worktree dir (sibling modules: `spellbook.py`, `injector.py`, `ibus_injector.py`) | `dirname(GS_SVC_PATH)`; `GS_WT` overrides it only to mix trees deliberately |
+| scratch / state | per-PID under this repo's gitignored `tmp/repros/`; `GS_REPRO_SCRATCH` pins it, and a pinned dir is never reset or deleted by a suite |
+| `SPEECH_ENGINE_PATH` | `~/Projects/speech-to-cli` unless set (see CLAUDE.md, External Dependencies) |
+
+Two rules the suites enforce on themselves, both learned the hard way on
+2026-09-06:
+
+* **No fixed scratch path.** Suites used to share absolute dirs, and two agents
+  running one suite at once corrupted each other — *two concurrent runs of
+  `verify_chronicle_contract.py` both failed with bogus mismatches while each
+  alone passed.* It reads exactly like a service regression. Worse, a suite
+  that `rmtree`s its dir at start makes the best-behaved run the most
+  destructive one: a "clean" start deletes a peer's live directory. Reset and
+  cleanup are therefore gated on *this process having created the dir*.
+* **No live config.** `state.load_config()` reads
+  `~/.config/speech-to-cli/config.json` at import and `_reload_config_flags()`
+  re-reads it **mid-run** for every `_SYNC_FLAGS` key, so pinning keys after
+  `load()` is silently undone at the next `start_listening()`. The harnesses
+  call `_isolate_config(mod)`, which rebuilds `CONFIG` from the service's own
+  defaults plus an explicit `CONFIG_PINS` dict and repoints `CONFIG_PATH` at a
+  scratch file — so the live file can be neither read nor written — then
+  `assert_isolated(mod)`, which **raises** unless `CHRONICLE_PATH`,
+  `CONFIG_PATH` and `XDG_STATE_HOME` all resolve inside the scratch dir.
+
+## Baselines are pinned SHAs, never branch names
+
+A suite that diffs against a moving ref goes vacuous the moment its fix merges:
+it starts comparing the fix to itself and passes forever. **Pin to a branch's
+merge base, never to "current main"** — a fast-moving main manufactures false
+regressions. To confirm a suite still detects what it was written for:
+
+```sh
+git archive <baseline-sha> | tar -x -C /tmp/base   # disposable
+tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
+```
+
+| suite | issue / PR | baseline | expected there |
+|---|---|---|---|
+| `service-audit` | #18–#20 | `7899ccb` | derived (`merge^1`), not re-run |
+| `chronicle-perf` | #22 / #27 | `6a1ecae` | derived (`merge^1`), not re-run |
+| `injector-seam` | #24 | `ea47ff1` | derived (`merge^1`), not re-run |
+| `cancel-tokens` | #21 / #33 | `66edc79` | **verified** — 4 of 5 fail |
+| `dead-recorder` | #57, #48 / #72 | `e863b2c` | **verified** — e, f, h fail; g, i pass |
+| `offline-handoff` | #49 / #70 | `70ff468` | **verified** — pre-#70 *and* pre-#72 |
+| `subtitle-token` | #42 / #78 | `65bd57b` | e1–e4 fail |
+| `begin-refused` | #79 / #84 | `15dd402`, `f290d7e` | j, k fail — **l stays green on both sides** |
+| `pin-lifecycle` | #46 ×#57 | `15dd402` | compound X: X1 FAIL, X2 PASS, X3 FAIL |
+| `version-cache` | #53 / #85 | two-sided, below | `577a05f` passes, `7eaeb02` fails |
+| `prefs-rig` | #82 | merge base of the branch | more warnings than baseline = fail |
+
+"derived" means the SHA is the merge commit's first parent — the main tip
+immediately before the fix, correct by construction but not re-run. The method
+was validated on `cancel-tokens`, whose SHA was independently recorded in that
+work's findings.
+
+### Three traps in this table, all of them earned
+
+**`begin-refused`'s `l` is green on both sides, and that is correct.** It is a
+regression guard against a fix that stops speaking replies nobody cancelled —
+the failure a user notices before any of the ones j and k catch. A future reader
+seeing it green on main is the most likely person to delete it. Don't.
+
+**`offline-handoff` is `70ff468`, not `79594dd`.** `79594dd` already contains
+#72 (`git merge-base --is-ancestor 848b855 79594dd` → yes), so against it case I
+fails for **one** reason — the offline exit doesn't exist yet, so the WS error
+fires instead of the mic report — not two. `70ff468` is pre-#70 *and* pre-#72.
+"Fails for two reasons" is the kind of note that stops someone investigating one
+reason too early.
+
+**`version-cache` needs two references, and here is why.** #53's fix merged as
+`577a05f`; `e55e619` then deleted the hunk as plain deletions — a stale-buffer
+write, no revert commit — so main went green and silently back to red before
+#85 re-landed it. A suite with only *pre-fix* references can agree with itself
+forever while testing nothing, which is exactly what this one did. It now runs a
+two-sided control on every invocation: `GOOD_REF=577a05f` must pass,
+`BAD_REF=7eaeb02` must fail (`GS_GOOD_REF`/`GS_BAD_REF` override). **Keep those
+literal SHAs.** Anything resolved at runtime can silently become a second
+pre-fix reference and put the suite back where it started.
+
+## Exit codes
+
+`0` clean · `1` the defect is present · `2` **SETUP FAILURE** — the repro could
+not create the window it needed (a stalled `idle_add`, a hook that never fired),
+so it is reporting neither a pass nor a bug. Several repros in `subtitle-token`
+and `begin-refused` force a narrow window and then *check the window was hit*;
+two early drafts passed on unfixed builds before that check existed. **A rewrite
+that collapses `2` into `0` or `1` silently restores the ability to pass for the
+wrong reason.**
+
+### The pipeline-exit-status trap, in both directions
+
+Both forms have bitten this tree, and the **silent** one is the dangerous half:
+
+* `cmd | grep PAT | tail -1 && return` — **fails silently.** `tail` exits `0`
+  on empty input, so the pipeline "succeeds" whether or not `grep` matched, the
+  first branch is always taken, and every summary comes out blank. Nothing
+  reports an error; you just stop being told anything. Capture into a variable
+  and test it for content instead.
+* a runner whose last command is a `diff` or `grep` — **fails loudly**, and
+  returns `1` on a *successful* run (a fix is supposed to change stderr). At
+  least someone notices, usually when they gate CI on it.
+
+Same root cause: taking a pipeline's exit status as the answer to a question it
+never answered. `$?` after a pipe reads the LAST command, not the interesting
+one — that form once reported two red suites as green here.
+
+## Instruments that must survive a refactor
+
+* **`subtitle-token/subtitle_spy.py: GLibSpy`** — the harness runs no GLib main
+  loop, so `_emit_subtitle_update` callbacks queue and never fire. A subtitle
+  assertion written without the shim reads an empty list, measures nothing and
+  **passes**. It is the instrument, not a convenience.
+* **`assert_isolated()`** — the harness version proves the *paths* are
+  redirected; `subtitle_spy.assert_isolated()` delegates to it and adds the
+  other half, that the CONFIG *pins actually took*. A path can be redirected
+  correctly while a pin is silently missing, and `terminal_mode` really is
+  `True` on the developer desktop. Keep both halves if these are ever folded
+  together.
+* **`prefs-rig` containment comes from `GLib.get_home_dir()` honouring `$HOME`**,
+  not from its monkeypatched writers. The stubs are a *reporting* mechanism (they
+  produce the `WRITES` line), not the safety mechanism — proven by
+  `probe_write_containment.js`, which removes the stub and drives the real
+  writer with a sentinel. So deleting a stub to exercise a save path is safe.
+* **`offline-handoff` case H** replaces `stt.wyoming.transcribe` and never
+  restores it; it is safe only because `build()` re-stubs it every call. Case G
+  restores `_rest_stt_fallback` explicitly because `build()` does *not*. The
+  runner gives each case its own process so this is irrelevant rather than
+  merely currently-true — if stub ownership ever moves into the harness, check H
+  before trusting it.
+
+## prefs-rig is not python
+
+`prefs-rig/` is a GJS/bash rig (`run.sh` → `gjs` + `gtk4-broadwayd`) testing
+`prefs.js`: 10 files, zero `.py`, by design. A `*.py` inventory returns a false
+negative on it and a python collector must never try to import it. Its exit
+contract is its own: **0** = both runs completed; **1** = a run did not
+complete, or the branch emits *more* warnings than the baseline. A **differing
+stderr is not a failure** — a fix is supposed to change stderr.

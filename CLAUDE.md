@@ -225,7 +225,9 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 
 ## Testing
 
-No test suite. Validate changes by:
+No unit-test framework, by choice -- the repro suites in `tests/repros/` are plain
+scripts that exit 0 or 1. Validate changes by:
+
 1. Restarting the service (`systemctl --user restart gnome-speaks.service`)
 2. Checking logs (`journalctl --user -u gnome-speaks.service -f`)
 3. Testing via D-Bus (`dbus-send`) or keyboard shortcuts
@@ -236,51 +238,41 @@ No test suite. Validate changes by:
 6. Wake-word secure gate: `python3 verify_wake_gate.py` from the checkout root -- no env vars,
    no desktop, no daemon (it imports `ibus_injector` from its own directory). 24 checks; exit 0
    means all passed.
-7. Service-side changes: the de-facto verification bar is the scratch repro suites under
-   `~/.claude/projects/-home-jp/scratch/gnome-speaks-dreamteam/`, one directory per audit --
-   `lucid-service-audit-repros` (queue invariants, dispatch gate, config),
-   `lucid-chronicle-perf-repros` (chronicle contract, archive, HTTP endpoints),
-   `lucid-cancel-tokens-repros` (cancel-token verdicts, stop vs stop_listening),
-   `lucid-subtitle-token-repros` (subtitle progress reads its utterance's token, not the wire;
-   e4 is the composed cycle-then-reply case),
-   `morpheus-injector-seam-repros` (Injector seam, IbusInjector),
-   `lucid-version-cache-repros` (/api/version fork storm + realm-sigil contract).
-   They import the service by
-   path and need no running service, D-Bus, mic or port 7710. Run the suite(s) covering the
-   area you touched before opening a PR.
+7. **Service-side changes: `tests/repros/run_all.sh` is the verification bar.**
 
-   **Always pass the path explicitly; never trust a suite's default.** Only
-   `lucid-cancel-tokens-repros` defaults to the main checkout. `lucid-service-audit-repros`,
-   `lucid-chronicle-perf-repros` and `morpheus-injector-seam-repros` default to
-   `~/Projects/gnome-speaks-wt/<audit-name>/` worktrees that no longer exist, so an
-   unqualified run dies with `FileNotFoundError` on that path instead of testing anything.
+```sh
+tests/repros/run_all.sh                       # the service in this repo
+tests/repros/run_all.sh /path/to/service.py   # a worktree, or an extracted SHA
+```
 
-   ```bash
-   SVC=~/Projects/gnome-speaks-wt/<your-worktree>/gnome-speaks-service.py
-   cd ~/.claude/projects/-home-jp/scratch/gnome-speaks-dreamteam
-   GS_SVC_PATH=$SVC       python3 lucid-service-audit-repros/verify_queue_invariants.py
-   GS_SVC_PATH=$SVC       python3 lucid-chronicle-perf-repros/verify_archive.py
-   GS_SVC_PATH=$SVC       python3 lucid-cancel-tokens-repros/verify_cancel_invariants.py
-   bash lucid-subtitle-token-repros/run_all.sh $SVC
-   GS_SVC_PATH=$SVC       python3 morpheus-injector-seam-repros/verify_injector_seam.py
-   GS_WT=$(dirname $SVC)  python3 morpheus-injector-seam-repros/verify_ibus_injector.py
-   GS_SVC_PATH=$SVC       python3 lucid-version-cache-repros/verify_version_cache.py
-   ```
+Run it before opening a PR that touches `gnome-speaks-service.py`. It needs no
+running service, no D-Bus, no microphone and no port 7710; it exits non-zero if
+any suite fails. `GS_SVC_PATH` is the only input and the runner sets it -- the
+worktree dir and the scratch dir are derived, so there is nothing to pass by
+hand and no default that can silently point at a tree that no longer exists.
+Per-suite detail, the pinned baseline SHA each suite discriminates against, and
+why `version-cache` is expected red are in `tests/repros/README.md`.
 
-   `verify_ibus_injector.py` is the exception: it imports `ibus_injector` as a module rather
-   than loading the service by path, so it reads **`GS_WT` (a checkout *directory*)** and
-   ignores `GS_SVC_PATH` entirely -- passing only `GS_SVC_PATH` gets you
-   `ModuleNotFoundError: No module named 'ibus_injector'`.
+Two hazards these suites are built to avoid, both measured on 2026-09-06 --
+keep them in mind before adding a suite, and read `tests/repros/README.md`
+before changing one:
 
-   Exit 0 = clean. A non-zero exit is a failed check -- in the `repro_*` scripts that means
-   the bug the repro was written for is still present, which is the point of running them.
-   **A red suite is not automatically your fault**: some scripts are open-bug repros that are
-   red on `main` by design, and several keep state under `/tmp/<suite>/` that is not reset
-   between runs. Get a baseline on `main` before blaming your branch, and wipe the suite's
-   state dir if a second run disagrees with the first.
+- **Never a fixed scratch path.** Suites shared absolute state dirs, and two
+  agents running one suite at once corrupted each other; the failure looked
+  exactly like a service regression and nearly got a good commit reverted.
+  Scratch is per-PID, and reset/cleanup only ever touch a directory the running
+  process created.
+- **Never JP's live config.** `state.load_config()` reads
+  `~/.config/speech-to-cli/config.json` at import, and `_reload_config_flags()`
+  re-reads it *mid-run* for every `_SYNC_FLAGS` key -- so pinning a key after
+  `load()` is undone at the next `start_listening()`. The harnesses rebuild
+  `CONFIG` from the service's own defaults and repoint `CONFIG_PATH` at a
+  scratch file, then assert that `CHRONICLE_PATH`/`CONFIG_PATH`/`XDG_STATE_HOME`
+  all resolve inside it.
 
-8. **prefs.js changes: the broadway rig.** Lives in the same scratch dir as the suites above,
-   as `luna-prefs-async-repros/`. ⚠️ **`gnome-extensions prefs
+8. **prefs.js changes: the broadway rig.** Lives with the other suites in the repo,
+   as `tests/repros/prefs-rig/` (GJS/bash, not python -- it is never
+   collected by `run_all.sh`'s python path; the runner invokes its `run.sh`). ⚠️ **`gnome-extensions prefs
    gnome-speaks@jphein` CANNOT verify a worktree** -- it goes through the live shell and opens
    the copy **installed** in `~/.local/share/gnome-shell/extensions`, so it renders the OLD
    prefs.js and reports success. Item 5 does not cover this either: gnome-shell never loads
@@ -288,9 +280,17 @@ No test suite. Validate changes by:
    nothing about it.
 
    ```bash
-   cd ~/.claude/projects/-home-jp/scratch/gnome-speaks-dreamteam/luna-prefs-async-repros
-   ./run.sh ~/Projects/gnome-speaks-wt/<wt>/prefs.js                     # one file
-   ./run.sh ~/Projects/gnome-speaks-wt/<wt>/prefs.js /path/to/main.js    # + baseline diff
+   cd tests/repros/prefs-rig
+   # Paths must be ABSOLUTE: harness.js imports the file as a module URI, and a
+   # relative path resolves against the rig dir, not your shell -- it fails with
+   # `ImportError: Unable to load file async from: file://../prefs.js`.
+   ./run.sh /abs/path/to/prefs.js                          # one file
+   # + baseline diff. The baseline is the branch's MERGE BASE, never a moving
+   # origin/main. Extract it to a real temp dir -- a placeholder in a `>`
+   # redirect is a footgun, and the block above has already cd'd into the rig:
+   BASE=$(mktemp -d)
+   git show $(git merge-base origin/main HEAD):prefs.js > $BASE/prefs.js
+   ./run.sh /abs/path/to/prefs.js $BASE/prefs.js
    ```
 
    It builds a **real, mapped `Adw.PreferencesWindow`** on a `gtk4-broadwayd` virtual display,
