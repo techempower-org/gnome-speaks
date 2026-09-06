@@ -149,6 +149,25 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
   key-event backend even when IBus is active (spec §5.4, "non-text targets"). Never collapse it
   into `commit`/`type_raw`.
 
+- **The streaming STT path has no offline seam of its own** (#49): while `wyoming_mod.skip_azure()`
+  holds (60 s breaker or `SPEECH_FORCE_OFFLINE=1`), `start_listening()` routes a streaming session
+  to the VAD batch path, and a WS connect failure calls `mark_azure_down()` and hands the session to
+  `_offline_stt_session` → `_rest_stt_fallback`. With Wyoming configured the WS gets ONE attempt.
+- **A recorder nobody is reading is a recorder losing speech.** The pipe between `pw-record` and this
+  process holds **65536 B = 2.048 s** of 16 kHz mono PCM (measured, `F_GETPIPE_SZ`), and a WS connect
+  attempt can last **10 s** — so audio spoken past the first two seconds of a stalled connect was
+  destroyed *at the source*, and no amount of cleverness at the handoff could get it back. Hence
+  `_RecorderTap`: a reader thread owns `proc.stdout` from the moment the recorder starts, so the
+  recorder never blocks and a failed connect can hand the WHOLE utterance to Wyoming. Consumers read
+  frames from the tap, not the pipe (`calibrate_noise(tap)`, `tap.read(FRAME_BYTES)`); between loop
+  cycles it is trimmed to `_PIPE_FRAMES` so the next utterance does not start with the service's own
+  TTS. Never reintroduce a bare `proc.stdout.read()` in the streaming cycle.
+- **`_offline_stt_session` drains BEFORE it honors `stopping()`** — and the order is the fix, not a
+  detail. The dictation hotkey firing while a connect is still pending is the NORMAL case, and it
+  means "finish this utterance", not "discard it"; a version that checked `stopping()` first handed
+  the recognizer 960 B — one calibration frame — and silently lost the press. Only `stop()` discards,
+  it says so by cancelling the token, and that verdict is applied once, in `_deliver_stt_result`.
+
 - **ydotool stuck keys**: If a ydotool command is interrupted between key-down and key-up, the virtual device retains that key as pressed. The service auto-restarts `ydotoold` to recover. Scripts: `fix-ydotool.sh`, `install-ydotool.sh`.
 - **pw-record ignores SIGTERM**: Must use SIGKILL (`proc.kill()`) to stop PipeWire recorder processes.
 - **Half-duplex drain**: On speakers, 0.5s delay after TTS before opening mic to prevent echo pickup.
