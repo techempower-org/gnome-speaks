@@ -124,8 +124,18 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         page.add(typeGroup);
 
         this._addSwitchRow(typeGroup, 'Type at Cursor',
-            'Type transcribed words where the cursor is (via ydotool). Off = copy to clipboard only. Default: on',
+            'Type transcribed words where the cursor is. Off = copy to clipboard only. Default: on',
             'dictation_mode', true);
+
+        // Typing engine. IBus is the input-method path (no stuck keys;
+        // refuses password fields — but ONLY on X11/XWayland: on native
+        // Wayland the field's content-type never reaches IBus, so the
+        // refusal cannot fire). The wording stays qualified on purpose.
+        this._addComboRow(typeGroup, 'Typing Engine', 'injection_method', [
+            ['ydotool', 'Virtual keyboard (ydotool) — default'],
+            ['ibus', 'Input method (IBus) — no stuck keys; skips password fields on X11/XWayland only'],
+            ['auto', 'Auto — IBus when available, else ydotool'],
+        ], 'ydotool');
 
         this._addSwitchRow(typeGroup, 'Keep Live Text',
             'Keep the live-typed words as-is instead of replacing them with the final corrected transcript. Default: on',
@@ -501,6 +511,10 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         this._addSwitchRow(wakeGroup, 'Wake Word',
             'Say your wake phrase to open the microphone hands-free. Armed only while idle — never while dictating or speaking. "cast wake word" toggles by voice. Default: off',
             'wake_word', false);
+
+        this._addSwitchRow(wakeGroup, 'Only Type Into Known Fields',
+            'Wake-word dictation types only when the input method can confirm the field is not a password. Needs the IBus typing engine; on native Wayland this refuses all hands-free typing. Default: off',
+            'wake_word_secure_gate', false);
 
         this._addEntryRow(wakeGroup, 'Wake Model', 'wake_word_model', '',
             'openwakeword model name — this IS your wake phrase; keep it private, since anyone who knows it can open your mic by voice');

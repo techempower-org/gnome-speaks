@@ -14,7 +14,7 @@ Two-process design connected by session D-Bus (`org.gnome.Speaks`):
 | `injector.py` | imported by the service | The `Injector` seam: the contract both injection backends implement | ~120 |
 | `ibus_injector.py` | imported by the service | `IbusInjector` — text injection as an IBus engine (D-Bus commits, preedit, crash recovery) | ~660 |
 | `spellbook.py` | imported by the service | Incantation matcher + executor ("cast …" → local actions); denylist | ~390 |
-| `spellbook.json` | data | 14 repo spells (self-control); user overlay at `~/.config/speech-to-cli/spellbook.json` merges + hot-reloads | — |
+| `spellbook.json` | data | 15 repo spells (self-control); user overlay at `~/.config/speech-to-cli/spellbook.json` merges + hot-reloads | — |
 | `spiel_provider.py` | imported by the service | Spiel/libspiel synthesis side (`org.gnome.Speaks.Speech.Provider`); off unless `spiel_provider` | ~120 |
 | `prefs.js` | GNOME Extensions app (GJS/Gtk4) | 6-page preferences window (task-first redesign, #5e49049) | ~1,540 |
 | `stylesheet.css` | GNOME Shell | Badge states, pills, animations, subtitle overlay, chronicle scroll | ~560 |

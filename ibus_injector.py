@@ -538,6 +538,11 @@ class IbusInjector(Injector):
 
     # ── session lifecycle ────────────────────────────────────────────────
 
+    def purpose_known(self):
+        eng = self._engine
+        return bool(eng is not None and eng.focused and eng.purpose
+                    and not eng.is_secure())
+
     def acquire(self):
         """Become the global engine for one utterance.
 

@@ -194,6 +194,19 @@
         "op": "press_enter"
       },
       "gate": "instant"
+    },
+    {
+      "name": "typing-engine",
+      "patterns": [
+        "typing engine",
+        "switch typing",
+        "input method"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "injection_toggle"
+      },
+      "gate": "instant"
     }
   ]
 }

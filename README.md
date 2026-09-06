@@ -495,6 +495,7 @@ into that body field, and `"reply"` speaks a fixed success line.
 | "cast seal the chronicle" | stop or resume recording the Chronicle |
 | "cast loop" / "keep listening" | toggle continuous dictation, mid-session |
 | "cast run it" / "press enter" | press Enter — hands-free command execution (spell-gated so a misheard word never executes anything) |
+| "cast typing engine" | switch between the virtual keyboard (ydotool) and the IBus input method — no stuck keys — and back, by voice |
 
 **Overlay examples** — these live in your own `~/.config/speech-to-cli/spellbook.json`
 because their endpoints are site-specific:

@@ -72,6 +72,12 @@ class Injector:
         """True if this backend can put text at the cursor right now."""
         return False
 
+    def purpose_known(self):
+        """True when the backend KNOWS the focused field's content-type is
+        non-secure. Only an input-method backend can ever know this; a
+        key-event backend must answer False (see spec §4.3 wake gate)."""
+        return False
+
     def supports_preedit(self):
         """True if provisional text goes to a volatile pre-edit region.
 

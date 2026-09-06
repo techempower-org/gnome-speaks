@@ -1604,7 +1604,7 @@ class GnomeSpeaksService:
         # off IBus, because the reason for getting off IBus may be that the
         # user cannot type.
         "injection_method",
-        "speed", "pitch", "volume", "chronicle",
+        "speed", "pitch", "volume", "chronicle", "wake_word_secure_gate",
         # LLM provider config
         "llm_provider", "llm_model", "llm_api_key", "llm_system_prompt",
         # Chimes
@@ -1856,12 +1856,16 @@ class GnomeSpeaksService:
 
     # -- STT: Streaming WebSocket using speech-to-cli building blocks ------
 
-    def start_listening(self, quick=False):
+    def start_listening(self, quick=False, wake=False):
         """Start microphone recording with STT. Returns 'ok' or error string.
+
+        wake=True marks a session opened by the wake word (hands-free, no
+        deliberate hotkey press) — see _wake_gate_blocks.
 
         If quick=True, skip config reload and audio detection refresh.
         Used for tight loop restarts where config hasn't changed.
         """
+        self._wake_initiated = bool(wake)
         # Prevent concurrent STT threads from rapid clicks.
         # For quick (loop) restarts, briefly wait for the old thread to finish
         # since the loop restart fires before the thread fully exits.
@@ -2001,7 +2005,8 @@ class GnomeSpeaksService:
                     return
 
                 if CONFIG.get("dictation_mode", True):
-                    get_injector().commit(user_text)
+                    if not self._wake_gate_blocks():
+                        get_injector().commit(user_text)
                 else:
                     clipboard_write(user_text)
             else:
@@ -2477,8 +2482,9 @@ class GnomeSpeaksService:
                     elif live_typing:
                         get_injector().send_backspaces(len(typed_partial[0]))
                         time.sleep(0.02)
-                        get_injector().paste(user_text)
-                    else:
+                        if not self._wake_gate_blocks():
+                            get_injector().paste(user_text)
+                    elif not self._wake_gate_blocks():
                         get_injector().commit(user_text)
                 else:
                     if live_typing and typed_partial[0]:
@@ -3080,6 +3086,28 @@ class GnomeSpeaksService:
         except queue.Full:
             log.warning("Spell reply dropped: speech queue full")
 
+    def _wake_gate_blocks(self):
+        """spec §4.3 (opt-in, wake_word_secure_gate): a wake-word session may
+        only type into a field whose content-type is KNOWN non-secure.
+
+        A deliberate hotkey press is the user vouching for the target; a
+        wake word is not. Only the IBus backend can know a field's purpose
+        (ydotool never can), and on native Wayland IBus never receives it
+        either — so with the gate on, hands-free dictation is refused there.
+        That is the documented capability trade; default is OFF.
+        """
+        if not getattr(self, "_wake_initiated", False):
+            return False
+        if not CONFIG.get("wake_word_secure_gate", False):
+            return False
+        inj = get_injector()
+        inj.acquire()  # idempotent; lets content-type arrive before we ask
+        if inj.purpose_known():
+            return False
+        log.info("Wake-word gate: field purpose unknown — not typing")
+        self._spell_speak("Unknown field — press the hotkey to dictate here.")
+        return True
+
     def _spell_ctx_dbus(self, op):
         """Self-directed spell operations (dbus_self action type)."""
         if op == "stop":
@@ -3099,6 +3127,14 @@ class GnomeSpeaksService:
             new = not CONFIG.get("read_notifications", False)
             self._save_config_flag("read_notifications", new)
             return "The notification herald is %s." % ("on" if new else "off")
+        elif op == "injection_toggle":
+            cur = CONFIG.get("injection_method", "ydotool")
+            new = "ydotool" if cur == "ibus" else "ibus"
+            self._save_config_flag("injection_method", new)
+            if new == "ibus":
+                return ("Typing through the input method — no key can stick. "
+                        "Say the same words to go back.")
+            return "Typing through the virtual keyboard."
         elif op == "press_enter":
             # Hands-free Enter. Deliberately a SPELL ("cast run it") and not
             # a bare voice-command word: the "cast" prefix + pattern match
@@ -3204,7 +3240,8 @@ class GnomeSpeaksService:
                 name = wyoming_mod.detect_stream(host, port, model, _chunks())
                 if name and self.current_state == "idle":
                     log.info("Wake word detected (%s) — opening mic", name)
-                    GLib.idle_add(lambda: (self.start_listening(quick=True),
+                    GLib.idle_add(lambda: (self.start_listening(quick=True,
+                                                                wake=True),
                                            False)[-1])
                     time.sleep(2.0)  # cooldown; state flips to listening anyway
             except wyoming_mod.WyomingError as e:
