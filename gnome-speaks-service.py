@@ -4579,6 +4579,13 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
     _voices_cache = (None, 0.0)
     _VOICES_CACHE_TTL = 300  # 5 minutes
 
+    # /api/version payload, built once on the first request (see
+    # _handle_version).  No TTL: the git facts in it describe the code this
+    # process loaded, so they cannot change while it runs.  ThreadingHTTPServer
+    # can land two pollers at once, hence the lock.
+    _version_cache = None
+    _version_cache_lock = threading.Lock()
+
     def log_message(self, format, *args):
         """Route HTTP log messages through the existing logger instead of stderr."""
         log.debug("HTTP %s", format % args)
@@ -4855,7 +4862,27 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_version(self):
         """GET /api/version — realm-sigil version contract (falls back to a
-        minimal payload when realm-sigil isn't installed)."""
+        minimal payload when realm-sigil isn't installed).
+
+        The payload is built once and reused.  hash/branch/dirty describe the
+        code this process loaded and cannot change while it runs, so deriving
+        them per request forked three git processes — one of them a full
+        working-tree scan — on every poll of the status board (#53).  Only
+        `uptime` is live, and it is refreshed *in place* so the key order the
+        realm-sigil contract ships with is untouched.
+        """
+        cls = SpeechHTTPHandler
+        with cls._version_cache_lock:
+            if cls._version_cache is None:
+                cls._version_cache = self._build_version_payload()
+            payload = dict(cls._version_cache)
+        payload["uptime"] = int(time.time() - _SERVICE_START_TIME)
+        self._send_json(payload)
+
+    @staticmethod
+    def _build_version_payload():
+        """The once-per-process half of /api/version: three git reads, the
+        realm-sigil call, and the host facts."""
         import socket as _socket
         repo_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -4891,7 +4918,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             payload = {"name": "gnome-speaks", "version": hash_,
                        "hash": hash_, "branch": branch, "dirty": dirty,
                        "uptime": uptime}
-        self._send_json(payload)
+        return payload
 
     def _handle_status(self):
         svc = self.service

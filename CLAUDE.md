@@ -207,7 +207,9 @@ No test suite. Validate changes by:
    `lucid-service-audit-repros` (queue invariants, dispatch gate, config),
    `lucid-chronicle-perf-repros` (chronicle contract, archive, HTTP endpoints),
    `lucid-cancel-tokens-repros` (cancel-token verdicts, stop vs stop_listening),
-   `morpheus-injector-seam-repros` (Injector seam, IbusInjector). They import the service by
+   `morpheus-injector-seam-repros` (Injector seam, IbusInjector),
+   `lucid-version-cache-repros` (/api/version fork storm + realm-sigil contract).
+   They import the service by
    path and need no running service, D-Bus, mic or port 7710. Run the suite(s) covering the
    area you touched before opening a PR.
 
@@ -225,6 +227,7 @@ No test suite. Validate changes by:
    GS_SVC_PATH=$SVC       python3 lucid-cancel-tokens-repros/verify_cancel_invariants.py
    GS_SVC_PATH=$SVC       python3 morpheus-injector-seam-repros/verify_injector_seam.py
    GS_WT=$(dirname $SVC)  python3 morpheus-injector-seam-repros/verify_ibus_injector.py
+   GS_SVC_PATH=$SVC       python3 lucid-version-cache-repros/verify_version_cache.py
    ```
 
    `verify_ibus_injector.py` is the exception: it imports `ibus_injector` as a module rather
