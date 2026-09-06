@@ -756,6 +756,13 @@ class IbusInjector(Injector):
         # whitespace-join rule can stop it doubling a separator.
         return self.commit(text)
 
+    def finalize(self, text):
+        # The partials only ever lived in the pre-edit, and end() clears that
+        # region rather than committing it -- so a keep-live-text utterance
+        # must be committed here or it never reaches the field (#45). The
+        # engine's commit clears the pre-edit first, so nothing doubles.
+        return self.commit(text)
+
     def press_enter(self):
         # A KEY EVENT. commit_text("\n") puts a newline character in the field
         # and no shell ever runs the command, so this must not be a commit.

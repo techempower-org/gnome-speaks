@@ -53,6 +53,18 @@ class Injector:
         """
         return True
 
+    def finalize(self, text):
+        """The utterance is over and `text` is its final form; make the live
+        text stick.
+
+        Called by the keep-live-text path (loop mode, skip_final_paste)
+        instead of `commit`, because the caller has already been showing
+        `text` provisionally.  A key-event backend really typed it, so there
+        is nothing left to do -- this default.  A pre-edit backend has only
+        ever shown it in a volatile region that `end()`/`cancel()` DISCARD,
+        so it must commit here or the whole utterance vanishes (#45).
+        """
+
     def end(self):
         """Finish the current utterance cleanly. MUST be idempotent."""
 
