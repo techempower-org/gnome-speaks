@@ -177,6 +177,31 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
   actually reached the cursor outranks both (an error notification next to text landing under the
   cursor is a lie about the outcome). Keep the ranking in one place if a third failure is added.
 
+- **A pinned injector must also be RELEASED**: the STT cycle pins `inj = get_injector()` so a
+  mid-utterance "cast typing engine" cannot retract with the wrong backend (#46) -- but the pin
+  is only half of it. `get_injector()` rebuilds on the config flip and merely `cancel()`s the
+  outgoing backend, and the spell thread triggers that rebuild immediately (it reads
+  `get_injector().name` for its reply). The cycle then keeps typing through the pin, and every
+  text path runs `_ensure_session()` -> `acquire()`, so the *cancelled* backend RE-ACQUIRES --
+  and it is no longer the process-wide `_injector`, so no later rebuild will ever cancel it
+  again. The idle hook (`_set_state('idle')` -> `get_injector().end()`) ends the CURRENT
+  backend, which is now a different object. Result: a stranded input method until
+  `SESSION_MAX_SECONDS = 120`. So `end()` the outgoing backend at the re-pin, and the pinned one
+  in the post-loop cleanup.
+  ⚠️ Release once per SESSION, not per cycle -- `inj.end()` every cycle forces a restore plus a
+  0.4 s `FOCUS_WAIT` re-acquire on every loop utterance.
+  ⚠️ The release must stay BELOW every path that delivers text -- the final
+  `finalize`/`paste`/`commit`, and the latched dead-recorder verdict, which delivers through that
+  same path before it reports. `end()` FLUSHES the coalescer and `cancel()` DISCARDS it, so
+  releasing with the wrong one, or above the delivery, truncates the utterance the report is
+  promising it kept.
+  ⚠️ Anything the cycle hands the backend to must be given the PIN, not `get_injector()` --
+  `_LiveTyper` types off the WS receive thread and resolved its own backend per hypothesis.
+  ⚠️ And touch a backend's attributes through `getattr(..., default)` on this path. `name` has a
+  default on the `Injector` base exactly so a partial backend degrades instead of crashing; an
+  unguarded `inj.name` in the swap's *log line* raised AttributeError out of the whole STT cycle
+  -- nothing recognized, nothing typed, on the ordinary healthy-Azure path.
+
 - **ydotool stuck keys**: If a ydotool command is interrupted between key-down and key-up, the virtual device retains that key as pressed. The service auto-restarts `ydotoold` to recover. Scripts: `fix-ydotool.sh`, `install-ydotool.sh`.
 - **pw-record ignores SIGTERM**: Must use SIGKILL (`proc.kill()`) to stop PipeWire recorder processes.
 - **Half-duplex drain**: On speakers, 0.5s delay after TTS before opening mic to prevent echo pickup.

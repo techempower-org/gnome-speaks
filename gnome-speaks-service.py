@@ -1048,11 +1048,18 @@ class _LiveTyper:
     `typed_holder[0]` remains the on-screen source of truth for the final
     commit arithmetic.  Only the worker writes it while the cycle is open;
     read it only after close() has joined the worker.
+
+    `injector` is the backend PINNED by the cycle that owns this worker, not
+    `get_injector()`.  A "cast typing engine" mid-utterance rebuilds the
+    process-wide backend, and the half-typed hypothesis on screen belongs to
+    the old one -- resolving the backend here would retract it with the new
+    one (#46).
     """
 
-    def __init__(self, typed_holder, log_fn):
+    def __init__(self, typed_holder, log_fn, injector):
         self._typed = typed_holder
         self._log = log_fn
+        self._inj = injector
         self._cv = threading.Condition()
         self._pending = None
         self._closed = False
@@ -1093,7 +1100,7 @@ class _LiveTyper:
             if text == self._typed[0]:
                 continue
             try:
-                get_injector().replace_text(self._typed[0], text)
+                self._inj.replace_text(self._typed[0], text)
                 self._typed[0] = text
             except Exception as exc:
                 # Screen state is unknown now; keep the last value we are
@@ -2509,6 +2516,7 @@ class GnomeSpeaksService:
         # cleanup after it reads this flag.
         recorder_dead = threading.Event()
         failed = None
+        inj = None           # pinned backend; bound below, released in cleanup
         try:
             # 2. Get persistent WebSocket (with exponential backoff retry).
             ws = None
@@ -2544,9 +2552,13 @@ class GnomeSpeaksService:
                     _ws_backoff *= 2
 
             # --- Mode flags (stable across cycles) ---
+            # Pin the injection backend. Everything this cycle puts in front
+            # of the cursor goes through `inj`, never through a fresh
+            # get_injector() -- see the re-pin at the top of the loop.
+            inj = get_injector()
             live_typing = (CONFIG.get("dictation_mode", True)
                            and not CONFIG.get("conversation_mode", False)
-                           and get_injector().available())
+                           and inj.available())
             # Wake gate (spec §4.3): ONE verdict per session, taken before the
             # first partial is typed. Gating only the final paste left
             # live-typed partials and the Keep-Live-Text path
@@ -2578,6 +2590,38 @@ class GnomeSpeaksService:
                         _log(f"trimmed {dropped} inter-cycle frames")
                 # Pick up a mid-session Loop toggle in BOTH directions.
                 is_loop = CONFIG.get("continuous_dictation", False)
+
+                # Re-pin between utterances -- and ONLY between utterances.
+                # "cast typing engine" flips CONFIG['injection_method'] on the
+                # spell thread; get_injector() would then hand the NEW backend
+                # the job of retracting text the OLD one typed (ibus->ydotool
+                # sends real Backspaces into the user's document, ydotool->ibus
+                # leaves the incantation on screen -- #46).
+                #
+                # The rebuild only cancel()s the outgoing backend, and every
+                # text path re-acquires (_ensure_session -> acquire), so the
+                # backend being dropped has to be handed back HERE or it sits
+                # on the user's input method until SESSION_MAX_SECONDS. end()
+                # is idempotent (injector.py), and gating on an actual identity
+                # change keeps the 0.4 s FOCUS_WAIT re-acquire off the common
+                # no-swap path.
+                nxt = get_injector()
+                if nxt is not inj:
+                    # getattr, not attribute access: `name` has a default on
+                    # the Injector base precisely so a partial backend
+                    # degrades instead of crashing (injector.py). Taking the
+                    # whole STT cycle down for a LOG LINE is the worst
+                    # possible trade, and this line sits on a path whose only
+                    # job is to hand a backend back cleanly.
+                    _log(f"injection backend swapped mid-session: "
+                         f"{getattr(inj, 'name', '?')} -> "
+                         f"{getattr(nxt, 'name', '?')}")
+                    try:
+                        inj.end()
+                    except Exception:
+                        log.debug("Outgoing injector end() failed", exc_info=True)
+                    inj = nxt
+
                 _log(f"=== cycle {cycle} (loop={is_loop}) ===")
 
                 # 3. Init new WS session for this utterance
@@ -2608,7 +2652,7 @@ class GnomeSpeaksService:
                 raw_frames = []
                 typed_partial = [""]
                 raw_partial = [""]
-                typer = _LiveTyper(typed_partial, _log) if live_typing else None
+                typer = _LiveTyper(typed_partial, _log, inj) if live_typing else None
 
                 # 5. Sender thread: calibrate noise, send audio with VAD.
                 #    A new sender thread is created each cycle, but the same proc
@@ -2858,7 +2902,7 @@ class GnomeSpeaksService:
                 if cancel_token.cancelled:
                     _log(f"cancelled — discarding transcript ({len(user_text)} chars)")
                     if live_typing and typed_partial[0]:
-                        get_injector().send_backspaces(len(typed_partial[0]))
+                        inj.send_backspaces(len(typed_partial[0]))
                         typed_partial[0] = ""
                     GLib.idle_add(self._emit_transcription_ready, "")
                     user_text = ""
@@ -2895,7 +2939,7 @@ class GnomeSpeaksService:
                 # the mic closes (never TTS over an open mic).
                 if user_text and self._try_cast(user_text):
                     if live_typing and typed_partial[0]:
-                        get_injector().send_backspaces(len(typed_partial[0]))
+                        inj.send_backspaces(len(typed_partial[0]))
                     GLib.idle_add(self._emit_transcription_ready, user_text)
                     if (is_loop and not _stopping()
                             and not recorder_dead.is_set()
@@ -2922,7 +2966,7 @@ class GnomeSpeaksService:
                 if (is_loop and not user_text and not _stopping()
                         and not recorder_dead.is_set()):
                     if live_typing and typed_partial[0]:
-                        get_injector().send_backspaces(len(typed_partial[0]))
+                        inj.send_backspaces(len(typed_partial[0]))
                     _log("no speech in loop cycle, continuing")
                     # Quiet cycle = natural gap for starved queue items (agent
                     # messages, spell replies) to play before the mic reopens.
@@ -2938,7 +2982,7 @@ class GnomeSpeaksService:
                     # Conversation mode: send to LLM then speak response
                     if CONFIG.get("conversation_mode", False):
                         if live_typing:
-                            get_injector().send_backspaces(len(typed_partial[0]))
+                            inj.send_backspaces(len(typed_partial[0]))
                             time.sleep(0.02)
                         self._conversation_worker(user_text)
                         if not CONFIG.get("continuous_dictation", False):
@@ -2951,7 +2995,6 @@ class GnomeSpeaksService:
                         if wake_blocked:
                             pass  # refused at session start; nothing was live-typed either
                         elif live_typing and (is_loop or CONFIG.get("skip_final_paste", False)):
-                            inj = get_injector()
                             if is_loop and typed_partial[0]:
                                 # Final correction: if Azure's final differs from what
                                 # was live-typed, surgically fix the divergent tail.
@@ -2967,19 +3010,19 @@ class GnomeSpeaksService:
                             # that end() would DISCARD at idle, so commit it (#45).
                             inj.finalize(user_text)
                         elif live_typing:
-                            get_injector().send_backspaces(len(typed_partial[0]))
+                            inj.send_backspaces(len(typed_partial[0]))
                             time.sleep(0.02)
-                            get_injector().paste(user_text)
+                            inj.paste(user_text)
                         else:
-                            get_injector().commit(user_text)
+                            inj.commit(user_text)
                     else:
                         if live_typing and typed_partial[0]:
-                            get_injector().send_backspaces(len(typed_partial[0]))
+                            inj.send_backspaces(len(typed_partial[0]))
                         clipboard_write(user_text)
                 else:
                     log.info("No speech detected")
                     if live_typing and typed_partial[0]:
-                        get_injector().send_backspaces(len(typed_partial[0]))
+                        inj.send_backspaces(len(typed_partial[0]))
                     GLib.idle_add(self._emit_transcription_ready, "")
 
                 # 10. Decide whether to loop or exit.  A dead recorder ends
@@ -3008,6 +3051,28 @@ class GnomeSpeaksService:
             # ---------------------------------------------------------------
             tap.close()
             self._reap_recorder(proc)
+            # Hand the pinned backend back. Safe here, and only here: every
+            # path that delivers text has already run by the time the cycle
+            # loop is left -- step 9's finalize/paste/commit, and #57's
+            # latched dead-recorder verdict, which delivers through that same
+            # path and only then reports. end() FLUSHES the IBus coalescer
+            # ("flush what is buffered, then hand the IME back"); cancel() is
+            # the one that discards.
+            #
+            # It cannot be left to the idle hook: that ends whatever
+            # get_injector() returns NOW, which after a mid-session swap is a
+            # different object from the one this cycle typed through -- and
+            # that one would hold the user's input method until
+            # SESSION_MAX_SECONDS. Once per session, not per cycle: on the
+            # no-swap path this is the same object the idle hook is about to
+            # end anyway and end() is idempotent, whereas ending every cycle
+            # would force a restore + 0.4 s FOCUS_WAIT re-acquire on each
+            # loop utterance.
+            if inj is not None:
+                try:
+                    inj.end()
+                except Exception:
+                    log.debug("Pinned injector end() failed", exc_info=True)
 
         # Reported ONCE per session, and only here: after every exit above
         # has already delivered whatever Azure did recognize.  A mic yanked
