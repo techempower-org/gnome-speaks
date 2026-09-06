@@ -2984,7 +2984,7 @@ class GnomeSpeaksService:
                         if live_typing:
                             inj.send_backspaces(len(typed_partial[0]))
                             time.sleep(0.02)
-                        self._conversation_worker(user_text)
+                        self._conversation_worker(user_text, inj)
                         if not CONFIG.get("continuous_dictation", False):
                             self._save_config_flag("conversation_mode", False)
                         # _conversation_worker handles its own restart/warmup
@@ -4365,10 +4365,18 @@ class GnomeSpeaksService:
 
     # -- Streaming LLM response with incremental TTS ----------------------
 
-    def _stream_conversation_worker(self, user_text):
+    def _stream_conversation_worker(self, user_text, inj=None):
         """Stream LLM response and start TTS on each complete sentence.
 
         Uses the unified llm_stream library for all providers (including bedrock).
+
+        `inj` is the caller's PINNED backend when there is one. The streaming
+        cycle calls this synchronously from inside its pinned scope (the line
+        above the call is `inj.send_backspaces(...)`), so the `<type>` paste
+        below belongs to that utterance and must use that utterance's backend
+        -- the same rule that put the pin into _LiveTyper (#46/#61). Callers
+        with no pin (the batch/offline `_deliver_stt_result`) pass nothing and
+        get the current backend, which is correct for them.
         """
         # AI replies are user-initiated speech: hold the agent speech queue
         # for the whole turn (LLM streaming + sentence TTS).
@@ -4580,7 +4588,11 @@ class GnomeSpeaksService:
                 if type_text and not (cancel_token is not None
                                       and cancel_token.cancelled):
                     log.info("Typing %d chars at cursor (from streamed reply)", len(type_text))
-                    get_injector().paste(type_text)
+                    # The utterance's backend, not whatever is current: a
+                    # "cast typing engine" mid-reply rebuilds the process-wide
+                    # injector, and this paste belongs to the cycle that is
+                    # still holding the old one.
+                    (inj or get_injector()).paste(type_text)
                 elif type_text:
                     log.info("AI reply cancelled — %d chars NOT typed",
                              len(type_text))
@@ -4613,16 +4625,21 @@ class GnomeSpeaksService:
 
     # -- Conversation worker ------------------------------------------------
 
-    def _conversation_worker(self, user_text):
+    def _conversation_worker(self, user_text, inj=None):
         """Send transcribed text to an LLM and speak the response.
 
         All providers (including bedrock) now stream via llm_stream.
+
+        `inj`: see _stream_conversation_worker. Optional and TRAILING on
+        purpose -- five repros across two suites call this as
+        `Thread(target=svc._conversation_worker, args=(text,))`, and a
+        required or leading parameter would break every one of them.
         """
         if not stream_chat:
             GLib.idle_add(self._emit_error, "LLM streaming library not available (llm_stream not found)")
             self._set_state("idle")
             return
-        return self._stream_conversation_worker(user_text)
+        return self._stream_conversation_worker(user_text, inj)
 
     def _load_cca_config(self):
         """Load cloud-chat-assistant config."""
