@@ -17,13 +17,9 @@ Run any repro with:
     GS_SVC_PATH=<path to a gnome-speaks-service.py> python3 <script>
 exit 0 = clean, exit 1 = bug present.
 """
-import atexit
-import contextlib
-import glob
 import importlib.util
 import json
 import os
-import shutil
 import sys
 import time
 
@@ -78,50 +74,20 @@ SVC_DEFAULT = os.path.join(REPO_ROOT, "gnome-speaks-service.py")
 # and it read exactly like a service regression.
 SCRATCH_ROOT = os.path.join(REPO_ROOT, "tmp", "repros")
 
+# The shared isolation core (#90). Five harnesses carried a byte-identical copy
+# of it; a correction to the contract had to be made five times.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import isolation  # noqa: E402
+
+
 SVC_PATH = os.environ.get("GS_SVC_PATH", SVC_DEFAULT)
 WT = os.environ.get("GS_WT") or os.path.dirname(os.path.abspath(SVC_PATH))
 
 # get(), never setdefault(): setdefault EXPORTS the path, so any child python
 # this suite spawns would inherit the PARENT's dir and its atexit would delete
 # the still-running parent's scratch out from under it.
-_PINNED = os.environ.get("GS_REPRO_SCRATCH")
-SCRATCH = _PINNED or os.path.join(SCRATCH_ROOT, f"deadrec-repros-{os.getpid()}")
-STATE_DIR = os.path.join(SCRATCH, "state")
-os.environ["XDG_STATE_HOME"] = STATE_DIR        # BEFORE the module computes
-                                                # CHRONICLE_PATH from it
-if _PINNED is None:
-    # Only ever reset and remove a directory THIS process created. A dir the
-    # caller pinned belongs to the caller.
-    shutil.rmtree(SCRATCH, ignore_errors=True)  # a verdict must never depend
-    atexit.register(shutil.rmtree, SCRATCH, True)   # on who ran here before
-os.makedirs(STATE_DIR, exist_ok=True)
-
-
-def _sweep_stale_scratch():
-    """Remove scratch dirs whose owning process is gone.
-
-    atexit does NOT run when `timeout` SIGTERMs a run, which is exactly how
-    these are usually killed -- so the PID-keyed dirs accumulate. Only a dir
-    whose PID no longer exists is touched, so a live sibling run is never
-    swept out from under itself.
-    """
-    import re
-    for d in glob.glob(os.path.join(os.path.dirname(SCRATCH), "*-repros-*")):
-        m = re.search(r"-repros-(\d+)$", d)
-        if not m or d == SCRATCH:
-            continue
-        try:
-            os.kill(int(m.group(1)), 0)      # signal 0: liveness probe only
-        except ProcessLookupError:
-            shutil.rmtree(d, ignore_errors=True)
-        except PermissionError:
-            pass                              # someone else's live process
-        except Exception:
-            pass
-
-
-_sweep_stale_scratch()
-os.environ.setdefault("SPEECH_ENGINE_PATH", os.path.expanduser("~/Projects/speech-to-cli"))
+SCRATCH, STATE_DIR = isolation.setup_scratch("deadrec-repros", SCRATCH_ROOT)
+isolation.sweep_stale_scratch(SCRATCH)
 
 
 class RecordingInjector:
@@ -207,109 +173,16 @@ class RecordingInjector:
 
 # Every key below is pinned because a repro's verdict depends on it. Nothing
 # here may be read from JP's live config -- see the ISOLATION note above.
-CONFIG_PINS = {
-    "key": "test-key",              # speak() bails out early without one
-    "wake_word": False,             # the wake watcher must never open the mic
-    "wake_word_model": "",
-    "wake_word_secure_gate": False, # #55: gates live_typing for the session
-    "continuous_dictation": False,  # is_loop -- picks the whole cycle shape
-    "conversation_mode": False,
-    "dictation_mode": True,
-    "terminal_mode": False,         # use_lexical: rewrites text before asserts
-    "skip_final_paste": False,      # picks finalize() vs paste() in step 9
-    "injection_method": "ydotool",
-    "read_notifications": False,
-    "llm_thinking": False,
-    "spiel_provider": False,        # a second D-Bus name on the session bus
-    "debug": False,                 # else every run appends to /tmp/speech-debug.log
-    "live_subtitles": False,
-    "phrase_list": [],
-    "wyoming_host": "",             # no LAN fallback from a test
-    "chronicle": False,
-}
+CONFIG_PINS = dict(isolation.CONFIG_PINS)
 
-
-
-REAL_STATE = os.path.join(os.path.expanduser("~/.local/state"), "gnome-speaks")
-
-
-
-@contextlib.contextmanager
-def config_scope(mod, **overrides):
-    """Run ONE scenario with its own CONFIG flags, restored afterwards.
-
-    Every load() in a process hands back the SAME dict -- `from state import
-    CONFIG` binds one shared object across the service, audio, stt, speech_tts
-    and wyoming -- so two scenarios in one process silently clobber each
-    other's flags, and the second one's verdict describes the first one's
-    configuration. Snapshot/restore rather than forking, so the repro stays
-    debuggable in one process:
-
-        with harness.config_scope(mod, continuous_dictation=True):
-            ...                      # loop-mode scenario
-        # flags are back to the pinned baseline here
-    
-
-    Three traps a scenario can hit that produce a GREEN run while measuring the
-    WRONG code path -- all three found by lucid-pin-lifecycle, and all three
-    cost an hour each to rediscover:
-
-    1. `_reload_config_flags()` restores conversation_mode=False at
-       start_listening(), so a conversation-mode scenario silently takes the
-       DICTATION path (send_backspaces + paste), the reply path never runs, and
-       the repro still prints a paste and looks like it passed. The CONFIG_PATH
-       redirect in _isolate_config() closes this -- the reload re-reads OUR
-       file and re-applies OUR pins -- but only for flags that are IN
-       CONFIG_PINS. Put a scenario's flags there or in config_scope(), never in
-       a bare CONFIG[...] assignment after load().
-    2. In SINGLE-SHOT, turn_end sets _stop_event and
-       _stream_conversation_worker aborts on it before stream_chat is ever
-       called. Any reply-path scenario needs loop mode, and should assert
-       stream_chat was actually invoked so it cannot pass while testing
-       something else.
-    3. Production calls _conversation_worker SYNCHRONOUSLY from inside
-       _streaming_stt_cycle, so the cycle's `finally` -- and its injector
-       release -- runs after the reply. A scenario that starts the worker on
-       its OWN thread has no such release and will report a stranded backend
-       that production does not have.
-    """
-    saved = dict(mod.CONFIG)
-    mod.CONFIG.update(overrides)
-    try:
-        yield mod.CONFIG
-    finally:
-        mod.CONFIG.clear()
-        mod.CONFIG.update(saved)
+# Re-exported so callers keep working: subtitle_spy delegates its PATH checks
+# to harness.assert_isolated() and adds the "pins actually took" half, and
+# repros call harness.config_scope() directly.
+config_scope = isolation.config_scope
 
 
 def assert_isolated(mod):
-    """Prove the module under test cannot reach JP's live state, BEFORE any
-    scenario runs.
-
-    CHRONICLE_PATH is computed at MODULE IMPORT from $XDG_STATE_HOME, so this
-    only holds if the env var was set before exec_module -- which is easy to
-    break by moving an import. The chronicle archive and the rotated
-    generations are derived from CHRONICLE_PATH at call time, so pinning it
-    pins them too. Raises rather than warns: a repro that has quietly attached
-    itself to the real ledger must not be allowed to report a verdict.
-    """
-    root = os.path.realpath(SCRATCH)
-    checks = {
-        "CHRONICLE_PATH": getattr(mod, "CHRONICLE_PATH", None),
-        "CONFIG_PATH": getattr(mod, "CONFIG_PATH", None),
-        "XDG_STATE_HOME": os.environ.get("XDG_STATE_HOME"),
-    }
-    for name, value in checks.items():
-        if value is None:
-            raise AssertionError(f"{name} is unset -- cannot prove isolation")
-        real = os.path.realpath(value)
-        if not (real == root or real.startswith(root + os.sep)):
-            raise AssertionError(
-                f"{name}={value!r} resolves OUTSIDE the isolated scratch "
-                f"{SCRATCH!r} -- refusing to run")
-        if os.path.realpath(REAL_STATE) in (real, os.path.dirname(real)):
-            raise AssertionError(f"{name} points at JP's live state dir")
-    return True
+    return isolation.assert_isolated(mod, SCRATCH)
 
 
 def _isolate_config(mod):
@@ -346,7 +219,7 @@ def load(fake_tts_seconds=1.0):
     sys.modules["gsvc_under_test"] = mod
     spec.loader.exec_module(mod)  # main() is __main__-guarded; nothing starts
 
-    _isolate_config(mod)   # BEFORE anything reads CONFIG
+    isolation.isolate_config(mod, SCRATCH, CONFIG_PINS)   # BEFORE anything reads CONFIG
     assert_isolated(mod)   # and prove it, before any scenario
 
     # Pin the delivery path: this file is loaded from JP's real config.json,
