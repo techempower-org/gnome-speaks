@@ -643,35 +643,48 @@ def _chronicle_find(entry_id):
 # Clipboard helpers (our own — do not import from speech-to-cli)
 # ---------------------------------------------------------------------------
 
-def _read_via(cmds, label):
-    """Read text with the first of `cmds` that exists (Wayland-first, X11
-    fallback).
+def _run_first_available(cmds, timeout, label):
+    """Run each of `cmds` in turn, yielding the result of every one that RAN.
 
-    The clipboard and the PRIMARY selection differ only in which tools to ask
-    and what to call the failure in the log -- everything else (the 5 s
-    timeout, "returncode 0 means the text is stdout verbatim", falling through
-    on FileNotFoundError, and "" when nothing worked) is the same contract.
-    Deliberately returns stdout UNSTRIPPED: callers that want it trimmed do
-    their own trimming, and one of them also truncates.
+    The genuinely shared part of the THREE selection readers: try the Wayland
+    tool, fall through to the X11 one when it is not installed, give up on one
+    that hangs.
+
+    It YIELDS rather than deciding, because the callers do not agree on what
+    counts as success and that test sits INSIDE the loop:
+
+      clipboard_read       timeout 5, exit 0 wins outright, stdout VERBATIM, ""
+      selection_read       timeout 5, ditto, PRIMARY selection
+      _get_clipboard_text  timeout 1, exit-0-but-EMPTY means TRY THE NEXT
+                           TOOL, result STRIPPED and truncated to 200, None
+
+    Deciding here would need a per-caller flag, which is the tell that the
+    thing was never shared. So the loop is shared and the verdict is not.
     """
     for cmd in cmds:
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                return result.stdout
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=timeout)
         except FileNotFoundError:
             continue
         except subprocess.TimeoutExpired:
             log.debug("%s read timed out: %s", label, cmd[0])
-    return ""
+            continue
+        yield result
+
+
+_CLIPBOARD_CMDS = [["wl-paste", "--no-newline"],
+                   ["xclip", "-selection", "clipboard", "-o"]]
+_PRIMARY_CMDS = [["wl-paste", "--primary", "--no-newline"],
+                 ["xclip", "-selection", "primary", "-o"]]
 
 
 def clipboard_read():
     """Read text from the clipboard (Wayland-first, X11 fallback)."""
-    return _read_via(
-        [["wl-paste", "--no-newline"],
-         ["xclip", "-selection", "clipboard", "-o"]],
-        "Clipboard")
+    for result in _run_first_available(_CLIPBOARD_CMDS, 5, "Clipboard"):
+        if result.returncode == 0:
+            return result.stdout
+    return ""
 
 
 def clipboard_write(text):
@@ -1169,10 +1182,10 @@ def _terminal_lowercase(text):
 
 def selection_read():
     """Read the currently highlighted/selected text (PRIMARY selection)."""
-    return _read_via(
-        [["wl-paste", "--primary", "--no-newline"],
-         ["xclip", "-selection", "primary", "-o"]],
-        "Selection")
+    for result in _run_first_available(_PRIMARY_CMDS, 5, "Selection"):
+        if result.returncode == 0:
+            return result.stdout
+    return ""
 
 
 # Voice commands: spoken punctuation → actual characters
@@ -4283,13 +4296,12 @@ class GnomeSpeaksService:
 
     def _get_clipboard_text(self):
         """Get clipboard text (Wayland first, X11 fallback), truncated to 200 chars."""
-        for cmd in [["wl-paste", "--no-newline"], ["xclip", "-selection", "clipboard", "-o"]]:
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=1)
-                if result.returncode == 0 and result.stdout.strip():
-                    return result.stdout.strip()[:200]
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                continue
+        # Its own timeout (1 s, not 5), its own success test (an exit-0 but
+        # EMPTY read means "try the next tool" here), its own sentinel (None,
+        # not ""), and its own trimming. Only the loop is shared.
+        for result in _run_first_available(_CLIPBOARD_CMDS, 1, "Clipboard"):
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()[:200]
         return None
 
     def _build_context(self, user_text):
