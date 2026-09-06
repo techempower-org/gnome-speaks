@@ -1456,6 +1456,12 @@ class CancelRegistry:
 
     Lock order: the registry never calls back into the service, so its lock is
     always innermost (``_queue_current_lock -> registry`` is safe).
+
+    This class is the ONLY place in the service that touches
+    ``state._cancel_event``.  Everywhere else reads a token, so
+    ``grep -n "_cancel_event" gnome-speaks-service.py`` returning only this
+    class and prose is a usable check that no verdict is being taken from the
+    wire again (issue #42).
     """
 
     def __init__(self):
@@ -3348,20 +3354,33 @@ class GnomeSpeaksService:
         """Emit AudioLevel from TTS audio stream for badge VU effect."""
         GLib.idle_add(self._emit_audio_level, level)
 
-    def _run_subtitle_progress(self, text, estimated_duration, stop_event):
+    def _run_subtitle_progress(self, text, estimated_duration, stop_event,
+                               token):
         """Emit SubtitleUpdate signals every 200ms during TTS playback.
 
         Runs in a daemon thread alongside TTS. Respects pause and cancel.
+
+        The cancel it respects is its OWN utterance's verdict, never the
+        process-global wire (``state._cancel_event``). The wire belongs to
+        whichever operation last called ``CancelRegistry.begin()``, so reading
+        it here meant two wrong answers: another operation's cancel froze this
+        subtitle mid-word, and a later ``begin()`` lowering the wire let a
+        cancelled utterance still emit its 100 % "finished" frame. The token is
+        set once and never reset, so neither can happen (issue #42).
+
         Args:
             text: Full text being spoken.
             estimated_duration: Estimated speech duration in seconds.
             stop_event: threading.Event — set when TTS finishes.
+            token: CancelToken of the utterance being spoken — this thread's
+                only cancellation verdict. None means "no verdict available"
+                and is treated as not cancelled.
         """
         start_time = time.monotonic()
         pause_accumulated = 0.0
         pause_start = None
         while not stop_event.is_set():
-            if state._cancel_event.is_set():
+            if token is not None and token.cancelled:
                 break
             # Handle pause
             if state._pause_event.is_set():
@@ -3378,12 +3397,16 @@ class GnomeSpeaksService:
             GLib.idle_add(self._emit_subtitle_update, text, estimated_duration, pct)
             stop_event.wait(timeout=0.2)
 
-        # Final emission at 100%
-        if not state._cancel_event.is_set():
+        # Final emission at 100% — only if THIS utterance really finished.
+        if token is None or not token.cancelled:
             GLib.idle_add(self._emit_subtitle_update, text, estimated_duration, 100)
 
     def _subtitle_queue_worker(self, subtitle_q):
-        """Single subtitle thread that processes (text, duration) tuples from a queue.
+        """Single subtitle thread that processes subtitle items from a queue.
+
+        Items are ``(text, estimated_duration, stop_event, token)``; the token
+        travels with the sentence so each progress run judges by the reply's
+        own verdict rather than the shared wire (issue #42).
 
         Eliminates per-sentence thread creation overhead (~5-10ms each).
         Reads from subtitle_q until a None sentinel is received.
@@ -3392,8 +3415,9 @@ class GnomeSpeaksService:
             item = subtitle_q.get()
             if item is None:
                 break
-            text, estimated_duration, stop_event = item
-            self._run_subtitle_progress(text, estimated_duration, stop_event)
+            text, estimated_duration, stop_event, token = item
+            self._run_subtitle_progress(text, estimated_duration, stop_event,
+                                        token)
 
     def _speak_worker(self, text, voice=None, quality=None, output_file=None,
                       user_initiated=True, suppress_idle=False,
@@ -3437,7 +3461,7 @@ class GnomeSpeaksService:
             sub_stop = threading.Event()
             sub_thread = threading.Thread(
                 target=self._run_subtitle_progress,
-                args=(text, est_dur, sub_stop),
+                args=(text, est_dur, sub_stop, token),
                 daemon=True,
             )
             sub_thread.start()
@@ -3913,7 +3937,7 @@ class GnomeSpeaksService:
             sub_stop = threading.Event()
             sub_thread = threading.Thread(
                 target=self._run_subtitle_progress,
-                args=(text, est_dur, sub_stop),
+                args=(text, est_dur, sub_stop, token),
                 daemon=True,
             )
             sub_thread.start()
@@ -4330,7 +4354,12 @@ class GnomeSpeaksService:
             first_sentence = True
             spoke_anything = False
 
-            # Single subtitle thread for the entire conversation (Fix 7)
+            # Single subtitle thread for the entire conversation (Fix 7).
+            # cancel_token (issued at the first spoken sentence) rides the
+            # queue with every sentence, so a subtitle run judges by this
+            # reply's verdict and not the shared wire (issue #42). It is None
+            # until then, which _run_subtitle_progress reads as "not
+            # cancelled" — the same answer the wire gave before it is issued.
             subtitle_q = queue.Queue()
             subtitle_thread = threading.Thread(
                 target=self._subtitle_queue_worker,
@@ -4403,7 +4432,7 @@ class GnomeSpeaksService:
                     _sf = 22.0 if self._voice_quality == "fast" else 15.0
                     _sd = max(1.0, len(sentence) / _sf)
                     _ss = threading.Event()
-                    subtitle_q.put((sentence, _sd, _ss))
+                    subtitle_q.put((sentence, _sd, _ss, cancel_token))
                     speech_tts.tts(sentence, quality=self._voice_quality,
                                    speed=CONFIG.get("speed", 1.0),
                                    pitch=CONFIG.get("pitch", "default"),
@@ -4431,7 +4460,7 @@ class GnomeSpeaksService:
                 _sf = 22.0 if self._voice_quality == "fast" else 15.0
                 _sd = max(1.0, len(remainder) / _sf)
                 _ss = threading.Event()
-                subtitle_q.put((remainder, _sd, _ss))
+                subtitle_q.put((remainder, _sd, _ss, cancel_token))
                 speech_tts.tts(remainder, quality=self._voice_quality,
                                speed=CONFIG.get("speed", 1.0),
                                pitch=CONFIG.get("pitch", "default"),

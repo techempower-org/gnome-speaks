@@ -136,7 +136,10 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
   record this queue outcome, restart the loop — must read that operation's `CancelToken`, never the
   wire. Never reintroduce a bare `state._cancel_event.clear()` in a worker; go through
   `self._cancels` (`issue` → `begin` → `retire`), and retire on every exit or the token leaks into
-  the live set forever.
+  the live set forever. `CancelRegistry` is now the **only** place in the service that touches the
+  wire — #42 took the last two reads out of `_run_subtitle_progress` — so
+  `grep -n "_cancel_event" gnome-speaks-service.py` returning only that class and prose is a cheap
+  standing check that no new verdict is being read off the wire.
 - **`stop()` and `stop_listening()` both set `_stop_event` and mean opposite things**:
   `stop_listening()` is the dictation hotkey — end the utterance, **keep** the text.  `stop()` is the
   panic stop (D-Bus Stop, `POST /stop`, "cast stop", every user-speech preemption) — **abandon** it.
@@ -213,7 +216,11 @@ No test suite. Validate changes by:
    `lucid-service-audit-repros` (queue invariants, dispatch gate, config),
    `lucid-chronicle-perf-repros` (chronicle contract, archive, HTTP endpoints),
    `lucid-cancel-tokens-repros` (cancel-token verdicts, stop vs stop_listening),
-   `morpheus-injector-seam-repros` (Injector seam, IbusInjector). They import the service by
+   `lucid-subtitle-token-repros` (subtitle progress reads its utterance's token, not the wire;
+   e4 is the composed cycle-then-reply case),
+   `morpheus-injector-seam-repros` (Injector seam, IbusInjector),
+   `lucid-version-cache-repros` (/api/version fork storm + realm-sigil contract).
+   They import the service by
    path and need no running service, D-Bus, mic or port 7710. Run the suite(s) covering the
    area you touched before opening a PR.
 
@@ -229,8 +236,10 @@ No test suite. Validate changes by:
    GS_SVC_PATH=$SVC       python3 lucid-service-audit-repros/verify_queue_invariants.py
    GS_SVC_PATH=$SVC       python3 lucid-chronicle-perf-repros/verify_archive.py
    GS_SVC_PATH=$SVC       python3 lucid-cancel-tokens-repros/verify_cancel_invariants.py
+   bash lucid-subtitle-token-repros/run_all.sh $SVC
    GS_SVC_PATH=$SVC       python3 morpheus-injector-seam-repros/verify_injector_seam.py
    GS_WT=$(dirname $SVC)  python3 morpheus-injector-seam-repros/verify_ibus_injector.py
+   GS_SVC_PATH=$SVC       python3 lucid-version-cache-repros/verify_version_cache.py
    ```
 
    `verify_ibus_injector.py` is the exception: it imports `ibus_injector` as a module rather
