@@ -129,7 +129,28 @@ Both forms have bitten this tree, and the **silent** one is the dangerous half:
   least someone notices, usually when they gate CI on it.
 
 Same root cause: taking a pipeline's exit status as the answer to a question it
-never answered. `$?` after a pipe reads the LAST command, not the interesting
+never answered. `$?` after a pipe reads the LAST command, not the
+interesting one — that form once reported two red suites as green here.
+
+**It came back, in the one branch I hand-rolled instead of using my own fix.**
+After `summarise()` was written to capture-and-test, the prefs-rig branch of
+`run_all.sh` kept a private `grep -E 'EXIT_CLEAN|REGRESSION' | tail -1`. Neither
+pattern matches what the rig prints when it cannot *start*, so when prefs-rig
+became the one check that actually flaked, the runner reported `rc=1` followed
+by nothing at all — a red that named no reason, in the file whose job is to
+make a red legible. The fix existed three lines above the bug.
+
+Two rules came out of that, and both are asserted by control rather than
+assumed:
+
+* **`^!!` is matched first.** Suites emit `!! SETUP FAILURE` / `!! REGRESSION` /
+  `!! HARNESS DID NOT COMPLETE` for what a reader must not miss, and a run can
+  limp as far as a `[PASS]` line and *then* fail setup. If the case lines won,
+  that run would report the pass.
+* **A non-zero rc never prints a blank diagnostic.** The last-resort fallback
+  was `tail -1`, which returns empty on empty input — so "always prints a
+  diagnostic" was only *mostly* true until an explicit
+  `!! NO OUTPUT from <suite> (rc=N)` closed it. `$?` after a pipe reads the LAST command, not the interesting
 one — that form once reported two red suites as green here.
 
 ⚠️ **And do not "fix" this by reaching for `set -euo pipefail`, which is the

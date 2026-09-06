@@ -50,21 +50,62 @@ rc=0
 # exits 0 on empty input, so the first pattern always "succeeds" and every
 # summary comes out blank -- the same pipeline-exit-status trap that makes a
 # script ending in `diff` return 1 on success.
-summarise() {
+#
+# EXIT_CLEAN is prefs-rig's own "the run completed" marker and belongs with
+# the other roll-up verdicts; without it that line falls through to the
+# generic tail -1 and reports the stderr-delta line instead of the verdict.
+#
+# `^!!` is FIRST on purpose. A suite emits `!! SETUP FAILURE` / `!! REGRESSION`
+# / `!! HARNESS DID NOT COMPLETE` for the things a reader must not miss, and a
+# run can limp as far as a `[PASS]` line and THEN fail setup -- if the case
+# lines won, that run would report the pass.
+summarise() {   # summarise <output> <label> <rc>
     _s_out=""
-    for _s_pat in '^\[(PASS|FAIL)\]' '^(PASS|FAIL|RESULT):' '^(all checks passed|FAILURES:|ALL )'; do
+    for _s_pat in '^!!' '^\[(PASS|FAIL)\]' '^(PASS|FAIL|RESULT):' \
+                  '^(all checks passed|FAILURES:|ALL |EXIT_CLEAN)'; do
         _s_out=$(printf '%s\n' "$1" | grep -E "$_s_pat" | tail -1)
         if [ -n "$_s_out" ]; then printf '%s\n' "$_s_out"; return; fi
     done
-    printf '%s\n' "$1" | tail -1
+    _s_out=$(printf '%s\n' "$1" | tail -1)
+    if [ -n "$_s_out" ]; then printf '%s\n' "$_s_out"; return; fi
+    # THE INVARIANT: a non-zero rc must never print a blank diagnostic. The
+    # fallback above is `tail -1`, which returns EMPTY on empty input -- so
+    # without this line "always prints a diagnostic" was only mostly true, and
+    # a red with nothing after it is the red people learn to skim.
+    printf '!! NO OUTPUT from %s (rc=%s)\n' "$2" "$3"
 }
-line() { printf '%-16s %-34s rc=%s  %s\n' "$1" "$2" "$3" "$(summarise "$4" | cut -c1-80)"; }
+
+# Exit codes are a contract, and the summary counts them separately so "green"
+# means exactly one thing: 0 clean · 1 the defect is present · 2 SETUP FAILURE
+# (the check could not run, so it reports neither a pass nor a bug) · 3 the
+# harness did not complete. 2 and 3 still fail the gate -- a gate that goes
+# green on a check that never executed is measuring the absence of the test --
+# but they are labelled and counted apart from a real red.
+n_pass=0; n_fail=0; n_setup=0; n_incomplete=0
+tally() {
+    case "$1" in
+        0) n_pass=$((n_pass + 1)) ;;
+        2) n_setup=$((n_setup + 1)); rc=1 ;;
+        3) n_incomplete=$((n_incomplete + 1)); rc=1 ;;
+        *) n_fail=$((n_fail + 1)); rc=1 ;;
+    esac
+}
+line() {
+    case "$3" in
+        0) _l_tag="" ;;
+        2) _l_tag="  [SETUP FAILURE]" ;;
+        3) _l_tag="  [HARNESS INCOMPLETE]" ;;
+        *) _l_tag="" ;;
+    esac
+    tally "$3"
+    printf '%-16s %-34s rc=%s%s  %s\n' "$1" "$2" "$3" "$_l_tag" \
+        "$(summarise "$4" "$1/$2" "$3" | cut -c1-80)"
+}
 
 run() {   # run <suite> <script>...
     suite="$1"; shift
     for f in "$@"; do
         out=$(cd "$HERE/$suite" && timeout 300 python3 "$f" 2>/dev/null); st=$?
-        [ $st -ne 0 ] && rc=1
         line "$suite" "$f" "$st" "$out"
     done
 }
@@ -102,7 +143,7 @@ run version-cache  verify_version_cache.py repro_a_fork_storm.py
 # ---------------------------------------------------------------------------
 for c in A B C D E F G H I; do
     out=$(cd "$HERE/offline-handoff" && timeout 300 python3 repro_offline_handoff.py "$c" 2>/dev/null)
-    st=$?; [ $st -ne 0 ] && rc=1
+    st=$?
     line offline-handoff "case $c" "$st" "$out"
 done
 
@@ -124,9 +165,14 @@ if [ -x "$HERE/prefs-rig/run.sh" ] && command -v gjs >/dev/null 2>&1; then
     ref=$(git -C "$REPO" merge-base origin/main HEAD 2>/dev/null || echo origin/main)
     if git -C "$REPO" show "$ref:prefs.js" > "$base_dir/prefs.js" 2>/dev/null; then
         out=$(cd "$HERE/prefs-rig" && timeout 300 ./run.sh "$REPO/prefs.js" "$base_dir/prefs.js" 2>&1)
-        st=$?; [ $st -ne 0 ] && rc=1
-        printf '%-16s %-34s rc=%s  %s\n' prefs-rig "run.sh (gjs/broadway)" "$st" \
-            "$(printf '%s\n' "$out" | grep -E 'EXIT_CLEAN|REGRESSION' | tail -1 | cut -c1-80)"
+        st=$?
+        # Through line()/summarise() like every other suite. This branch used
+        # to hand-roll `grep -E 'EXIT_CLEAN|REGRESSION' | tail -1`, which
+        # matched neither a setup failure nor anything else the rig says when
+        # it cannot start -- so the one check that actually flaked reported
+        # `rc=1` followed by nothing at all. It was the only branch written by
+        # hand instead of using the fix three lines above it.
+        line prefs-rig "run.sh (gjs/broadway)" "$st" "$out"
     else
         printf '%-16s %-34s SKIP (no %s:prefs.js baseline)\n' prefs-rig "run.sh" "$ref"
     fi
@@ -136,5 +182,10 @@ else
 fi
 
 echo
+n_total=$((n_pass + n_fail + n_setup + n_incomplete))
+_sum="$n_total checks: $n_pass pass, $n_fail fail"
+[ "$n_setup" -gt 0 ] && _sum="$_sum, $n_setup SETUP FAILURE"
+[ "$n_incomplete" -gt 0 ] && _sum="$_sum, $n_incomplete HARNESS INCOMPLETE"
+echo "$_sum"
 [ $rc -eq 0 ] && echo "ALL SUITES GREEN" || echo "SOME SUITES FAILED"
 exit $rc
