@@ -643,9 +643,18 @@ def _chronicle_find(entry_id):
 # Clipboard helpers (our own — do not import from speech-to-cli)
 # ---------------------------------------------------------------------------
 
-def clipboard_read():
-    """Read text from the clipboard (Wayland-first, X11 fallback)."""
-    for cmd in [["wl-paste", "--no-newline"], ["xclip", "-selection", "clipboard", "-o"]]:
+def _read_via(cmds, label):
+    """Read text with the first of `cmds` that exists (Wayland-first, X11
+    fallback).
+
+    The clipboard and the PRIMARY selection differ only in which tools to ask
+    and what to call the failure in the log -- everything else (the 5 s
+    timeout, "returncode 0 means the text is stdout verbatim", falling through
+    on FileNotFoundError, and "" when nothing worked) is the same contract.
+    Deliberately returns stdout UNSTRIPPED: callers that want it trimmed do
+    their own trimming, and one of them also truncates.
+    """
+    for cmd in cmds:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
@@ -653,8 +662,16 @@ def clipboard_read():
         except FileNotFoundError:
             continue
         except subprocess.TimeoutExpired:
-            log.debug("Clipboard read timed out: %s", cmd[0])
+            log.debug("%s read timed out: %s", label, cmd[0])
     return ""
+
+
+def clipboard_read():
+    """Read text from the clipboard (Wayland-first, X11 fallback)."""
+    return _read_via(
+        [["wl-paste", "--no-newline"],
+         ["xclip", "-selection", "clipboard", "-o"]],
+        "Clipboard")
 
 
 def clipboard_write(text):
@@ -1152,16 +1169,10 @@ def _terminal_lowercase(text):
 
 def selection_read():
     """Read the currently highlighted/selected text (PRIMARY selection)."""
-    for cmd in [["wl-paste", "--primary", "--no-newline"], ["xclip", "-selection", "primary", "-o"]]:
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                return result.stdout
-        except FileNotFoundError:
-            continue
-        except subprocess.TimeoutExpired:
-            log.debug("Selection read timed out: %s", cmd[0])
-    return ""
+    return _read_via(
+        [["wl-paste", "--primary", "--no-newline"],
+         ["xclip", "-selection", "primary", "-o"]],
+        "Selection")
 
 
 # Voice commands: spoken punctuation → actual characters
