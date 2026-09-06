@@ -1564,7 +1564,9 @@ class _RecorderTap:
     Consumers read frames exactly as they read the pipe before: the tap
     exposes `.stdout` (itself) and a `read(FRAME_BYTES)` that returns one
     frame, or b"" at EOF -- so `calibrate_noise(tap)` and the sender loop are
-    unchanged apart from the object they read from.
+    unchanged apart from the object they read from. EOF still arrives as a
+    short read AFTER the buffer drains, which is what #57/#48 wants: the
+    words already captured are delivered, then the lost mic is reported.
     """
 
     def __init__(self, proc, frame_bytes=FRAME_BYTES, max_frames=None):
@@ -1617,7 +1619,9 @@ class _RecorderTap:
         A live recorder delivers a frame every 30 ms, so the timeout only
         fires when it has genuinely stalled -- where reading the pipe would
         have blocked forever. Reported as EOF, and logged so a stall is
-        distinguishable from a recorder that simply exited.
+        distinguishable from a recorder that simply exited. Callers must not
+        read a lost mic off this b"" alone: `proc.poll()` is the positive
+        control (#57), and it stays valid because the tap never touches proc.
         """
         with self._cv:
             while not self._buf:
@@ -2264,14 +2268,28 @@ class GnomeSpeaksService:
                               and not self._stop_event.is_set())
                           else False)
 
-    def _offline_stt_session(self, tap, cancel_token, stopping, _log,
-                             reason=None):
+    def _report_recorder_dead(self, cycle):
+        """The single place the lost-microphone verdict reaches the user.
+
+        Reported ONCE per session and only after the words already captured
+        have been delivered -- in addition to the text, never instead of it
+        (#57/#48). Both session exits go through here so the wording, and the
+        once-ness, cannot drift apart.
+        """
+        log.warning("Recorder exited mid-session (cycle %d) -- microphone lost",
+                    cycle)
+        GLib.idle_add(self._emit_error,
+                      "Microphone disconnected — plug it in and press the hotkey")
+
+    def _offline_stt_session(self, proc, tap, cancel_token, stopping, _log,
+                             reason=None, recorder_dead=None):
         """Finish a streaming session whose WebSocket never came up.
 
         Takes over the recorder's tap and hands the audio to
         _rest_stt_fallback, which goes straight to Wyoming while Azure is
-        marked down. The recorder itself is left to the cycle's teardown
-        envelope (`finally: _reap_recorder`), which owns it.
+        marked down. `proc` is here ONLY as the liveness control (poll());
+        the recorder is reaped by the cycle's teardown envelope, which owns
+        it.
 
         ORDER MATTERS. The backlog the tap already holds -- everything
         recorded since the recorder started, including the whole connect
@@ -2319,6 +2337,17 @@ class GnomeSpeaksService:
                 chunk = tap.read(FRAME_BYTES)
                 if not chunk or len(chunk) < FRAME_BYTES:
                     _log(f"offline: recorder EOF at frame {total_frames}")
+                    # Same classification as the sender loop (#57): a quiet
+                    # pipe is not proof of a lost mic, poll() is, and the
+                    # token is the only signal that says we asked for it.
+                    if recorder_dead is not None and not cancel_token.cancelled:
+                        try:
+                            proc.wait(timeout=0.5)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        if proc.poll() is not None:
+                            _log("offline: recorder exited -- microphone lost")
+                            recorder_dead.set()
                     break
                 frames.append(chunk)
                 total_frames += 1
@@ -2351,15 +2380,20 @@ class GnomeSpeaksService:
         if frames and not cancel_token.cancelled:
             self._set_state("processing")
             text = _rest_stt_fallback(frames, _log) or ""
-        if text:
-            # The words made it. Raising "STT WebSocket failed" at the user
-            # anyway would be a notification that contradicts the text
-            # appearing under their cursor; the log carries the diagnosis.
+        self._deliver_stt_result({"text": text}, "offline", cancel_token)
+
+        # Report AFTER delivery, and at most one toast. A lost mic is the
+        # actionable diagnosis and outranks "the websocket failed"; text that
+        # actually landed outranks both (#57: in addition to the words, never
+        # instead of them).
+        dead = recorder_dead is not None and recorder_dead.is_set()
+        if dead and not cancel_token.cancelled:
+            self._report_recorder_dead(0)
+        elif text:
             log.warning("Azure STT WebSocket unreachable (%s) — "
                         "recognized offline instead", reason)
         elif reason is not None and not cancel_token.cancelled:
             GLib.idle_add(self._emit_error, f"STT WebSocket failed: {reason}")
-        self._deliver_stt_result({"text": text}, "offline", cancel_token)
 
     def _streaming_stt_worker(self, cancel_token=None):
         """Thread entry: run one streaming STT session and always retire its
@@ -2475,8 +2509,8 @@ class GnomeSpeaksService:
             ws_fresh = False
             # With a Wyoming fallback configured, one failed connect trips
             # the breaker (the batch paths' one-strike rule) instead of
-            # spending 1+2+4 s of backoff on a wire that is already known to
-            # be down. The tap keeps recording throughout either way.
+            # spending 1+2+4 s of backoff on a wire already known to be down.
+            # The tap keeps recording throughout either way.
             _ws_max_attempts = 1 if wyoming_mod.enabled() else 4
             _ws_backoff = 1.0  # seconds, doubles each attempt, caps at 30s
             for attempt in range(_ws_max_attempts):
@@ -2490,10 +2524,12 @@ class GnomeSpeaksService:
                         # Azure is unreachable: trip the breaker so the next
                         # presses skip the WS entirely, and finish THIS
                         # session offline instead of dropping words that are
-                        # already recorded.
+                        # already recorded. It owns its own reporting --
+                        # delivery first, then at most one toast.
                         wyoming_mod.mark_azure_down()
-                        self._offline_stt_session(tap, cancel_token,
-                                                  _stopping, _log, reason=exc)
+                        self._offline_stt_session(
+                            proc, tap, cancel_token, _stopping, _log,
+                            reason=exc, recorder_dead=recorder_dead)
                         return
                     # Exponential backoff before next attempt
                     delay = min(_ws_backoff, 30.0)
@@ -2974,10 +3010,7 @@ class GnomeSpeaksService:
         # of it.  Gated on the token, not on _stopping(): by this point a
         # single-shot turn.end has set _stop_event and would silence it.
         if recorder_dead.is_set() and not cancel_token.cancelled:
-            log.warning("Recorder exited mid-session (cycle %d) -- microphone lost",
-                        cycle)
-            GLib.idle_add(self._emit_error,
-                          "Microphone disconnected — plug it in and press the hotkey")
+            self._report_recorder_dead(cycle)
 
         if failed is not None:
             # A dead recorder is upstream of most ways this cycle can raise;
@@ -4579,13 +4612,6 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
     _voices_cache = (None, 0.0)
     _VOICES_CACHE_TTL = 300  # 5 minutes
 
-    # /api/version payload, built once on the first request (see
-    # _handle_version).  No TTL: the git facts in it describe the code this
-    # process loaded, so they cannot change while it runs.  ThreadingHTTPServer
-    # can land two pollers at once, hence the lock.
-    _version_cache = None
-    _version_cache_lock = threading.Lock()
-
     def log_message(self, format, *args):
         """Route HTTP log messages through the existing logger instead of stderr."""
         log.debug("HTTP %s", format % args)
@@ -4862,27 +4888,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_version(self):
         """GET /api/version — realm-sigil version contract (falls back to a
-        minimal payload when realm-sigil isn't installed).
-
-        The payload is built once and reused.  hash/branch/dirty describe the
-        code this process loaded and cannot change while it runs, so deriving
-        them per request forked three git processes — one of them a full
-        working-tree scan — on every poll of the status board (#53).  Only
-        `uptime` is live, and it is refreshed *in place* so the key order the
-        realm-sigil contract ships with is untouched.
-        """
-        cls = SpeechHTTPHandler
-        with cls._version_cache_lock:
-            if cls._version_cache is None:
-                cls._version_cache = self._build_version_payload()
-            payload = dict(cls._version_cache)
-        payload["uptime"] = int(time.time() - _SERVICE_START_TIME)
-        self._send_json(payload)
-
-    @staticmethod
-    def _build_version_payload():
-        """The once-per-process half of /api/version: three git reads, the
-        realm-sigil call, and the host facts."""
+        minimal payload when realm-sigil isn't installed)."""
         import socket as _socket
         repo_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -4918,7 +4924,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             payload = {"name": "gnome-speaks", "version": hash_,
                        "hash": hash_, "branch": branch, "dirty": dirty,
                        "uptime": uptime}
-        return payload
+        self._send_json(payload)
 
     def _handle_status(self):
         svc = self.service
