@@ -1865,7 +1865,13 @@ class GnomeSpeaksService:
         If quick=True, skip config reload and audio detection refresh.
         Used for tight loop restarts where config hasn't changed.
         """
-        self._wake_initiated = bool(wake)
+        # A wake-word session stays a wake-word session across quick (loop)
+        # restarts; only a fresh start -- a deliberate hotkey press -- clears
+        # the flag, because that press is the user vouching for the target.
+        if wake:
+            self._wake_initiated = True
+        elif not quick:
+            self._wake_initiated = False
         # Prevent concurrent STT threads from rapid clicks.
         # For quick (loop) restarts, briefly wait for the old thread to finish
         # since the loop restart fires before the thread fully exits.
@@ -2136,6 +2142,14 @@ class GnomeSpeaksService:
                        and not CONFIG.get("conversation_mode", False)
                        and get_injector().available())
         use_lexical = CONFIG.get("terminal_mode", False)
+
+        # spec §4.3: the wake gate is decided ONCE per session, up front.
+        # Partials are injected before any final exists, so asking only at
+        # the final would let live typing leak text into a field the gate
+        # then refuses; a refusal must hold for every path in this session.
+        wake_blocked = self._wake_gate_blocks()
+        if wake_blocked:
+            live_typing = False
 
         # ---------------------------------------------------------------
         # Main cycle loop — runs once in single-shot mode, loops in
@@ -2472,7 +2486,10 @@ class GnomeSpeaksService:
 
                 # Type at cursor (dictation mode) or just copy to clipboard
                 if CONFIG.get("dictation_mode", True):
-                    if live_typing and (is_loop or CONFIG.get("skip_final_paste", False)):
+                    if wake_blocked:
+                        # Verdict given at session start; nothing reaches the cursor.
+                        log.debug("Wake-word gate: transcript withheld")
+                    elif live_typing and (is_loop or CONFIG.get("skip_final_paste", False)):
                         if is_loop and typed_partial[0]:
                             # Final correction: if Azure's final differs from what
                             # was live-typed, surgically fix the divergent tail.
@@ -2482,9 +2499,8 @@ class GnomeSpeaksService:
                     elif live_typing:
                         get_injector().send_backspaces(len(typed_partial[0]))
                         time.sleep(0.02)
-                        if not self._wake_gate_blocks():
-                            get_injector().paste(user_text)
-                    elif not self._wake_gate_blocks():
+                        get_injector().paste(user_text)
+                    else:
                         get_injector().commit(user_text)
                 else:
                     if live_typing and typed_partial[0]:

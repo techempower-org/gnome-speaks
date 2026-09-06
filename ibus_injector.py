@@ -540,7 +540,9 @@ class IbusInjector(Injector):
 
     def purpose_known(self):
         eng = self._engine
-        return bool(eng is not None and eng.focused and eng.purpose
+        # FREE_FORM is 0, so the purpose value itself can never be the
+        # signal -- what matters is that SetContentType actually arrived.
+        return bool(eng is not None and eng.focused and eng.saw_content_type
                     and not eng.is_secure())
 
     def acquire(self):
