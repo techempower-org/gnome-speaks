@@ -2287,10 +2287,9 @@ class GnomeSpeaksService:
         _schedule_warmup()
 
         if user_text and CONFIG.get("continuous_dictation", False) and not self._stop_event.is_set():
-            GLib.idle_add(lambda: (self.start_listening(quick=True), False)[-1]
-                          if (CONFIG.get("continuous_dictation", False)
-                              and not self._stop_event.is_set())
-                          else False)
+            GLib.idle_add(self._restart_listening_cb(
+                lambda: (CONFIG.get("continuous_dictation", False)
+                         and not self._stop_event.is_set())))
 
     def _report_recorder_dead(self, cycle):
         """The single place the lost-microphone verdict reaches the user.
@@ -3606,11 +3605,10 @@ class GnomeSpeaksService:
                     and CONFIG.get("conversation_mode", False)
                     and not self._stop_event.is_set()):
                 log.info("Hands-free: auto-restarting listening after TTS")
-                GLib.idle_add(lambda: (self.start_listening(quick=True), False)[-1]
-                              if (CONFIG.get("continuous_dictation", False)
-                                  and CONFIG.get("conversation_mode", False)
-                                  and not self._stop_event.is_set())
-                              else False)
+                GLib.idle_add(self._restart_listening_cb(
+                    lambda: (CONFIG.get("continuous_dictation", False)
+                             and CONFIG.get("conversation_mode", False)
+                             and not self._stop_event.is_set())))
         return outcome
 
     def speak_clipboard(self):
@@ -4331,6 +4329,32 @@ class GnomeSpeaksService:
             history = list(self._conversation_history[-40:])
         return system_prompt, history
 
+    def _restart_listening_cb(self, still_wanted):
+        """A one-shot GLib source callback that restarts listening.
+
+        Collapses `lambda: (self.start_listening(quick=True), False)[-1] if
+        <guard> else False`, which appeared four times. The tuple-index trick
+        exists only to force the False that makes a GLib source fire once, and
+        it is easy to get subtly wrong -- that is what is worth having in one
+        place.
+
+        What deliberately STAYS at each call site:
+          * the guard, because all four differ (loop only; loop AND
+            conversation; stop-event only), and
+          * the scheduler, because `idle_add` and `timeout_add(2000)` are a
+            timing decision, not boilerplate.
+
+        `still_wanted` is re-checked HERE, when the source fires, not when it
+        was scheduled: between the two the user can stop or toggle the loop
+        off, and the restart must not happen then. That re-check is why the
+        guard is passed as a callable.
+        """
+        def _cb():
+            if still_wanted():
+                self.start_listening(quick=True)
+            return False
+        return _cb
+
     def _maybe_loop_restart(self):
         """Restart listening in AI+Loop mode. Called from worker thread."""
         if (CONFIG.get("continuous_dictation", False)
@@ -4342,9 +4366,8 @@ class GnomeSpeaksService:
             # audio detection since nothing changed within the loop.
             # Use GLib.idle_add because start_listening touches state
             # that must be set from the main thread context.
-            GLib.idle_add(lambda: (self.start_listening(quick=True), False)[-1]
-                          if not self._stop_event.is_set()
-                          else False)
+            GLib.idle_add(self._restart_listening_cb(
+                lambda: not self._stop_event.is_set()))
         else:
             _schedule_warmup()
 
@@ -4638,11 +4661,8 @@ class GnomeSpeaksService:
                     and CONFIG.get("conversation_mode", False)
                     and not self._stop_event.is_set()):
                 log.info("AI+Loop: retry after error (2s delay)")
-                GLib.timeout_add(2000, lambda: (
-                    (self.start_listening(quick=True), False)[-1]
-                    if not self._stop_event.is_set()
-                    else False
-                ))
+                GLib.timeout_add(2000, self._restart_listening_cb(
+                    lambda: not self._stop_event.is_set()))
         finally:
             self._cancels.retire(cancel_token)
             self._release_user_speech()
