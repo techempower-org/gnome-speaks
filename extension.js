@@ -694,8 +694,21 @@ export default class GnomeSpeaksExtension extends Extension {
         });
         this._signals.push({obj: this._badge, id: keyId});
 
+        // The waveform + VAD dot hang off the badge's geometry, which only
+        // changes on drag, pill show/hide, pill relabel and idle<->active
+        // resizes. Follow the allocation instead of repositioning per audio
+        // frame (#51).
+        let allocId = this._badge.connect('notify::allocation', () => {
+            this._positionWaveform();
+        });
+        this._signals.push({obj: this._badge, id: allocId});
+
         // Waveform + timeout — vertical stack below badge
         this._waveformLevels = new Array(32).fill(0);
+        // Per-bar cache of what is actually applied, so a frame only touches
+        // the bars whose height or color changed (#51)
+        this._waveformBarHeights = new Array(32).fill(-1);
+        this._waveformBarColors = new Array(32).fill(null);
         this._waveformContainer = new St.BoxLayout({
             style_class: 'gnome-speaks-waveform-wrapper',
             reactive: false,
@@ -1301,6 +1314,8 @@ export default class GnomeSpeaksExtension extends Extension {
             this._waveformRowTop = null;
             this._waveformBars = [];
             this._waveformBarsTop = [];
+            this._waveformBarHeights = [];
+            this._waveformBarColors = [];
         }
 
         if (this._badge) {
@@ -2397,9 +2412,8 @@ export default class GnomeSpeaksExtension extends Extension {
         // Waveform bars: shift buffer and update heights (respects toggle)
         if (this._waveformContainer && this._waveformBars.length > 0
             && this._getConfigFlag('show_waveform', true)) {
-            // Show waveform when audio arrives — reposition every frame
-            // to track badge width changes (pills expanding/collapsing)
-            this._positionWaveform();
+            // Show waveform when audio arrives (position tracks the badge
+            // via notify::allocation, not per frame)
             if (this._waveformContainer.opacity === 0) {
                 this._waveformContainer.show();
                 this._waveformContainer.ease({
@@ -2427,8 +2441,11 @@ export default class GnomeSpeaksExtension extends Extension {
                 let h = Math.max(2, Math.floor(logLevel * 22 * fadeFactor));
                 let barBot = this._waveformBars[i];
                 let barTop = this._waveformBarsTop[i];
-                barBot.set_height(h);
-                barTop.set_height(h);
+                if (h !== this._waveformBarHeights[i]) {
+                    this._waveformBarHeights[i] = h;
+                    barBot.set_height(h);
+                    barTop.set_height(h);
+                }
                 // Three-color: green (good), amber (hot), red (clipped)
                 // When fading, shift to dim gray
                 let colorClass;
@@ -2439,12 +2456,16 @@ export default class GnomeSpeaksExtension extends Extension {
                         : lvl > 0.35 ? 'gnome-speaks-waveform-bar-hot'
                         : lvl > 0.02 ? 'gnome-speaks-waveform-bar-good' : null;
                 }
-                for (let bar of [barBot, barTop]) {
-                    bar.remove_style_class_name('gnome-speaks-waveform-bar-good');
-                    bar.remove_style_class_name('gnome-speaks-waveform-bar-hot');
-                    bar.remove_style_class_name('gnome-speaks-waveform-bar-clip');
-                    bar.remove_style_class_name('gnome-speaks-waveform-bar-dim');
-                    if (colorClass) bar.add_style_class_name(colorClass);
+                // Only touch the style class when it actually changes — each
+                // add/remove invalidates the St theme node and queues a
+                // relayout in the shell process
+                let prevClass = this._waveformBarColors[i];
+                if (colorClass !== prevClass) {
+                    this._waveformBarColors[i] = colorClass;
+                    for (let bar of [barBot, barTop]) {
+                        if (prevClass) bar.remove_style_class_name(prevClass);
+                        if (colorClass) bar.add_style_class_name(colorClass);
+                    }
                 }
             }
         }
