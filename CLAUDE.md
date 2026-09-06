@@ -107,8 +107,8 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 | Terminal | Lowercase, no punctuation, lexical output |
 | Talk | D-Bus API for external apps (blocking call) |
 | Half/Full Duplex | Auto-detected speaker vs headphone routing |
-| Wake word | Idle-only mic stream to LAN openwakeword; detection = dictation hotkey. Toggle: "cast wake word" |
-| Injection | How text reaches the cursor. `injection_method`: `ydotool` (default, synthesizes keys) · `ibus` (D-Bus commits, no stuck keys) · `auto` (ibus when reachable). Falls back to ydotool for every failure, never to nothing |
+| Wake word | Idle-only mic stream to LAN openwakeword; detection = dictation hotkey. Toggle: "cast wake word". Opt-in `wake_word_secure_gate` (prefs: "Only Type Into Known Fields"): a wake-opened session types only into a focused field the app has **not** declared PASSWORD/PIN — ONE verdict per session, taken where `live_typing` is computed (gating just the final paste missed live partials and Keep-Live-Text, #55); `start_listening(quick=True)` keeps the wake mark. It **fails open**: ibus-daemon 1.5.34 always forwards `SetContentType`, and an undeclared field arrives as `(0,0)` = FREE_FORM, so an undeclared password box is undetectable. Works on native Wayland (measured GNOME 50) — it is not X11-only. `python3 verify_wake_gate.py` checks it |
+| Injection | How text reaches the cursor. `injection_method`: `ydotool` (default, synthesizes keys, learns nothing about the target) · `ibus` (D-Bus commits, no stuck keys, sees the content-type the app declares — so it can skip a declared password/PIN field, never an undeclared one) · `auto` (ibus when reachable). Falls back to ydotool for every failure, never to nothing |
 | Spellbook | "cast …"/"invoke …" transcripts run local spells (never typed/LLM'd); `POST /cast` is the text seam |
 | Chronicle | Not a mode -- always-on ledger of both directions; 📜 badge rune (8 lines) + panel submenu (12), click to respeak. Spells: "cast echo" / "chronicle" / "seal the chronicle" |
 

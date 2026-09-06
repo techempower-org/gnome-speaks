@@ -1933,7 +1933,13 @@ class GnomeSpeaksService:
         If quick=True, skip config reload and audio detection refresh.
         Used for tight loop restarts where config hasn't changed.
         """
-        self._wake_initiated = bool(wake)
+        # A quick restart continues the SAME session (loop cycle, AI+Loop
+        # retry), so it inherits how that session was opened; only a fresh
+        # start -- the hotkey -- clears the wake mark (#55).
+        if wake:
+            self._wake_initiated = True
+        elif not quick:
+            self._wake_initiated = False
         # Prevent concurrent STT threads from rapid clicks -- and from the
         # "stop, it didn't stop, press again" sequence: stop() keeps the
         # reference to a worker that outlived its join, so a second worker is
@@ -2239,6 +2245,18 @@ class GnomeSpeaksService:
             live_typing = (CONFIG.get("dictation_mode", True)
                            and not CONFIG.get("conversation_mode", False)
                            and get_injector().available())
+            # Wake gate (spec §4.3): ONE verdict per session, taken before the
+            # first partial is typed. Gating only the final paste left
+            # live-typed partials and the Keep-Live-Text path
+            # (skip_final_paste, default on) ungated, so in the default config
+            # the gate never fired (#55).  Scoped to the dictation branches:
+            # conversation mode types nothing at the cursor, so it must never
+            # even ask -- an unknown field is not its business.
+            wake_blocked = (CONFIG.get("dictation_mode", True)
+                            and not CONFIG.get("conversation_mode", False)
+                            and self._wake_gate_blocks())
+            if wake_blocked:
+                live_typing = False
             use_lexical = CONFIG.get("terminal_mode", False)
 
             # ---------------------------------------------------------------
@@ -2581,7 +2599,9 @@ class GnomeSpeaksService:
 
                     # Type at cursor (dictation mode) or just copy to clipboard
                     if CONFIG.get("dictation_mode", True):
-                        if live_typing and (is_loop or CONFIG.get("skip_final_paste", False)):
+                        if wake_blocked:
+                            pass  # refused at session start; nothing was live-typed either
+                        elif live_typing and (is_loop or CONFIG.get("skip_final_paste", False)):
                             inj = get_injector()
                             if is_loop and typed_partial[0]:
                                 # Final correction: if Azure's final differs from what
@@ -2600,9 +2620,8 @@ class GnomeSpeaksService:
                         elif live_typing:
                             get_injector().send_backspaces(len(typed_partial[0]))
                             time.sleep(0.02)
-                            if not self._wake_gate_blocks():
-                                get_injector().paste(user_text)
-                        elif not self._wake_gate_blocks():
+                            get_injector().paste(user_text)
+                        else:
                             get_injector().commit(user_text)
                     else:
                         if live_typing and typed_partial[0]:
@@ -3203,14 +3222,28 @@ class GnomeSpeaksService:
             log.warning("Spell reply dropped: speech queue full")
 
     def _wake_gate_blocks(self):
-        """spec §4.3 (opt-in, wake_word_secure_gate): a wake-word session may
-        only type into a field whose content-type is KNOWN non-secure.
+        """spec §4.3 (opt-in, wake_word_secure_gate): a wake-word session types
+        only into a focused field the app has NOT declared password/PIN.
 
-        A deliberate hotkey press is the user vouching for the target; a
-        wake word is not. Only the IBus backend can know a field's purpose
-        (ydotool never can), and on native Wayland IBus never receives it
-        either — so with the gate on, hands-free dictation is refused there.
-        That is the documented capability trade; default is OFF.
+        A deliberate hotkey press is the user vouching for the target; a wake
+        word is not. Only the IBus backend sees a purpose at all (ydotool never
+        can), so the gate needs injection_method ibus/auto.
+
+        What this does NOT do — measured, not assumed:
+
+        * ibus-daemon (1.5.34) forwards SetContentType to a freshly created
+          engine unconditionally, so after acquire()'s FOCUS_WAIT +
+          CONTENT_TYPE_GRACE a focused engine has ALWAYS seen a content-type.
+          purpose_known() therefore reduces to "focused and not PASSWORD/PIN".
+        * A client that never declares a purpose arrives as (0, 0) — bit-for-bit
+          identical to a declared FREE_FORM. So the gate FAILS OPEN on an
+          undeclared field and CANNOT detect an undeclared password box.
+        * It is not X11-only. On GNOME 50 native Wayland the purpose does
+          arrive (journal 2026-09-01T07:39:11: "IBus content type purpose=10
+          hints=0", wayland session). Any claim that this refuses all
+          hands-free typing on Wayland is false.
+
+        Default is OFF.
         """
         if not getattr(self, "_wake_initiated", False):
             return False
@@ -3220,6 +3253,12 @@ class GnomeSpeaksService:
         inj.acquire()  # idempotent; lets content-type arrive before we ask
         if inj.purpose_known():
             return False
+        # A refused session must not leave the IME swapped in for nothing;
+        # idle's end() would also do this, but a loop session never idles.
+        try:
+            inj.end()
+        except Exception:
+            log.debug("Injector end() after gate refusal failed", exc_info=True)
         log.info("Wake-word gate: field purpose unknown — not typing")
         self._spell_speak("Unknown field — press the hotkey to dictate here.")
         return True

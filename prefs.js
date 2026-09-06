@@ -127,13 +127,14 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
             'Type transcribed words where the cursor is. Off = copy to clipboard only. Default: on',
             'dictation_mode', true);
 
-        // Typing engine. IBus is the input-method path (no stuck keys;
-        // refuses password fields — but ONLY on X11/XWayland: on native
-        // Wayland the field's content-type never reaches IBus, so the
-        // refusal cannot fire). The wording stays qualified on purpose.
+        // Typing engine. IBus is the input-method path (no stuck keys; it
+        // sees the content-type the app declares, so it can skip a field the
+        // app marks password/PIN). It cannot skip a password field that
+        // declares nothing: an undeclared field arrives as (0, 0), which is
+        // exactly FREE_FORM. Say what it does, not what it protects against.
         this._addComboRow(typeGroup, 'Typing Engine', 'injection_method', [
             ['ydotool', 'Virtual keyboard (ydotool) — default'],
-            ['ibus', 'Input method (IBus) — no stuck keys; skips password fields on X11/XWayland only'],
+            ['ibus', 'Input method (IBus) — no stuck keys; skips fields the app declares as password/PIN'],
             ['auto', 'Auto — IBus when available, else ydotool'],
         ], 'ydotool');
 
@@ -513,7 +514,7 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
             'wake_word', false);
 
         this._addSwitchRow(wakeGroup, 'Only Type Into Known Fields',
-            'Wake-word dictation types only when the input method can confirm the field is not a password. Needs the IBus typing engine; on native Wayland this refuses all hands-free typing. Default: off',
+            'Wake-word dictation types only into a focused field the app has not declared as password or PIN. Needs the IBus typing engine. A field that declares nothing is treated as ordinary text, so this cannot catch an undeclared password box. Default: off',
             'wake_word_secure_gate', false);
 
         this._addEntryRow(wakeGroup, 'Wake Model', 'wake_word_model', '',
