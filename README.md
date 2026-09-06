@@ -263,11 +263,18 @@ by voice):
 
 Every failure — an unknown value, missing `gir1.2-ibus-1.0`, no `ibus-daemon`,
 registration refused — falls back to ydotool, never to nothing: losing dictation to a
-misconfigured key is worse than ignoring the key. The IBus engine refuses to type into
-password fields, but **only on X11/XWayland**: on native Wayland the field's content-type
-never reaches IBus, so the refusal cannot fire. `press_enter` ("cast run it") always goes
-through a key-event backend, since committing `"\n"` inserts a character rather than
-pressing Enter.
+misconfigured key is worse than ignoring the key.
+
+The IBus engine also refuses to type into a field the application **declares** as a
+password or PIN — on X11 and on native Wayland alike. This refusal is always on whenever
+IBus is the engine; it is not the same thing as `wake_word_secure_gate`, which is a
+separate, stricter rule that applies only to hands-free sessions
+([Only Type Into Known Fields](#wake-word)). It carries the same limit either way: a field
+that declares nothing arrives as purpose `0`, hints `0` — identical to a field that
+declares FREE_FORM — so a hand-rolled password box that declares nothing is not detected.
+
+`press_enter` ("cast run it") always goes through a key-event backend, since committing
+`"\n"` inserts a character rather than pressing Enter.
 
 ### Prosody
 
@@ -555,9 +562,9 @@ not. With this on, a wake-word-opened session types only into a *focused* field
 that the application has **not** declared as password or PIN — otherwise
 nothing is typed (no live partials either) and the service says "Unknown field
 — press the hotkey to dictate here". The verdict is taken once, when the
-session opens, and survives loop restarts. It needs the IBus **Typing Engine**
-(`injection_method: "ibus"` or `"auto"`); the virtual keyboard never learns
-anything about its target.
+session opens, and survives loop restarts. It needs the IBus
+[Typing Engine](#typing-engine) (`injection_method: "ibus"` or `"auto"`); the
+virtual keyboard never learns anything about its target.
 
 Read the guarantee narrowly — it is *refuse the declared*, not *allow only the
 vouched-for*:

@@ -180,14 +180,45 @@ No test suite. Validate changes by:
 5. Shell-side changes: headless session (`--nested` is dead on 50, see gotchas) --
    `dbus-run-session -- gnome-shell --headless --virtual-monitor 1280x720`, then
    enable/disable/re-enable and require **zero** JS errors, shell CRITICALs, and St warnings.
-6. Service-side changes: the de-facto verification bar is the four scratch repro suites under
-   `~/.claude/projects/-home-jp/scratch/gnome-speaks-dreamteam/` -- `lucid-service-audit-repros`
-   (queue invariants, dispatch gate, config), `lucid-chronicle-perf-repros` (chronicle contract,
-   archive, HTTP endpoints), `lucid-cancel-tokens-repros` (cancel-token verdicts, stop vs
-   stop_listening), `morpheus-injector-seam-repros` (Injector seam, IbusInjector). Each script
-   imports the service from `GS_SVC_PATH=<path to gnome-speaks-service.py>` (defaults to the main
-   checkout, so point it at your worktree) and needs no running service or D-Bus. Run the suite(s)
-   covering the area you touched before opening a PR.
+6. Wake-word secure gate: `python3 verify_wake_gate.py` from the checkout root -- no env vars,
+   no desktop, no daemon (it imports `ibus_injector` from its own directory). 24 checks; exit 0
+   means all passed.
+7. Service-side changes: the de-facto verification bar is the scratch repro suites under
+   `~/.claude/projects/-home-jp/scratch/gnome-speaks-dreamteam/`, one directory per audit --
+   `lucid-service-audit-repros` (queue invariants, dispatch gate, config),
+   `lucid-chronicle-perf-repros` (chronicle contract, archive, HTTP endpoints),
+   `lucid-cancel-tokens-repros` (cancel-token verdicts, stop vs stop_listening),
+   `morpheus-injector-seam-repros` (Injector seam, IbusInjector). They import the service by
+   path and need no running service, D-Bus, mic or port 7710. Run the suite(s) covering the
+   area you touched before opening a PR.
+
+   **Always pass the path explicitly; never trust a suite's default.** Only
+   `lucid-cancel-tokens-repros` defaults to the main checkout. `lucid-service-audit-repros`,
+   `lucid-chronicle-perf-repros` and `morpheus-injector-seam-repros` default to
+   `~/Projects/gnome-speaks-wt/<audit-name>/` worktrees that no longer exist, so an
+   unqualified run dies with `FileNotFoundError` on that path instead of testing anything.
+
+   ```bash
+   SVC=~/Projects/gnome-speaks-wt/<your-worktree>/gnome-speaks-service.py
+   cd ~/.claude/projects/-home-jp/scratch/gnome-speaks-dreamteam
+   GS_SVC_PATH=$SVC       python3 lucid-service-audit-repros/verify_queue_invariants.py
+   GS_SVC_PATH=$SVC       python3 lucid-chronicle-perf-repros/verify_archive.py
+   GS_SVC_PATH=$SVC       python3 lucid-cancel-tokens-repros/verify_cancel_invariants.py
+   GS_SVC_PATH=$SVC       python3 morpheus-injector-seam-repros/verify_injector_seam.py
+   GS_WT=$(dirname $SVC)  python3 morpheus-injector-seam-repros/verify_ibus_injector.py
+   ```
+
+   `verify_ibus_injector.py` is the exception: it imports `ibus_injector` as a module rather
+   than loading the service by path, so it reads **`GS_WT` (a checkout *directory*)** and
+   ignores `GS_SVC_PATH` entirely -- passing only `GS_SVC_PATH` gets you
+   `ModuleNotFoundError: No module named 'ibus_injector'`.
+
+   Exit 0 = clean. A non-zero exit is a failed check -- in the `repro_*` scripts that means
+   the bug the repro was written for is still present, which is the point of running them.
+   **A red suite is not automatically your fault**: some scripts are open-bug repros that are
+   red on `main` by design, and several keep state under `/tmp/<suite>/` that is not reset
+   between runs. Get a baseline on `main` before blaming your branch, and wipe the suite's
+   state dir if a second run disagrees with the first.
 
 ## Git
 
