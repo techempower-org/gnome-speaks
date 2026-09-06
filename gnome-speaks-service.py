@@ -1033,6 +1033,74 @@ def get_injector():
         return _injector
 
 
+class _LiveTyper:
+    """Type streaming hypotheses off the WebSocket receive thread.
+
+    ydotool types at 12 ms/char and is awaited synchronously, so typing a
+    hypothesis inline in the recv loop starves ws.recv(): a 20-char suffix
+    is ~240 ms against Azure hypotheses every 100-300 ms.  Later hypotheses
+    queue in the socket, each stale one is typed and then partially erased
+    by the next, and the lag grows with speaking speed.  Here the recv loop
+    only drops the newest hypothesis into a one-slot mailbox; this worker
+    types the diff against whatever is newest when it gets there and never
+    sees the intermediates.
+
+    `typed_holder[0]` remains the on-screen source of truth for the final
+    commit arithmetic.  Only the worker writes it while the cycle is open;
+    read it only after close() has joined the worker.
+    """
+
+    def __init__(self, typed_holder, log_fn):
+        self._typed = typed_holder
+        self._log = log_fn
+        self._cv = threading.Condition()
+        self._pending = None
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="live-typer")
+        self._thread.start()
+
+    def submit(self, text):
+        """Make `text` the newest hypothesis; overwrites any untyped one."""
+        with self._cv:
+            self._pending = text
+            self._cv.notify()
+
+    def close(self, timeout=5.0):
+        """Stop the worker, dropping anything not yet typed.
+
+        The caller reconciles the screen against the final transcript
+        itself, so an untyped intermediate is wasted keystrokes, not lost
+        text.  Blocks until the in-flight replace (if any) has finished.
+        """
+        with self._cv:
+            self._closed = True
+            self._pending = None
+            self._cv.notify()
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            self._log("live typer still typing after close(); "
+                      "typed_partial may be stale")
+
+    def _run(self):
+        while True:
+            with self._cv:
+                while self._pending is None and not self._closed:
+                    self._cv.wait()
+                if self._closed:
+                    return
+                text, self._pending = self._pending, None
+            if text == self._typed[0]:
+                continue
+            try:
+                get_injector().replace_text(self._typed[0], text)
+                self._typed[0] = text
+            except Exception as exc:
+                # Screen state is unknown now; keep the last value we are
+                # sure of rather than claim `text` is on screen.
+                self._log(f"live typing failed: {exc}")
+
+
 # ── Terminal-mode smart lowercasing ──────────────────────────────────────
 # Lowercase by default but preserve correct casing for filesystem entries.
 # Caches directory listings for 30s to avoid repeated disk I/O.
@@ -2211,6 +2279,7 @@ class GnomeSpeaksService:
                 raw_frames = []
                 typed_partial = [""]
                 raw_partial = [""]
+                typer = _LiveTyper(typed_partial, _log) if live_typing else None
 
                 # 5. Sender thread: calibrate noise, send audio with VAD.
                 #    A new sender thread is created each cycle, but the same proc
@@ -2331,63 +2400,70 @@ class GnomeSpeaksService:
                 got_phrase = False
                 natural_end = False
 
-                while time.time() < deadline and not _stopping():
-                    try:
-                        ws.settimeout(1.0)
-                        msg = ws.recv()
-                    except websocket.WebSocketTimeoutException:
-                        if sender_done.is_set():
-                            if got_phrase:
-                                break
-                            try:
-                                ws.settimeout(2.0)
-                                msg = ws.recv()
-                            except Exception as exc:
-                                _log(f"WS recv after sender done: {exc}")
-                                break
-                        else:
-                            continue
-                    except Exception as exc:
-                        _log(f"WS recv error: {exc}")
-                        break
-
-                    mtype = _parse_ws_msg(msg, phrases, partial_holder, end_word_event, end_word, _log,
-                                          raw_partial_holder=raw_partial, use_lexical=use_lexical)
-
-                    if mtype == "hypothesis":
-                        text = partial_holder[0]
-                        if text:
-                            self._throttled_partial_transcription(
-                                _terminal_lowercase(text) if use_lexical else text)
-                            if live_typing:
-                                # Terminal mode: smart lowercase (preserves filesystem casing)
-                                raw = _terminal_lowercase(raw_partial[0]) if use_lexical else raw_partial[0]
-                                get_injector().replace_text(typed_partial[0], raw)
-                                typed_partial[0] = raw
-                    elif mtype == "phrase":
-                        got_phrase = True
-                        text = partial_holder[0]
-                        if text:
-                            GLib.idle_add(self._emit_partial_transcription, text)
-                        if sender_done.is_set():
-                            try:
-                                ws.settimeout(0.5)
-                                ws.recv()  # drain final message
-                            except Exception as exc:
-                                _log(f"WS drain after phrase (expected): {exc}")
+                try:
+                    while time.time() < deadline and not _stopping():
+                        try:
+                            ws.settimeout(1.0)
+                            msg = ws.recv()
+                        except websocket.WebSocketTimeoutException:
+                            if sender_done.is_set():
+                                if got_phrase:
+                                    break
+                                try:
+                                    ws.settimeout(2.0)
+                                    msg = ws.recv()
+                                except Exception as exc:
+                                    _log(f"WS recv after sender done: {exc}")
+                                    break
+                            else:
+                                continue
+                        except Exception as exc:
+                            _log(f"WS recv error: {exc}")
                             break
-                    elif mtype == "turn_end":
-                        _log(f"turn.end received (phrases={len(phrases)})")
-                        got_phrase = True
-                        natural_end = True
-                        # Signal sender to stop reading audio for this cycle.
-                        # In loop mode we use a local flag instead of _stop_event
-                        # so the outer loop can continue.
-                        if is_loop:
-                            end_word_event.set()  # reuse end_word_event to stop sender
-                        else:
-                            self._stop_event.set()
-                        break
+
+                        mtype = _parse_ws_msg(msg, phrases, partial_holder, end_word_event, end_word, _log,
+                                              raw_partial_holder=raw_partial, use_lexical=use_lexical)
+
+                        if mtype == "hypothesis":
+                            text = partial_holder[0]
+                            if text:
+                                self._throttled_partial_transcription(
+                                    _terminal_lowercase(text) if use_lexical else text)
+                                if typer is not None:
+                                    # Terminal mode: smart lowercase (preserves filesystem casing)
+                                    raw = _terminal_lowercase(raw_partial[0]) if use_lexical else raw_partial[0]
+                                    # Off-thread: ydotool would otherwise hold this
+                                    # loop for 12 ms/char while hypotheses pile up.
+                                    typer.submit(raw)
+                        elif mtype == "phrase":
+                            got_phrase = True
+                            text = partial_holder[0]
+                            if text:
+                                GLib.idle_add(self._emit_partial_transcription, text)
+                            if sender_done.is_set():
+                                try:
+                                    ws.settimeout(0.5)
+                                    ws.recv()  # drain final message
+                                except Exception as exc:
+                                    _log(f"WS drain after phrase (expected): {exc}")
+                                break
+                        elif mtype == "turn_end":
+                            _log(f"turn.end received (phrases={len(phrases)})")
+                            got_phrase = True
+                            natural_end = True
+                            # Signal sender to stop reading audio for this cycle.
+                            # In loop mode we use a local flag instead of _stop_event
+                            # so the outer loop can continue.
+                            if is_loop:
+                                end_word_event.set()  # reuse end_word_event to stop sender
+                            else:
+                                self._stop_event.set()
+                            break
+                finally:
+                    # Everything below reads typed_partial synchronously, so the
+                    # worker must be idle before the final-commit arithmetic.
+                    if typer is not None:
+                        typer.close()
 
                 # Wait for sender thread to finish this cycle
                 if self._stop_event.is_set() and not sender_done.is_set():
