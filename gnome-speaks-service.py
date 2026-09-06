@@ -4418,6 +4418,37 @@ class GnomeSpeaksService:
             in_type_tag = False # True while inside <type>...</type>
             first_sentence = True
             spoke_anything = False
+            aborted = False     # begin() refused: a stop beat the first note
+
+            def _claim_playback():
+                """Issue this reply's token and take the wire.
+
+                False means begin() refused because a stop landed between the
+                claim and the first note. Every other path in the service
+                treats that as "never even start" (_speak_worker returns
+                "interrupted" without playing, _streaming_stt_cycle returns
+                before opening the mic); this one used to ignore the answer and
+                speak anyway, so a reply the user had already stopped was
+                spoken in full (#79).
+                """
+                nonlocal cancel_token, first_sentence
+                # One object claims playback AND carries the verdict.
+                cancel_token = self._cancels.issue("ai-reply")
+                self._speak_token = cancel_token
+                if not self._cancels.begin(cancel_token):
+                    log.info("AI reply cancelled before its first note — "
+                             "nothing spoken")
+                    return False
+                # Only now: announcing "speaking" for a reply that will never
+                # be spoken puts the badge in the same disagreement the token
+                # exists to prevent. The queue hold does not depend on this —
+                # _hold_user_speech() has held since the turn began.
+                self._set_state("speaking")
+                # On headphones, prewarm recorder during TTS
+                if not CONFIG.get("half_duplex", False):
+                    _schedule_warmup()
+                first_sentence = False
+                return True
 
             # Single subtitle thread for the entire conversation (Fix 7).
             # cancel_token (issued at the first spoken sentence) rides the
@@ -4479,17 +4510,9 @@ class GnomeSpeaksService:
                     if not sentence:
                         continue
 
-                    if first_sentence:
-                        # Transition to speaking state on first sentence
-                        self._set_state("speaking")
-                        # One object claims playback AND carries the verdict.
-                        cancel_token = self._cancels.issue("ai-reply")
-                        self._speak_token = cancel_token
-                        self._cancels.begin(cancel_token)
-                        # On headphones, prewarm recorder during TTS
-                        if not CONFIG.get("half_duplex", False):
-                            _schedule_warmup()
-                        first_sentence = False
+                    if first_sentence and not _claim_playback():
+                        aborted = True
+                        break
 
                     spoke_anything = True
                     log.info("Streaming TTS sentence: %s", sentence[:80])
@@ -4508,17 +4531,19 @@ class GnomeSpeaksService:
                     if self._stop_event.is_set():
                         break
 
+                if aborted:
+                    break
+
             # Speak any remaining buffered text after stream ends
             remainder = buffer.strip()
-            if remainder and not self._stop_event.is_set():
-                if first_sentence:
-                    self._set_state("speaking")
-                    cancel_token = self._cancels.issue("ai-reply")
-                    self._speak_token = cancel_token
-                    self._cancels.begin(cancel_token)
-                    if not CONFIG.get("half_duplex", False):
-                        _schedule_warmup()
-                    first_sentence = False
+            # Decided once: _stop_event could otherwise flip between a guard
+            # that claims playback and a guard that speaks.
+            speak_remainder = (bool(remainder) and not aborted
+                               and not self._stop_event.is_set())
+            if speak_remainder and first_sentence and not _claim_playback():
+                aborted = True
+                speak_remainder = False
+            if speak_remainder:
                 spoke_anything = True
                 log.info("Streaming TTS remainder: %s", remainder[:80])
                 GLib.idle_add(self._emit_partial_transcription, remainder)
