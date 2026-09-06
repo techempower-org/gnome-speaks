@@ -2482,12 +2482,21 @@ class GnomeSpeaksService:
                 # Type at cursor (dictation mode) or just copy to clipboard
                 if CONFIG.get("dictation_mode", True):
                     if live_typing and (is_loop or CONFIG.get("skip_final_paste", False)):
+                        inj = get_injector()
                         if is_loop and typed_partial[0]:
                             # Final correction: if Azure's final differs from what
                             # was live-typed, surgically fix the divergent tail.
                             if typed_partial[0] != user_text:
-                                get_injector().replace_text(typed_partial[0], user_text)
-                            get_injector().type_text(" ")
+                                inj.replace_text(typed_partial[0], user_text)
+                            # Separator before the next utterance. A pre-edit
+                            # backend's coalescer restores its own between
+                            # commits; typing one here would double it.
+                            if not inj.supports_preedit():
+                                inj.type_text(" ")
+                        # Keep the live text: on ydotool it is already really
+                        # typed (no-op); on IBus it is still a volatile pre-edit
+                        # that end() would DISCARD at idle, so commit it (#45).
+                        inj.finalize(user_text)
                     elif live_typing:
                         get_injector().send_backspaces(len(typed_partial[0]))
                         time.sleep(0.02)
