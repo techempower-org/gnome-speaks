@@ -125,7 +125,7 @@ run dead-recorder  repro_e_single_shot_turn_end.py repro_f_text_survives_yank.py
                    repro_i_healthy_loop.py
 run pin-lifecycle  repro_pin_lifecycle.py repro_compound_pin_x_deadmic.py \
                    repro_compound_reply_pin.py
-run injector-seam  verify_injector_seam.py verify_ibus_injector.py
+run injector-seam  verify_injector_seam.py verify_ibus_injector.py repro_fallback_retry.py
 run version-cache  verify_version_cache.py repro_a_fork_storm.py
 
 # ---------------------------------------------------------------------------
