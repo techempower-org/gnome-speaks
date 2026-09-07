@@ -154,6 +154,8 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
             'Turn "period", "comma", "new line" into characters. Default: on',
             'voice_commands', true);
 
+        this._addEntryRow(typeGroup, 'Phrase Hints', 'phrase_list', '',
+            'Comma-separated words or names Azure should recognise (product names, jargon). Default: none');
         this._addEntryRow(typeGroup, 'Stop Word', 'end_word', 'over',
             'Say this word to stop recording immediately. Default: over');
 
@@ -350,6 +352,13 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         });
 
         // ── Voices ──
+        const backendGroup = new Adw.PreferencesGroup({title: 'Speech Backend'});
+        page.add(backendGroup);
+        this._addComboRow(backendGroup, 'Primary Provider', 'speech_backend', [
+            ['azure', 'Azure (cloud) — your local Wyoming server only as fallback'],
+            ['local', 'Local (Piper / Parakeet on your Wyoming server) — Azure only as fallback'],
+        ], 'azure');
+
         const voiceGroup = new Adw.PreferencesGroup({title: 'Voices'});
         page.add(voiceGroup);
 
