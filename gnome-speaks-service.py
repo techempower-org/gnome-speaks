@@ -745,6 +745,46 @@ def _is_ydotoold_running():
 _ydotool_reset_lock = threading.Lock()
 
 
+_YDOTOOLD_UNIT_CANDIDATES = ("ydotool.service", "ydotoold.service")
+
+
+def _ydotoold_unit(proc_root="/proc"):
+    """(scope, unit) of the systemd unit that owns the LIVE ydotoold, or None.
+
+    Two units can exist on one machine -- the packaged user unit
+    `ydotool.service` (/usr/bin/ydotoold) and fix-ydotool.sh's `ydotoold.service`
+    (/usr/local/bin/ydotoold) -- and only one of them can hold the socket.
+    Restarting the other one starts a second daemon that exits with "Another
+    ydotoold is running with the same socket", trips the start limit, and
+    never clears a stuck key (#102). So ask the kernel which unit owns the
+    process: /proc/<pid>/exe (the executable, never a name pattern -- a cmdline
+    scan matches its own shell) and /proc/<pid>/cgroup for the unit.
+    scope is "user" or "system".
+    """
+    try:
+        pids = [d for d in os.listdir(proc_root) if d.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            exe = os.readlink(os.path.join(proc_root, pid, "exe"))
+        except OSError:
+            continue
+        if os.path.basename(exe) != "ydotoold":
+            continue
+        try:
+            with open(os.path.join(proc_root, pid, "cgroup")) as fh:
+                cg = fh.read()
+        except OSError:
+            continue
+        m = re.search(r"/([^/\s]+\.service)\s*$", cg, re.M)
+        if not m:
+            continue
+        scope = "user" if "/user.slice/" in cg or "user@" in cg else "system"
+        return scope, m.group(1)
+    return None
+
+
 def _reset_ydotoold():
     """Restart ydotoold to clear any stuck key state on its virtual device.
 
@@ -753,6 +793,11 @@ def _reset_ydotoold():
     compositor then suppresses that key from all physical keyboards. Restarting
     the daemon destroys the old virtual device and creates a clean one.
 
+    Restarts the unit that OWNS the live daemon (see _ydotoold_unit); with no
+    daemon running, starts the first known unit that exists. Never restarts a
+    unit by an assumed name -- that is how the reset became a no-op that left
+    a failed unit behind (#102).
+
     Uses a lock to prevent two threads from restarting simultaneously.
     """
     if not _YDOTOOL_V1:
@@ -760,14 +805,34 @@ def _reset_ydotoold():
     if not _ydotool_reset_lock.acquire(blocking=False):
         return  # another thread is already restarting
     try:
-        subprocess.run(
-            ["systemctl", "--user", "restart", "ydotoold"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
+        owner = _ydotoold_unit()
+        if owner is not None:
+            scope, unit = owner
+            if scope != "user":
+                log.warning("ydotoold runs as system unit %s; cannot restart it "
+                            "without privileges -- stuck keys need `sudo systemctl "
+                            "restart %s`", unit, unit)
+                return
+            cmd = ["systemctl", "--user", "restart", unit]
+        else:
+            # No daemon at all: start (not restart) the first candidate that exists.
+            unit = None
+            for cand in _YDOTOOLD_UNIT_CANDIDATES:
+                probe = subprocess.run(
+                    ["systemctl", "--user", "cat", cand],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                if probe.returncode == 0:
+                    unit = cand
+                    break
+            if unit is None:
+                log.warning("No ydotoold running and no known unit to start")
+                return
+            cmd = ["systemctl", "--user", "start", unit]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=5)
         # Give ydotoold time to create the new virtual device
         time.sleep(0.1)
-        log.info("Reset ydotoold to clear stuck key state")
+        log.info("Reset ydotoold (%s) to clear stuck key state", unit)
     except Exception as e:
         log.warning("Failed to restart ydotoold: %s", e)
     finally:
