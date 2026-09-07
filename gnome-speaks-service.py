@@ -1111,6 +1111,39 @@ def _make_injector():
     return ydotool
 
 
+_SPEECH_ROUTE_WORDS = {
+    None: "Azure live",
+    "forced": "forced offline: SPEECH_FORCE_OFFLINE is set, no Azure fallback",
+    "prefer_local": "local preferred: speech_backend=local, Azure only as fallback",
+    "azure_down": "Azure on cooldown after a failure",
+}
+
+
+def _speech_route_words(reason=None):
+    """Human words for why Azure is (not) being used right now (#103)."""
+    if reason is None:
+        reason = wyoming_mod.skip_reason() if hasattr(wyoming_mod, "skip_reason") else None
+    return _SPEECH_ROUTE_WORDS.get(reason, str(reason))
+
+
+def speech_route():
+    """Machine-readable routing state for GET /status and the startup log.
+
+    backend        what config asks for: "azure" | "local"
+    offline_reason None while Azure is live, else "forced" | "prefer_local" |
+                   "azure_down" (see wyoming.skip_reason)
+    local_down     the LAN server is on cooldown after a failure
+    """
+    reason = wyoming_mod.skip_reason() if hasattr(wyoming_mod, "skip_reason") else None
+    return {
+        "backend": str(CONFIG.get("speech_backend", "azure")).strip().lower(),
+        "offline_reason": reason,
+        "local_down": bool(getattr(wyoming_mod, "local_down", lambda: False)()),
+        "forced_offline": bool(wyoming_mod.force_offline()),
+        "wyoming_configured": bool(wyoming_mod.enabled()),
+    }
+
+
 def get_injector():
     """The process-wide injection backend (lazy, rebuilt when config changes)."""
     global _injector, _injector_method, _injector_fallback_since
@@ -1258,7 +1291,10 @@ def _refresh_fs_case_cache():
         except OSError:
             pass
     # Also include configured phrase_list entries
-    for phrase in CONFIG.get("phrase_list", []):
+    _pl = CONFIG.get("phrase_list", []) or []
+    if isinstance(_pl, str):  # prefs stores an entry row as one string
+        _pl = [p.strip() for p in _pl.split(",") if p.strip()]
+    for phrase in _pl:
         for word in phrase.split():
             cache[word.lower()] = word
     _fs_case_cache = cache
@@ -1921,6 +1957,10 @@ class GnomeSpeaksService:
 
     # Boolean flags that prefs.js can change on disk while the service runs.
     _SYNC_FLAGS = (
+        # Speech provider (a STRING, applied verbatim -- the loop below does no
+        # bool cast): "azure" | "local". Prefs flips it; a running service must
+        # follow without a restart (#104).
+        "speech_backend",
         # Mode flags
         "conversation_mode", "continuous_dictation", "dictation_mode",
         "terminal_mode", "skip_final_paste", "read_notifications",
@@ -2239,7 +2279,8 @@ class GnomeSpeaksService:
         # speech (#49).
         if mode == "streaming" and wyoming_mod.skip_azure():
             mode = "vad" if HAS_VAD else "fixed"
-            log.info("Azure marked down — routing STT to %s (offline fallback)", mode)
+            log.info("Skipping Azure STT (%s) — routing to %s via the local Wyoming server",
+                     _speech_route_words(), mode)
 
         # Use non-streaming STT backends (whisper, vad, fixed)
         if mode in ("whisper", "vad", "fixed"):
@@ -5258,6 +5299,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
     def _handle_status(self):
         svc = self.service
         current = svc.current_state
+        route = speech_route()
         paused = state._pause_event.is_set() if hasattr(state, '_pause_event') else False
 
         progress = None
@@ -5279,8 +5321,10 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
                     "text": p["text"],
                 }
 
-        result = {"state": current, "paused": paused,
-                  "queue_depth": svc._tts_queue.qsize()}
+        result = {
+            "state": current, "paused": paused,
+            "speech": route,
+            "queue_depth": svc._tts_queue.qsize()}
         if progress is not None:
             result["progress"] = progress
         self._send_json(result)
@@ -5618,6 +5662,7 @@ def main():
         "Starting GNOME Speaks service (speech=%s, region=%s, vad=%s, ws=%s, whisper=%s)",
         _SPEECH_ENGINE, CONFIG.get("region"), HAS_VAD, HAS_WS, HAS_WHISPER,
     )
+    log.info("Speech route at start: %s", _speech_route_words())
 
     # Detect typing tool in background to avoid blocking startup with
     # shutil.which() + pidof subprocess calls (~100-200ms).
