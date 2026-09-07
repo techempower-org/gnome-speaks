@@ -995,6 +995,12 @@ _INJECTION_METHODS = ("ydotool", "ibus", "auto")
 _injector = None
 _injector_method = None
 _injector_lock = threading.Lock()
+# When "ibus"/"auto" resolved to the ydotool fallback because the daemon was
+# not reachable (typically: the service started before ibus-daemon at login),
+# remember when, so get_injector() can retry instead of caching the fallback
+# for the whole session (#100). None = the cached backend is the one asked for.
+_injector_fallback_since = None
+_INJECTOR_RETRY_SECONDS = 15.0
 
 
 def _make_injector():
@@ -1042,12 +1048,12 @@ def _make_injector():
 
 def get_injector():
     """The process-wide injection backend (lazy, rebuilt when config changes)."""
-    global _injector, _injector_method
+    global _injector, _injector_method, _injector_fallback_since
     method = str(CONFIG.get("injection_method") or "ydotool").strip().lower()
-    if _injector is not None and method == _injector_method:
+    if _injector is not None and method == _injector_method and not _fallback_retry_due(rearm=False):
         return _injector
     with _injector_lock:
-        if _injector is not None and method == _injector_method:
+        if _injector is not None and method == _injector_method and not _fallback_retry_due(rearm=True):
             return _injector
         previous = _injector
         if previous is not None:
@@ -1058,9 +1064,35 @@ def get_injector():
                 log.debug("Previous injector cancel failed", exc_info=True)
         _injector = _make_injector()
         _injector_method = method
+        wanted_ibus = method in ("ibus", "auto") and IbusInjector is not None
+        if wanted_ibus and getattr(_injector, "name", "") == "ydotool":
+            if _injector_fallback_since is None:
+                _injector_fallback_since = time.monotonic()
+        else:
+            _injector_fallback_since = None
         log.info("Injection backend: %s (injection_method=%s)",
                  _injector.name, method)
         return _injector
+
+
+def _fallback_retry_due(rearm):
+    """True when the cached backend is an unwanted ydotool fallback and the
+    retry interval has passed. Bounded: one retry per interval, never a spin.
+
+    The lock-free fast path in get_injector() asks with rearm=False (a pure
+    read); only the caller holding _injector_lock rearms, so several callers
+    arriving together cost one attempt, and the fast path can never rearm the
+    clock out from under the caller about to rebuild.
+    """
+    global _injector_fallback_since
+    since = _injector_fallback_since
+    if since is None:
+        return False
+    if time.monotonic() - since < _INJECTOR_RETRY_SECONDS:
+        return False
+    if rearm:
+        _injector_fallback_since = time.monotonic()
+    return True
 
 
 class _LiveTyper:

@@ -3,6 +3,11 @@ Description=GNOME Speaks - Shared Speech Service (TTS/STT via Azure)
 Documentation=https://github.com/jphein/gnome-speaks
 # Start after the graphical session is ready (audio devices available)
 After=graphical-session.target
+# Order after ibus-daemon when the session has one, so the IBus injection
+# backend finds the daemon at start instead of falling back to ydotool for
+# the whole session (#100). A missing unit is ignored by After=, so this is
+# harmless on sessions without IBus.
+After=org.freedesktop.IBus.session.GNOME.service
 Wants=graphical-session.target
 
 [Service]
