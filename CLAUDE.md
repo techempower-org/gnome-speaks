@@ -219,6 +219,12 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 - **`addTopChrome` and `affectsInputRegion`**: GNOME 49+ tracks input regions from reactive actors automatically and **rejects** the param. It defaulted to `true` on 46-48, so omitting it is behavior-identical everywhere -- never re-add it.
 - **St renders only ONE box-shadow**: comma-separated shadow lists log `Ignoring excess values` per rule and the extra layers never draw. Keep one shadow per rule and get depth from gradients instead.
 - **`log()` is deprecated in GJS**: use `console.log/warn/error/debug`. Service-absent paths should log at `debug` so a solo-extension install (EGO users with no service) stays quiet.
+- **`PopupSwitchMenuItem.setToggleState()` FIRES `toggled` on GNOME 50** (it is `this.set({state})`, and the
+  item forwards its switch's `notify::state` as `toggled`), so a programmatic sync runs the same handler a
+  click does. Syncing a menu switch from the D-Bus reply of the toggle it mirrors is an infinite loop at
+  round-trip speed (#98: conversation mode flipped every ~5 ms, the badge flew offscreen). Every
+  programmatic switch write goes through `_setSwitchQuietly()`, and every `toggled` handler returns early
+  while `_quietSwitch` is set -- never call `setToggleState` directly.
 - **`PopupSubMenu.open()` refuses an EMPTY submenu** (`popupMenu.js` guards on `isEmpty()`): populating a submenu from its own `open-state-changed` deadlocks -- the event never fires, the row is dead. Seed a placeholder at build time and refresh from the PARENT menu's open instead (the Chronicle submenu bug, cff6745).
 - **Subtitles are conversation-mode only**: both user-voice subtitle paths early-return on `!this._conversationMode` (in dictation the text is already at the cursor). `subtitles_user` / `subtitles_tts` gate the two directions independently *on top of* the `live_subtitles` master; `live_subtitles` is dual-written to GSettings `live-subtitles` because the overlay gates on the GSettings layer.
 - **Orca's Spiel switch moved**: `orca.settings.speechSystemOverride` **no longer exists** in Orca 50 -- an `orca-customizations.py` setting it does nothing silently. Use the relocatable GSettings schema: `gsettings set "org.gnome.Orca.Speech:/org/gnome/orca/default/speech/" speech-server-factory spiel` (values: `speechdispatcherfactory` | `spiel`; the `:path` suffix is mandatory). libspiel is still unpackaged on Ubuntu 26.04 -- source build + `~/.config/environment.d/` typelib path.
