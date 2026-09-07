@@ -551,6 +551,7 @@ export default class GnomeSpeaksExtension extends Extension {
 
         // Pills — hidden in idle, shown when active
         this._conversationMode = false;
+        this._quietSwitch = false;
         this._continuousMode = false;
         this._terminalMode = false;
 
@@ -829,6 +830,24 @@ export default class GnomeSpeaksExtension extends Extension {
             isHD ? 'gnome-speaks-quality-hd' : 'gnome-speaks-quality-fast');
     }
 
+    // Set a PopupSwitchMenuItem's state WITHOUT running its 'toggled'
+    // handler. On GNOME 50 setToggleState() is `this.set({state})`, and the
+    // item forwards its switch's notify::state as 'toggled' -- so a
+    // programmatic sync fires the same handler a click does. Syncing the
+    // menu switch from a D-Bus reply therefore re-invoked the toggle, which
+    // flipped the mode back, which re-synced the switch ... one flip per
+    // round trip (~5 ms) until the badge had animated itself off the screen
+    // (#98). The emission is synchronous inside set(), so a flag suffices.
+    _setSwitchQuietly(item, state) {
+        if (!item || item.state === state) return;
+        this._quietSwitch = true;
+        try {
+            item.setToggleState(state);
+        } finally {
+            this._quietSwitch = false;
+        }
+    }
+
     _toggleMode() {
         if (!this._proxy) {
             // Local toggle for testing without service
@@ -841,9 +860,8 @@ export default class GnomeSpeaksExtension extends Extension {
             let enabled = result[0];
             this._conversationMode = enabled;
             this._updateModePill();
-            // Sync the panel menu toggle (without re-triggering its callback)
-            if (this._menuConversationToggle)
-                this._menuConversationToggle.setToggleState(enabled);
+            // Sync the panel menu switch quietly -- see _setSwitchQuietly.
+            this._setSwitchQuietly(this._menuConversationToggle, enabled);
         });
     }
 
@@ -946,8 +964,7 @@ export default class GnomeSpeaksExtension extends Extension {
             if (this._destroyed || error) return;
             this._continuousMode = result[0];
             this._updateContinuousPill();
-            if (this._menuContinuousToggle)
-                this._menuContinuousToggle.setToggleState(this._continuousMode);
+            this._setSwitchQuietly(this._menuContinuousToggle, this._continuousMode);
         });
     }
 
@@ -1393,20 +1410,21 @@ export default class GnomeSpeaksExtension extends Extension {
 
         this._menuConversationToggle = new PopupMenu.PopupSwitchMenuItem('AI Conversation', false);
         this._menuConversationToggle.connect('toggled', (item, state) => {
-            if (!this._proxy) return;
+            if (this._quietSwitch || !this._proxy) return;
             this._proxy.ToggleConversationModeRemote((result, error) => {
                 if (this._destroyed || error) return;
                 let enabled = result[0];
                 this._conversationMode = enabled;
                 this._updateModePill();
                 if (enabled !== state)
-                    item.setToggleState(enabled);
+                    this._setSwitchQuietly(item, enabled);
             });
         });
         menu.addMenuItem(this._menuConversationToggle);
 
         this._menuContinuousToggle = new PopupMenu.PopupSwitchMenuItem('Continuous Dictation', false);
         this._menuContinuousToggle.connect('toggled', () => {
+            if (this._quietSwitch) return;
             this._callMethod('ToggleContinuousDictation');
         });
         menu.addMenuItem(this._menuContinuousToggle);
@@ -1455,6 +1473,7 @@ export default class GnomeSpeaksExtension extends Extension {
 
         this._menuBadgeToggle = new PopupMenu.PopupSwitchMenuItem('Show Badge', this._badgeVisible);
         this._menuBadgeToggle.connect('toggled', (item, state) => {
+            if (this._quietSwitch) return;
             this._badgeVisible = state;
             if (this._badge) {
                 if (state) {
@@ -1822,8 +1841,7 @@ export default class GnomeSpeaksExtension extends Extension {
             if (!error && result) {
                 this._conversationMode = result[0];
                 this._updateModePill();
-                if (this._menuConversationToggle)
-                    this._menuConversationToggle.setToggleState(this._conversationMode);
+                this._setSwitchQuietly(this._menuConversationToggle, this._conversationMode);
             }
         });
         this._proxy.GetContinuousDictationRemote((result, error) => {
@@ -1831,8 +1849,7 @@ export default class GnomeSpeaksExtension extends Extension {
             if (!error && result) {
                 this._continuousMode = result[0];
                 this._updateContinuousPill();
-                if (this._menuContinuousToggle)
-                    this._menuContinuousToggle.setToggleState(this._continuousMode);
+                this._setSwitchQuietly(this._menuContinuousToggle, this._continuousMode);
             }
         });
         this._proxy.GetTerminalModeRemote((result, error) => {
@@ -1926,8 +1943,7 @@ export default class GnomeSpeaksExtension extends Extension {
                     if (!error && result) {
                         this._conversationMode = result[0];
                         this._updateModePill();
-                        if (this._menuConversationToggle)
-                            this._menuConversationToggle.setToggleState(this._conversationMode);
+                        this._setSwitchQuietly(this._menuConversationToggle, this._conversationMode);
                     }
                 });
             }
@@ -2557,8 +2573,7 @@ export default class GnomeSpeaksExtension extends Extension {
 
         let hideItem = this._createMenuItem('Hide Badge', () => {
             this._badgeVisible = false;
-            if (this._menuBadgeToggle)
-                this._menuBadgeToggle.setToggleState(false);
+            this._setSwitchQuietly(this._menuBadgeToggle, false);
             this._badge.ease({
                 opacity: 0, duration: 200, mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             });
