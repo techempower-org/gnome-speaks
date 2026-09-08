@@ -165,8 +165,10 @@ done
 # wake-watcher (#121): same shape, same reason. The watcher is a daemon thread
 # the SERVICE CONSTRUCTOR starts, so one process per case guarantees exactly one
 # watcher per verdict and no case inherits a thread the previous one armed.
-# Only B discriminates the pre-#41 baseline (11c8f60); A, C, D, E, F are guards.
-for c in A B C D E F; do
+# B discriminates the pre-#41 baseline (11c8f60); G and H discriminate the
+# pre-#137 baseline (a20afea), and B, C, F go red there too (they assert the
+# start-up ramp). A, D, E are guards.
+for c in A B C D E F G H; do
     out=$(cd "$HERE/wake-watcher" && timeout 300 python3 repro_wake_watcher.py "$c" 2>/dev/null)
     st=$?
     line wake-watcher "case $c" "$st" "$out"
