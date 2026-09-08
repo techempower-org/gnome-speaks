@@ -1974,11 +1974,13 @@ class GnomeSpeaksService:
                          name="tts-queue-dispatcher").start()
 
         # Voice spellbook (incantation layer) — "cast …" routes here instead
-        # of typing/LLM. Repo default + user overlay, mtime hot-reload.
+        # of typing/LLM. Repo default + user overlay, mtime hot-reload. The
+        # overlay path is spellbook's seam, never a literal here (#152): the
+        # repro harnesses pin it into scratch before constructing a service.
         self._spellbook_paths = (
             os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "spellbook.json"),
-            os.path.expanduser("~/.config/speech-to-cli/spellbook.json"),
+            spellbook.USER_SPELLBOOK_PATH,
         )
         self._spellbook = spellbook.load_spellbook(*self._spellbook_paths)
         self._spellbook_mtimes = self._spellbook_stat()
