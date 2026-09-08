@@ -4315,8 +4315,13 @@ class GnomeSpeaksService:
             done_event.set()
 
     def set_language(self, language):
-        """Change the STT language at runtime."""
-        CONFIG["language"] = language
+        """Change the STT language at runtime.
+
+        Persist it: "language" is in _SYNC_FLAGS, so a bare CONFIG write is
+        overwritten from disk by the next start_listening()'s
+        _reload_config_flags() (#133).
+        """
+        self._save_config_flag("language", language)
         log.info("Language set to: %s", language)
         _invalidate_stt_ws()
         return True
