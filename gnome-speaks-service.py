@@ -1994,10 +1994,20 @@ class GnomeSpeaksService:
         "debug",
     )
 
+    # How often the main loop polls CONFIG_PATH's mtime (#124). A stat every
+    # 2 s is the whole cost; the parse only runs when the file changed.
+    CONFIG_WATCH_SECONDS = 2
+
     def _reload_config_flags(self):
         """Re-read boolean mode flags from config file so prefs changes take effect.
 
         Skips JSON parse if file mtime is unchanged since last read.
+
+        Two callers: the non-quick hotkey path in start_listening(), and the
+        main-loop poll started by _start_config_watch() (#124). The poll is
+        what makes prefs.js's "most settings apply live" true -- before it, a
+        speech_backend / wake_word / chronicle flip sat on disk until the next
+        NON-quick hotkey press, and wake-opened and loop sessions are quick.
         """
         try:
             mtime = os.path.getmtime(CONFIG_PATH)
@@ -2014,6 +2024,20 @@ class GnomeSpeaksService:
                     CONFIG[key] = disk[key]
         except Exception as exc:
             log.debug("Config reload skipped: %s", exc)
+
+    def _start_config_watch(self):
+        """Poll CONFIG_PATH from the main loop so prefs changes land without a
+        hotkey press (#124). Returns the GLib source id.
+
+        A timer, not a Gio.FileMonitor: prefs.js and _save_config_flag both
+        publish by rename, but a monitor still fires per event and a parse
+        that fails mid-write would not be retried until the next one. The
+        mtime gate in _reload_config_flags already makes polling free.
+        """
+        def _tick():
+            self._reload_config_flags()
+            return GLib.SOURCE_CONTINUE
+        return GLib.timeout_add_seconds(self.CONFIG_WATCH_SECONDS, _tick)
 
     def _save_config_flag(self, key, value):
         """Write a single flag back to the config file so prefs stays in sync.
@@ -5770,6 +5794,10 @@ def main():
 
     # Start inactivity timer
     service._reset_inactivity_timer()
+
+    # Apply prefs.js edits to config.json while idle (#124). Without this the
+    # only reload was a side effect of the non-quick dictation hotkey.
+    service._start_config_watch()
 
     # Start HTTP REST API server (optional — gracefully skip if port in use)
     http_server = None
