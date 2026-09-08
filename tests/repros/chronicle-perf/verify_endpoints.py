@@ -163,12 +163,31 @@ check("GET /chronicle rejects a bad kind", st == 400, str(st))
 # a respeak of an id living in the ROTATED generation
 oldest = json.loads(open(rotated).readline())
 before = svc._tts_queue.qsize()
+recent_before = len(svc._queue_recent)
+events_before = len(events)
 st, body = post("/respeak", {"id": oldest["id"]})
 check("POST /respeak finds a rotated id", st == 200
       and body.get("respeaking", {}).get("id") == oldest["id"],
       f"{st} {json.dumps(body)[:120]}")
-check("POST /respeak enqueued playback", svc._tts_queue.qsize() > before
-      or svc._queue_current is not None)
+# The dispatcher thread runs get() -> issue token -> claim-under-lock, so a
+# single snapshot taken right after the POST can land between the dequeue
+# and the claim and see the item NEITHER queued NOR current (measured: it
+# did so 3/3 with speech-to-cli's #25 seam tree loaded, 0/3 without -- the
+# import cost shifted the thread timing by ~1 ms, nothing else changed).
+# Playback is asynchronous, so the assertion must be too: wait for any sign
+# the item reached the speaker -- the fake tts started, the item is current
+# or still queued, or it already finished into _queue_recent.
+def _playback_seen():
+    return (len(events) > events_before
+            or svc._queue_current is not None
+            or svc._tts_queue.qsize() > before
+            or len(svc._queue_recent) > recent_before)
+deadline = time.monotonic() + 2.0
+while not _playback_seen() and time.monotonic() < deadline:
+    time.sleep(0.01)
+check("POST /respeak enqueued playback", _playback_seen(),
+      f"events={events[-2:]} current={svc._queue_current is not None} "
+      f"qsize={svc._tts_queue.qsize()} recent={list(svc._queue_recent)[-1:]}")
 st, body = post("/respeak", {"id": 1})
 check("POST /respeak unknown id -> 404", st == 404, str(st))
 srv.shutdown()
