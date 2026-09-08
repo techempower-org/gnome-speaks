@@ -66,6 +66,7 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 |---|---|---|---|
 | `service-audit` | #18–#20, #110, #124 (c8 config-watch), #130 | `7899ccb` | derived (`merge^1`), not re-run; c8 batch-error-toast verified against `025df92` (E1 fails) |
 | `chronicle-perf` | #22 / #27 | `6a1ecae` | derived (`merge^1`), not re-run |
+| `chronicle-perf/repro_audio_info_stall` | #135 | `025df92` | **verified** — 319 ms stall, probe on MainThread |
 | `injector-seam` | #24 | `ea47ff1` | derived (`merge^1`), not re-run |
 | `cancel-tokens` | #21 / #33 | `66edc79` | **verified** — 4 of 5 fail |
 | `dead-recorder` | #57, #48 / #72 | `e863b2c` | **verified** — e, f, h fail; g, i pass |
