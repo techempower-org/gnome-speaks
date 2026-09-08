@@ -4974,18 +4974,34 @@ class GnomeSpeaksService:
         r'(?<=[.!?])'   # lookbehind for sentence-ending punctuation
         r'(?:\s+|$)'    # followed by whitespace or end-of-string
     )
+    # The buffer ENDS on a boundary: punctuation then whitespace. Split above
+    # consumes that whitespace, so it must be recognised before splitting or
+    # the last part comes back looking like an unfinished sentence (#154).
+    _SENTENCE_TAIL_RE = re.compile(r'[.!?]\s+$')
 
     def _split_sentences(self, buffer):
         """Split buffer into (complete_sentences_list, remaining_buffer).
 
-        A sentence is considered complete when it ends with . ! or ?
-        followed by whitespace (or end of string, but only if the stream
-        has finished — callers should only pass is_final=True at the end).
-        Returns (list_of_sentences, leftover_buffer).
+        A sentence is complete when it ends with . ! or ? followed by
+        whitespace. The last part is the leftover ONLY when the buffer does
+        not end on such a boundary; the split consumes the boundary
+        whitespace, so a leftover taken from a buffer ending in ". " came
+        back as "Beta two follows." and the next token fused onto it
+        ("follows.Gamma" -- spoken and subtitled as one sentence, #154).
+        Whitespace is never part of a returned sentence, and the boundary
+        it marked is never carried into the leftover: the caller strips and
+        joins, so the spoken text is the reply with single spaces between
+        sentences. Returns (list_of_sentences, leftover_buffer).
         """
         parts = self._SENTENCE_BOUNDARY_RE.split(buffer)
         # Filter out empty strings from split
         parts = [p for p in parts if p.strip()]
+        if not parts:
+            return [], buffer
+        if self._SENTENCE_TAIL_RE.search(buffer):
+            # Every part is complete -- including the last one, whose
+            # boundary whitespace the split just ate. Nothing to hold back.
+            return parts, ""
         if len(parts) <= 1:
             return [], buffer  # no complete sentence yet
         # All but the last part are complete sentences

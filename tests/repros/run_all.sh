@@ -126,6 +126,10 @@ run subtitle-token repro_e1_stale_complete_frame.py repro_e2_foreign_cancel_free
 run begin-refused  repro_j_first_sentence.py repro_k_remainder.py repro_l_healthy_reply.py
 run tts-prefetch   repro_p1_one_ahead.py repro_p2_stop_after_first.py \
                    repro_p3_claim_window_prefetched.py repro_p4_skip_cannot_reach_reply.py
+# sentence-split (#154): what TEXT the AI reply spoke. Real worker, the fake
+# records the full text handed to synthesis and the GLib spy the subtitle
+# frames; every row asserts speech == reply joined by single spaces.
+run sentence-split repro_s1_token_fusion.py repro_s2_edge_table.py
 run dead-recorder  repro_e_single_shot_turn_end.py repro_f_text_survives_yank.py \
                    repro_g_ws_init_unbound.py repro_h_stale_prewarm.py \
                    repro_i_healthy_loop.py
