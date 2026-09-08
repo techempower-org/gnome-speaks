@@ -71,6 +71,7 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 | `cancel-tokens` | #21 / #33 | `66edc79` | **verified** — 4 of 5 fail |
 | `dead-recorder` | #57, #48 / #72 | `e863b2c` | **verified** — e, f, h fail; g, i pass |
 | `offline-handoff` | #49 / #70 | `70ff468` | **verified** — pre-#70 *and* pre-#72 |
+| `wake-watcher` | #41, #48 / #121 | `11c8f60` | **verified** — B fails (25-spawn storm, zero sleeps); A, C, D, E, F green on both sides |
 | `subtitle-token` | #42 / #78 | `65bd57b` | e1–e4 fail |
 | `begin-refused` | #79 / #84 | `15dd402`, `f290d7e` | j, k fail — **l stays green on both sides** |
 | `pin-lifecycle` | #46 ×#57 | `15dd402` | compound X: X1 FAIL, X2 PASS, X3 FAIL |
