@@ -103,7 +103,7 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 |------|-------------|
 | Type (default) | STT -> typed at cursor via ydotool |
 | AI | STT -> LLM -> TTS (streaming sentence-level) |
-| Loop | Auto-restart listening after each utterance |
+| Loop | Auto-restart listening after each utterance. A badge tap while listening ENDS the utterance (text kept), stops the loop for this run and goes idle (#110, JP's choice (a)); the Loop pill / "cast loop" turns the mode off. Every restart guard checks `_stop_event`, and the batch (VAD) recorder honours it via `stt(stop_when=…)` -- before that a tap in offline/loop mode did nothing until VAD silence or 30 s |
 | Terminal | Lowercase, no punctuation, lexical output |
 | Talk | D-Bus API for external apps (blocking call) |
 | Half/Full Duplex | Auto-detected speaker vs headphone routing |
@@ -141,6 +141,11 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
   wire — #42 took the last two reads out of `_run_subtitle_progress` — so
   `grep -n "_cancel_event" gnome-speaks-service.py` returning only that class and prose is a cheap
   standing check that no new verdict is being read off the wire.
+- **The batch (VAD) recorder only ever watched the CANCEL wire**: `stop_listening()` deliberately leaves the wire
+  alone (it would kill the WS), so in vad mode a stop had no effect until VAD silence or `max_seconds` -- the
+  "stuck listening" of 2026-09-07 (#110). speech-to-cli's `stt(stop_when=…)` / `record_with_vad(stop_when=…)` is
+  the FINISH-EARLY-AND-KEEP predicate; the service passes `self._stop_event.is_set`. `_STT_HAS_STOP_WHEN` guards
+  an older speech-to-cli. Fixed-length recording (`stt_fixed`) still cannot be cut short (WAV header).
 - **`stop()` and `stop_listening()` both set `_stop_event` and mean opposite things**:
   `stop_listening()` is the dictation hotkey — end the utterance, **keep** the text.  `stop()` is the
   panic stop (D-Bus Stop, `POST /stop`, "cast stop", every user-speech preemption) — **abandon** it.
