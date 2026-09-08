@@ -69,6 +69,7 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 | `chronicle-perf/repro_audio_info_stall` | #135 | `025df92` | **verified** — 319 ms stall, probe on MainThread |
 | `injector-seam` | #24 | `ea47ff1` | derived (`merge^1`), not re-run |
 | `cancel-tokens` | #21 / #33 | `66edc79` | **verified** — 4 of 5 fail |
+| `cancel-tokens` `repro_e` | #132 | `025df92` | **verified** — E1, E3 fail; E2 stays green on both sides |
 | `dead-recorder` | #57, #48 / #72 | `e863b2c` | **verified** — e, f, h fail; g, i pass |
 | `offline-handoff` | #49 / #70 | `70ff468` | **verified** — pre-#70 *and* pre-#72 |
 | `wake-watcher` | #41, #48 / #121 | `11c8f60` | **verified** — B fails (25-spawn storm, zero sleeps); A, C, D, E, F green on both sides. The fake `time.sleep` is scoped to the watcher thread by identity — the constructor also starts `tts-queue-dispatcher`, whose 0.2 s hold-polls were being recorded and stopped (A doubles as that guard: ~240 ms window, dispatcher must survive) |
