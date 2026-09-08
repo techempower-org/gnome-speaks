@@ -27,6 +27,15 @@ Seams, all in-process (no audio, no network, no daemon):
                case's budget raises _StopWatcher (a BaseException, so the
                watcher's `except Exception` cannot swallow it and `finally`
                still runs).  Every other attribute delegates to the real module.
+               SCOPED TO THE WATCHER THREAD by identity: the service module has
+               ONE `time`, and the constructor also starts `tts-queue-dispatcher`,
+               which calls time.sleep(0.2) whenever current_state is not idle --
+               exactly what A, D and E set.  An unscoped shim recorded those
+               (29-30 spurious 0.2 s entries per 250 ms window, measured) and
+               killed the dispatcher with _StopWatcher; the shipped windows
+               (6-12 ms) merely fit inside the dispatcher's first real
+               _tts_queue.get(timeout=0.2).  Any other thread gets the real
+               time.sleep and is neither recorded nor stopped.
   * subprocess -> a namespace whose Popen returns a kill-tracking fake built on
                dead-recorder/fakes.py; PIPE/DEVNULL are the real constants.
   * wyoming_mod.detect_stream -> per-case fake; WyomingError is the REAL class.
@@ -79,14 +88,19 @@ threading.excepthook = _quiet_stop
 
 
 class FakeTime:
-    """time module shim: sleep() is recorded and near-instant."""
+    """time module shim: sleep() is recorded and near-instant -- on the
+    watcher thread ONLY. Every other caller gets the real time.sleep."""
 
     def __init__(self):
         self.sleeps = []            # every sleep() since arm()
         self.armed = False
         self.stop_after = None      # number of recorded sleeps before stopping
+        self.thread = None          # the one thread whose sleeps are ours
 
     def sleep(self, seconds):
+        if threading.current_thread() is not self.thread:
+            time.sleep(seconds)     # not under test: behave like the real module
+            return
         if self.armed:
             self.sleeps.append(seconds)
             if self.stop_after is not None and len(self.sleeps) >= self.stop_after:
@@ -160,6 +174,9 @@ class Rig:
         self.svc = harness.make_service(m)       # starts the REAL watcher thread
         self.thread = next((t for t in threading.enumerate()
                             if t.name == "wake-watcher"), None)
+        self.ftime.thread = self.thread      # scope the fake sleep to it
+        self.dispatcher = next((t for t in threading.enumerate()
+                                if t.name == "tts-queue-dispatcher"), None)
 
         def start_listening(quick=False, wake=False):
             self.starts.append(dict(quick=quick, wake=wake))
@@ -199,16 +216,30 @@ def report(label, checks):
 
 
 def case_a():
-    """Not idle: the watcher must never touch the recorder or the server."""
+    """Not idle: the watcher must never touch the recorder or the server.
+
+    The window is deliberately LONG (~240 ms, past the dispatcher's first
+    real 0.2 s queue timeout): while state is `listening` the dispatcher
+    thread sleeps 0.2 s per hold-poll through the same module `time`, and
+    this case doubles as the harness's own guard that only the watcher's
+    sleeps are recorded and only the watcher is stopped."""
+    stop_after = 120
     rig = Rig(KilledLiveProc)
     rig.set_state("listening")
-    if not rig.arm(stop_after=6):
+    if not rig.arm(stop_after=stop_after):
         return 2
-    print(f"  sleeps={rig.ftime.sleeps} spawns={len(rig.procs)} detects={rig.detects}")
+    spurious = [s for s in rig.ftime.sleeps if s != 0.5]
+    disp_alive = rig.dispatcher is not None and rig.dispatcher.is_alive()
+    print(f"  sleeps={len(rig.ftime.sleeps)} spurious={spurious} spawns={len(rig.procs)} "
+          f"detects={rig.detects} dispatcher_alive={disp_alive}")
     return report("A not-idle -> zero spawns", [
         (len(rig.procs) == 0, "no pw-record spawned while not idle"),
         (rig.detects == 0, "detect_stream never called while not idle"),
-        (all(s == 0.5 for s in rig.ftime.sleeps), "idle poll is the 0.5 s tick"),
+        (all(s == 0.5 for s in rig.ftime.sleeps),
+         f"idle poll is the 0.5 s tick (spurious: {spurious})"),
+        (len(rig.ftime.sleeps) == stop_after,
+         f"exactly {stop_after} sleeps recorded -- only the watcher's (got {len(rig.ftime.sleeps)})"),
+        (disp_alive, "tts-queue-dispatcher survived the armed window (not stopped by the shim)"),
     ])
 
 
