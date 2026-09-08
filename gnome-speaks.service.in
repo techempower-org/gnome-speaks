@@ -1,6 +1,7 @@
 [Unit]
 Description=GNOME Speaks - Shared Speech Service (TTS/STT via Azure)
 Documentation=https://github.com/jphein/gnome-speaks
+# Start after the graphical session is ready (audio devices available)
 After=graphical-session.target
 # Order after ibus-daemon when the session has one, so the IBus injection
 # backend finds the daemon at start instead of falling back to ydotool for
@@ -12,15 +13,21 @@ Wants=graphical-session.target
 [Service]
 Type=dbus
 BusName=org.gnome.Speaks
+# The exec placeholder below is rendered by both installers -- meson's
+# configure_file and install.sh's sed (#126). This template is the only unit
+# source of truth; there is no pre-rendered copy in the repo.
 ExecStart=@SERVICE_EXEC@
 # Release blocker, not polish: a crash between SetGlobalEngine(ours) and
 # SetGlobalEngine(prior) leaves NO global engine and the daemon does not
 # auto-revert (measured, GNOME 50.1). This runs on every stop, including
 # restart and OOM-kill. '-' so a failed restore never blocks the stop.
 ExecStopPost=-@SERVICE_EXEC@ --restore-ime
+# Always restart so the HTTP API on :7710 stays reachable; the inactivity
+# timeout is disabled below for the same reason.
 Restart=always
 RestartSec=2
 TimeoutStopSec=10
+# Import session environment for PipeWire, Wayland, and clipboard access
 PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR PULSE_SERVER
 Environment=SPEECH_ENGINE_PATH=%h/Projects/speech-to-cli
 Environment=CLOUD_CHAT_PATH=%h/Projects/cloud-chat-assistant

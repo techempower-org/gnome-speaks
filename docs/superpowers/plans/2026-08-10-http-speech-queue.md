@@ -9,7 +9,7 @@
 **Tech Stack:** Python 3 stdlib only (`queue`, `threading`, `dataclasses`, `itertools`). No test framework (project convention) — validation is `py_compile` + service restart + curl/dbus-send live checks. Spec: `docs/superpowers/specs/2026-08-10-http-speech-queue-design.md`.
 
 **Context facts** (verified 2026-08-10):
-- systemd runs the repo file directly: `ExecStart=/home/jp/Projects/gnome-speaks/gnome-speaks-service.py`. Service changes need only `systemctl --user restart gnome-speaks.service`. No extension.js changes in this plan → no shell restart needed.
+- systemd runs the repo file directly: `ExecStart=<checkout>/gnome-speaks-service.py` (rendered from `gnome-speaks.service.in` by `install.sh`). Service changes need only `systemctl --user restart gnome-speaks.service`. No extension.js changes in this plan → no shell restart needed.
 - `import queue` exists (line ~32). `itertools` and `dataclasses` do NOT — Task 1 adds them.
 - A post-commit hook auto-deploys to the extensions dir (harmless here; docs+service only).
 - Line numbers below are from commit `c62bcb0`; they shift as tasks land — anchor by symbol name.

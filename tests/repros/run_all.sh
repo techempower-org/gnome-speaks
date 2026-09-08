@@ -131,6 +131,13 @@ run injector-seam  verify_injector_seam.py verify_ibus_injector.py repro_fallbac
 run version-cache  verify_version_cache.py repro_a_fork_storm.py
 run spellbook      verify_spellbook.py
 
+# leak-scan is bash and scans the TRACKED TREE of this repo, not GS_SVC_PATH:
+# the repo is public and the maintainer's home path, LAN names and the HA
+# domain must never be committed (#126). It is excluded from its own scan and
+# proves the pattern matches a planted string before it believes a zero.
+out=$(timeout 60 "$REPO/tests/leak-scan.sh" 2>&1); st=$?
+line leak-scan "leak-scan.sh (tracked tree)" "$st" "$out"
+
 # ---------------------------------------------------------------------------
 # offline-handoff: ONE PROCESS PER CASE, on purpose.
 #

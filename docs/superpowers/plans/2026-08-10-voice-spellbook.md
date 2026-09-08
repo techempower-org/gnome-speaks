@@ -313,7 +313,7 @@ curl -s -X POST localhost:7710/cast -H 'Content-Type: application/json' -d '{"te
 curl -s -X POST localhost:7710/cast -H 'Content-Type: application/json' -d '{"text":"cast frobnicate"}'  # handled true + speaks fizzle
 # mode spell + config flip:
 curl -s -X POST localhost:7710/cast -H 'Content-Type: application/json' -d '{"text":"cast terminal mode"}'
-python3 -c "import json; print(json.load(open('/home/jp/.config/speech-to-cli/config.json'))['terminal_mode'])"  # True
+python3 -c "import json, os; print(json.load(open(os.path.expanduser('~/.config/speech-to-cli/config.json')))['terminal_mode'])"  # True
 curl -s -X POST localhost:7710/cast -H 'Content-Type: application/json' -d '{"text":"cast type mode"}'
 # skip spell against a queued utterance; journal shows CAST lines
 git add gnome-speaks-service.py install.sh && git commit -m "feat: wire spellbook into STT paths, add POST /cast seam"
