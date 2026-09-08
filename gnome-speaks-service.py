@@ -5236,22 +5236,25 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         held = None
         if body.get("interrupt"):
             flushed = svc._drain_tts_queue()
-            # User outranks agents -- on THIS path too (#132). stop() runs
-            # cancel_all(), which would also cancel a live dictation token
-            # and discard the user's in-progress transcript, or cut off the
-            # user's own SpeakClipboard/Talk. So while the mic/LLM is busy or
-            # a user-speech path holds the queue, only the agent backlog is
-            # flushed; the item queues and the dispatcher's hold speaks it
-            # once the user is done. The response says so in `held`.
-            if svc._user_speech_active.is_set():
-                held = "user speech"
-            elif svc.current_state in ("listening", "processing"):
-                held = svc.current_state
-            if held is not None:
-                log.info("Speech queue: interrupt held (%s) -- user session "
-                         "kept, %d queued item(s) flushed", held, flushed)
-            else:
-                svc.stop(drain_queue=False)
+            # User outranks agents -- on THIS path too (#132). This used to
+            # call stop(drain_queue=False), and stop() runs cancel_all(): every
+            # live token, including a begun dictation (its transcript is then
+            # discarded and the state forced idle), or the user's own
+            # SpeakClipboard/Talk. Gating stop() on a snapshot of current_state
+            # was not enough either: a start_listening() landing between the
+            # read and cancel_all() still lost its stt-stream token (measured
+            # 21/300 at a 0-4 ms offset; 0/80 serialized). So this path never
+            # calls stop() at all. It cancels exactly one token -- the queue's
+            # CURRENT item, read together with the item under
+            # _queue_current_lock -- and the dispatcher only ever publishes
+            # tokens it issued itself (label "queue"), so an agent seam
+            # structurally cannot reach a user token, whatever the timing.
+            # The agent backlog is flushed above; the playing agent item is
+            # cut off here; the new item queues, and if the user is (or by
+            # then becomes) busy the dispatcher's hold speaks it afterwards.
+            cut = svc.skip_current()
+            if cut is not None:
+                log.info("Speech queue: interrupt cut off item %d", cut)
                 # The dispatcher clears _queue_current moments after the
                 # cancel; wait briefly so position/state in the response
                 # reflect the flush.
@@ -5261,6 +5264,17 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
                         if svc._queue_current is None:
                             break
                     time.sleep(0.02)
+            # `held` is an ANNOTATION of the response, not a decision: it
+            # tells the caller why its item will not play right now. Nothing
+            # above depends on it, so a session that starts a microsecond
+            # after this read is simply held by the dispatcher unannounced.
+            if svc._user_speech_active.is_set():
+                held = "user speech"
+            elif svc.current_state in ("listening", "processing"):
+                held = svc.current_state
+            if held is not None:
+                log.info("Speech queue: interrupt held (%s) -- user session "
+                         "kept, %d queued item(s) flushed", held, flushed)
 
         try:
             item_id, position, dropped = svc.enqueue_speech(
