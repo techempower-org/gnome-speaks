@@ -14,7 +14,7 @@ Two-process design connected by session D-Bus (`org.gnome.Speaks`):
 | `injector.py` | imported by the service | The `Injector` seam: the contract both injection backends implement | ~120 |
 | `ibus_injector.py` | imported by the service | `IbusInjector` — text injection as an IBus engine (D-Bus commits, preedit, crash recovery) | ~660 |
 | `spellbook.py` | imported by the service | Incantation matcher + executor ("cast …" → local actions); denylist | ~390 |
-| `spellbook.json` | data | 15 repo spells (self-control); user overlay at `~/.config/speech-to-cli/spellbook.json` merges + hot-reloads | — |
+| `spellbook.json` | data | 15 repo spells (self-control); user overlay at `~/.config/speech-to-cli/spellbook.json` (seam: `spellbook.USER_SPELLBOOK_PATH` / env `GS_SPELLBOOK_USER_PATH`) merges + hot-reloads | — |
 | `spiel_provider.py` | imported by the service | Spiel/libspiel synthesis side (`org.gnome.Speaks.Speech.Provider`); off unless `spiel_provider` | ~120 |
 | `prefs.js` | GNOME Extensions app (GJS/Gtk4) | 6-page preferences window (task-first redesign, #5e49049) | ~1,540 |
 | `stylesheet.css` | GNOME Shell | Badge states, pills, animations, subtitle overlay, chronicle scroll | ~560 |
@@ -292,6 +292,13 @@ before changing one:
   exactly like a service regression and nearly got a good commit reverted.
   Scratch is per-PID, and reset/cleanup only ever touch a directory the running
   process created.
+- **Never JP's live spellbook overlay** (#152). The service merges
+  `~/.config/speech-to-cli/spellbook.json` over the repo spells at construction,
+  so a harness-built service carried the personal spells (24 loaded, 15 repo).
+  The overlay path is a seam — `spellbook.USER_SPELLBOOK_PATH`, env
+  `GS_SPELLBOOK_USER_PATH` — never a literal in the service; `isolation.py`
+  pins it to an empty scratch overlay and every `make_service()` asserts the
+  loaded count equals the repo `spellbook.json`.
 - **Never JP's live config.** `state.load_config()` reads
   `~/.config/speech-to-cli/config.json` at import, and `_reload_config_flags()`
   re-reads it *mid-run* for every `_SYNC_FLAGS` key -- so pinning a key after

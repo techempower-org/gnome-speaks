@@ -18,6 +18,10 @@ Contract under test (#119):
   4. Op table: every dbus_self.op in spellbook.json has an `op == "<op>"`
      branch in the service's _spell_ctx_dbus -- a typo'd op today is a
      silent FIZZLE_TEXT at runtime, and nothing else checks the join.
+  5. USER_SPELLBOOK_PATH seam (#152): the overlay path defaults to the
+     ~/.config location, honours GS_SPELLBOOK_USER_PATH verbatim (empty =
+     no overlay), and the SERVICE reads the seam rather than a literal --
+     that is what lets tests/repros/isolation.py pin it into scratch.
 
 Imports spellbook.py from the tree under test, NOT the service: the service
 pulls in speech-to-cli and JP's live config at import, and nothing here needs
@@ -226,9 +230,42 @@ def main():
               BOOK_PATH, os.path.join(_SCRATCH, "nope.json"))["spells"])
           == sorted(repo_names))
 
-    print("-- op table: spellbook.json <-> _spell_ctx_dbus")
+    print("-- USER_SPELLBOOK_PATH seam (#152; red on a20afea)")
+    # The overlay path must be a seam the harnesses can pin, not a literal.
+    # Each variant re-execs the module: the env var is read ONCE, at import.
+    saved = os.environ.pop("GS_SPELLBOOK_USER_PATH", None)
+    try:
+        fresh = load_module()
+        check("default overlay path is ~/.config/speech-to-cli/spellbook.json",
+              getattr(fresh, "USER_SPELLBOOK_PATH", None)
+              == os.path.expanduser("~/.config/speech-to-cli/spellbook.json"),
+              repr(getattr(fresh, "USER_SPELLBOOK_PATH", None)))
+        pinned = os.path.join(_SCRATCH, "pinned-overlay.json")
+        os.environ["GS_SPELLBOOK_USER_PATH"] = pinned
+        fresh = load_module()
+        check("GS_SPELLBOOK_USER_PATH pins the overlay path verbatim",
+              getattr(fresh, "USER_SPELLBOOK_PATH", None) == pinned,
+              repr(getattr(fresh, "USER_SPELLBOOK_PATH", None)))
+        os.environ["GS_SPELLBOOK_USER_PATH"] = ""
+        fresh = load_module()
+        check("empty GS_SPELLBOOK_USER_PATH means no overlay",
+              getattr(fresh, "USER_SPELLBOOK_PATH", None) == ""
+              and sorted(fresh.load_spellbook(
+                  BOOK_PATH, fresh.USER_SPELLBOOK_PATH)["spells"])
+              == sorted(repo_names))
+    finally:
+        if saved is None:
+            os.environ.pop("GS_SPELLBOOK_USER_PATH", None)
+        else:
+            os.environ["GS_SPELLBOOK_USER_PATH"] = saved
     with open(SVC_PATH) as f:
         src = f.read()
+    check("service reads spellbook.USER_SPELLBOOK_PATH",
+          "spellbook.USER_SPELLBOOK_PATH" in src)
+    check("service has no literal overlay path",
+          'expanduser("~/.config/speech-to-cli/spellbook.json")' not in src)
+
+    print("-- op table: spellbook.json <-> _spell_ctx_dbus")
     m = re.search(r"def _spell_ctx_dbus\(self, op\):.*?\n    def ", src,
                   re.S)
     check("service has _spell_ctx_dbus", m is not None)

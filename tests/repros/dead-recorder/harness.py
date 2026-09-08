@@ -254,6 +254,9 @@ def load(fake_tts_seconds=1.0):
 
 def make_service(mod):
     svc = mod.GnomeSpeaksService()
+    # #152: the overlay pin is a path; prove it TOOK by counting what this
+    # instance actually loaded against the repo spellbook.json.
+    isolation.assert_repo_spellbook(svc, SVC_PATH)
     svc._audio_detected = True
     svc.play_sound = lambda *a, **k: True
     return svc
