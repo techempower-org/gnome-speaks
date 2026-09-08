@@ -138,6 +138,9 @@ INACTIVITY_TIMEOUT_SEC = int(
 )  # 10 minutes default; set to 0 to disable (e.g. when the HTTP API must stay reachable)
 
 MAX_LISTEN_SECONDS = 30
+# Continuous dictation: this many CONSECUTIVE STT error cycles (not silence)
+# stop the loop for the current run, with one toast naming the route (#117).
+LOOP_ERROR_CAP = 3
 
 # ---------------------------------------------------------------------------
 # DBus introspection XML
@@ -1901,6 +1904,12 @@ class GnomeSpeaksService:
         # STT mode selection (auto, streaming, whisper, vad, fixed)
         self._stt_mode = "auto"
 
+        # Loop mode: consecutive batch STT ERROR cycles in this run (#117).
+        # Reset by a fresh (non-quick) start, by any cycle that yields text or
+        # silence, and when the cap fires. The streaming cycle loop keeps its
+        # own counter -- its cycles never leave the worker.
+        self._loop_error_cycles = 0
+
         # Inactivity timer (touched from every worker thread via _set_state)
         self._inactivity_source_id = None
         self._inactivity_lock = threading.Lock()
@@ -2325,6 +2334,9 @@ class GnomeSpeaksService:
 
         if not quick:
             self._reload_config_flags()
+            # A deliberate start is a new run: an error streak from the last
+            # one must not shorten this one (#117).
+            self._loop_error_cycles = 0
             if not self._audio_detected:
                 _refresh_audio_detection()
                 self._audio_detected = True
@@ -2460,9 +2472,7 @@ class GnomeSpeaksService:
             self._deliver_stt_result(result, mode, cancel_token)
         except Exception as exc:
             log.exception("Batch STT (%s) failed: %s", mode, exc)
-            GLib.idle_add(self._emit_error, f"STT failed: {exc}")
-            self._idle_after_stt()
-            _schedule_warmup()
+            self._stt_error_exit(mode, str(exc), cancel_token)
         finally:
             self._cancels.retire(cancel_token)
 
@@ -2488,12 +2498,12 @@ class GnomeSpeaksService:
         error = result.get("error")
         if error:
             log.error("Batch STT (%s) failed: %s", mode, error)
-            GLib.idle_add(self._emit_error, f"STT failed: {error}")
-            GLib.idle_add(self._emit_transcription_ready, "")
-            self._idle_after_stt()
-            _schedule_warmup()
+            self._stt_error_exit(mode, str(error), cancel_token)
             return
 
+        # Text or clean silence: the backend answered, so the error streak
+        # (#117) is over whatever happens next.
+        self._loop_error_cycles = 0
         user_text = result.get("text", "")
 
         self._set_state("processing")
@@ -2536,6 +2546,62 @@ class GnomeSpeaksService:
             GLib.idle_add(self._restart_listening_cb(
                 lambda: (CONFIG.get("continuous_dictation", False)
                          and not self._stop_event.is_set())))
+
+    def _stt_error_exit(self, mode, error, cancel_token):
+        """One batch STT cycle ended in an ERROR -- not silence. The single
+        exit for the worker's exception path and the {"error": ...} result
+        (#130), so the two cannot drift.
+
+        Single-shot: toast at once, as before. Continuous dictation: one
+        error is not the end of the run -- a single Azure hiccup used to kill
+        the loop -- so re-enter listening, but count it, and after
+        LOOP_ERROR_CAP CONSECUTIVE error cycles stop this run with ONE toast
+        that names the speech route (#117). The loop flag is left on: the next
+        tap resumes the loop. Silence never counts.
+
+        The restart is gated like every restart guard: on
+        CONFIG['continuous_dictation'] AND _stop_event, re-checked when the
+        source fires. _stop_event is set by stop_listening() -- the tap that
+        ends a loop run (#110) -- and by stop(); the token is stop()'s verdict
+        and is checked here too, so a session stop() abandoned can never
+        re-open the mic.
+        """
+        GLib.idle_add(self._emit_transcription_ready, "")
+        self._idle_after_stt()
+        _schedule_warmup()
+        looping = (CONFIG.get("continuous_dictation", False)
+                   and not self._stop_event.is_set()
+                   and not cancel_token.cancelled)
+        if not looping:
+            self._loop_error_cycles = 0
+            GLib.idle_add(self._emit_error, f"STT failed: {error}")
+            return
+        self._loop_error_cycles += 1
+        if self._loop_error_cycles >= LOOP_ERROR_CAP:
+            cycles = self._loop_error_cycles
+            self._loop_error_cycles = 0
+            self._report_loop_error_cap(cycles, error)
+            return
+        log.warning("Loop: STT error %d/%d (%s: %s), re-entering listening",
+                    self._loop_error_cycles, LOOP_ERROR_CAP, mode, error)
+        GLib.idle_add(self._restart_listening_cb(
+            lambda: (CONFIG.get("continuous_dictation", False)
+                     and not self._stop_event.is_set())))
+
+    def _report_loop_error_cap(self, cycles, error):
+        """The single place the "loop stopped on errors" verdict reaches the
+        user (#117): ONE toast naming the speech route -- the diagnosis -- and
+        the last failure. Both loop shapes (batch restarts and the streaming
+        cycle loop) report through here so the wording, and the once-ness,
+        cannot drift apart. The loop flag is deliberately not touched: the
+        next tap resumes continuous dictation.
+        """
+        route = _speech_route_words()
+        log.warning("Loop stopped after %d consecutive STT errors (%s): %s",
+                    cycles, route, error)
+        GLib.idle_add(self._emit_error,
+                      f"Continuous dictation paused after {cycles} STT failures "
+                      f"in a row ({route}): {error}")
 
     def _report_recorder_dead(self, cycle):
         """The single place the lost-microphone verdict reaches the user.
@@ -2773,6 +2839,13 @@ class GnomeSpeaksService:
         recorder_dead = threading.Event()
         failed = None
         inj = None           # pinned backend; bound below, released in cleanup
+        # Loop mode: consecutive cycles that ended in a WS ERROR with no text
+        # (#117). Step 9 used to read "no phrases" as "no speech" and re-enter
+        # listening forever when the socket died inside a cycle -- silently,
+        # one reconnect per cycle. `loop_error_stop` is (cycles, last error)
+        # once the cap fires; it is reported after cleanup, once.
+        error_cycles = 0
+        loop_error_stop = None
         try:
             # 2. Get persistent WebSocket (with exponential backoff retry).
             ws = None
@@ -2906,6 +2979,7 @@ class GnomeSpeaksService:
                 end_word_event = threading.Event()
                 sender_done = threading.Event()
                 raw_frames = []
+                cycle_errors = []    # WS send/recv failures this cycle (#117)
                 typed_partial = [""]
                 raw_partial = [""]
                 typer = _LiveTyper(typed_partial, _log, inj) if live_typing else None
@@ -2917,7 +2991,8 @@ class GnomeSpeaksService:
                 def send_audio(_req_id=request_id, _raw_frames=raw_frames,
                                _end_word_event=end_word_event,
                                _sender_done=sender_done,
-                               _rec_dead=recorder_dead):
+                               _rec_dead=recorder_dead,
+                               _cycle_errors=cycle_errors):
                     try:
                         # Calibrate noise threshold (cached — reads only 1 frame after first call)
                         energy_threshold, cal_frames = calibrate_noise(tap)
@@ -2990,6 +3065,7 @@ class GnomeSpeaksService:
                                 ws.send(_make_ws_audio_msg(_req_id, chunk), opcode=websocket.ABNF.OPCODE_BINARY)
                             except Exception as exc:
                                 _log(f"WS send error at frame {total_frames}: {exc}")
+                                _cycle_errors.append(f"WS send error: {exc}")
                                 break
 
                             energy = rms_energy(chunk)
@@ -3036,6 +3112,7 @@ class GnomeSpeaksService:
                         _log(f"REC END: speech={speech_frames} total={total_frames}")
                     except Exception as exc:
                         _log(f"sender exception: {exc}")
+                        _cycle_errors.append(f"sender error: {exc}")
                     finally:
                         # Send end-of-audio marker for this utterance
                         try:
@@ -3072,6 +3149,7 @@ class GnomeSpeaksService:
                                 continue
                         except Exception as exc:
                             _log(f"WS recv error: {exc}")
+                            cycle_errors.append(f"WS recv error: {exc}")
                             break
 
                         mtype = _parse_ws_msg(msg, phrases, partial_holder, end_word_event, end_word, _log,
@@ -3194,6 +3272,7 @@ class GnomeSpeaksService:
                 # In loop mode the cycle continues listening; replies queue until
                 # the mic closes (never TTS over an open mic).
                 if user_text and self._try_cast(user_text):
+                    error_cycles = 0    # recognized text: the backend works (#117)
                     if live_typing and typed_partial[0]:
                         inj.send_backspaces(len(typed_partial[0]))
                     GLib.idle_add(self._emit_transcription_ready, user_text)
@@ -3219,11 +3298,29 @@ class GnomeSpeaksService:
                 # 9. Emit results and type/copy
                 # In loop mode, skip the "processing" flicker if nothing was said —
                 # just silently re-enter listening on the next cycle.
+                # A cycle that produced text, or ended in clean silence, is a
+                # working backend: the error streak (#117) is over.
+                if user_text or not cycle_errors:
+                    error_cycles = 0
                 if (is_loop and not user_text and not _stopping()
                         and not recorder_dead.is_set()):
                     if live_typing and typed_partial[0]:
                         inj.send_backspaces(len(typed_partial[0]))
-                    _log("no speech in loop cycle, continuing")
+                    if cycle_errors:
+                        # Not silence: the socket failed and nothing was
+                        # recognized. Re-enter listening (the next cycle's
+                        # session init reconnects), but only LOOP_ERROR_CAP
+                        # times in a row -- then stop this run, once, with the
+                        # route named (#117). Reported after cleanup.
+                        error_cycles += 1
+                        _log(f"WS error cycle {error_cycles}/{LOOP_ERROR_CAP}: "
+                             f"{cycle_errors[-1]}")
+                        if error_cycles >= LOOP_ERROR_CAP:
+                            loop_error_stop = (error_cycles, cycle_errors[-1])
+                            GLib.idle_add(self._emit_transcription_ready, "")
+                            break
+                    else:
+                        _log("no speech in loop cycle, continuing")
                     # Quiet cycle = natural gap for starved queue items (agent
                     # messages, spell replies) to play before the mic reopens.
                     self._drain_speech_gap()
@@ -3366,6 +3463,12 @@ class GnomeSpeaksService:
             return
 
         self._idle_after_stt()
+
+        # The loop-error cap (#117): once, after idle, gated on the token like
+        # the recorder report above -- a stop() that abandoned this session
+        # owns its own silence.
+        if loop_error_stop is not None and not cancel_token.cancelled:
+            self._report_loop_error_cap(*loop_error_stop)
 
         # If stop_event was set by turn_end (natural_end) in single-shot mode,
         # and continuous dictation is on, restart via start_listening (legacy path
