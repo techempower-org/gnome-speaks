@@ -181,6 +181,12 @@ MAX_LISTEN_SECONDS = 30
 # Continuous dictation: this many CONSECUTIVE STT error cycles (not silence)
 # stop the loop for the current run, with one toast naming the route (#117).
 LOOP_ERROR_CAP = 3
+# Continuous dictation: a loop restart that loses the idle gap to the speech
+# queue ("error: busy (speaking)") waits for the queue to go quiet and tries
+# again, this many times, each wait bounded -- then stops the run with ONE
+# toast (#173). Never a hot retry: every retry is preceded by a wait.
+LOOP_RESTART_RETRIES = 3
+LOOP_RESTART_WAIT_SECONDS = 10.0
 
 # ---------------------------------------------------------------------------
 # DBus introspection XML
@@ -2806,9 +2812,16 @@ class GnomeSpeaksService:
         route = _speech_route_words()
         log.warning("Loop stopped after %d consecutive STT errors (%s): %s",
                     cycles, route, error)
-        GLib.idle_add(self._emit_error,
-                      f"Continuous dictation paused after {cycles} STT failures "
-                      f"in a row ({route}): {error}")
+        self._report_loop_stopped(f"Continuous dictation paused after {cycles} STT "
+                                  f"failures in a row ({route}): {error}")
+
+    def _report_loop_stopped(self, message):
+        """The one seam through which "this loop run has stopped" reaches the
+        user: the #117 error cap and the #173 restart bound both end here, so
+        a run can never end silently from a new path without a reviewer
+        seeing that it bypassed this. ONE toast; the loop flag is left alone
+        (the next tap resumes continuous dictation)."""
+        GLib.idle_add(self._emit_error, message)
 
     def _report_recorder_dead(self, cycle):
         """The single place the lost-microphone verdict reaches the user.
@@ -4569,18 +4582,31 @@ class GnomeSpeaksService:
         the time and the queue's never-speak-over-an-open-mic rule starves
         spell replies and agent messages forever. No-op when the queue is
         empty; bails immediately on stop."""
-        with self._queue_current_lock:
-            busy = self._queue_current is not None
-        if not busy and self._tts_queue.empty():
+        if self._speech_queue_quiet():
             return
         self._set_state("idle")
+        self._wait_speech_gap(max_seconds)
+
+    def _speech_queue_quiet(self):
+        """No item playing, none waiting, and nobody holding "speaking"."""
+        with self._queue_current_lock:
+            busy = self._queue_current is not None
+        return (not busy and self._tts_queue.empty()
+                and self.current_state != "speaking")
+
+    def _wait_speech_gap(self, max_seconds):
+        """Block until the speech queue is quiet, a stop lands, or max_seconds.
+
+        Returns True if the queue went quiet. The wait half of
+        _drain_speech_gap(), shared with the loop-restart re-arm (#173) so the
+        two loop shapes judge "the queue is done" the same way. Reads the
+        queue, never the cancel wire, and touches no state."""
         deadline = time.time() + max_seconds
         while time.time() < deadline and not self._stop_event.is_set():
-            with self._queue_current_lock:
-                busy = self._queue_current is not None
-            if not busy and self._tts_queue.empty():
-                return
+            if self._speech_queue_quiet():
+                return True
             time.sleep(0.2)
+        return self._speech_queue_quiet()
 
     def _spellbook_stat(self):
         return tuple(os.path.getmtime(p) if os.path.isfile(p) else 0
@@ -4987,7 +5013,7 @@ class GnomeSpeaksService:
             history = list(self._conversation_history[-40:])
         return system_prompt, history
 
-    def _restart_listening_cb(self, still_wanted):
+    def _restart_listening_cb(self, still_wanted, retries=None):
         """A one-shot GLib source callback that restarts listening.
 
         Collapses `lambda: (self.start_listening(quick=True), False)[-1] if
@@ -5006,12 +5032,58 @@ class GnomeSpeaksService:
         was scheduled: between the two the user can stop or toggle the loop
         off, and the restart must not happen then. That re-check is why the
         guard is passed as a callable.
+
+        Losing the idle gap (#173): between the STT worker's _set_state("idle")
+        and this source firing, the speech-queue dispatcher may claim
+        idle -> speaking for an agent item (atomic since #167/#168), and
+        start_listening() then answers "error: busy (speaking)". That answer
+        used to be dropped on the floor -- the loop ended, no toast, no retry,
+        Loop pill still on. The silence branch never had the gap because it
+        calls _drain_speech_gap() first (#171); here the mic is already
+        closed, so the parity move is to WAIT for the same gap and try again,
+        bounded (LOOP_RESTART_RETRIES x LOOP_RESTART_WAIT_SECONDS), then stop
+        the run with one toast through the #117 reporting seam. Only
+        "speaking" re-arms: "listening"/"processing" means another session
+        already owns the mic and the loop is not dead.
         """
+        if retries is None:
+            retries = LOOP_RESTART_RETRIES
+
         def _cb():
-            if still_wanted():
-                self.start_listening(quick=True)
+            if not still_wanted():
+                return False
+            rc = self.start_listening(quick=True)
+            if rc == "error: busy (speaking)":
+                self._rearm_loop_restart(still_wanted, retries)
+            elif rc != "ok":
+                log.info("Loop restart refused: %s", rc)
             return False
         return _cb
+
+    def _rearm_loop_restart(self, still_wanted, retries):
+        """The restart lost the idle gap to the speech queue (#173): wait off
+        the main loop for the queue to go quiet, then schedule the restart
+        again with one fewer retry. Out of retries -> ONE toast, idle, the
+        loop flag untouched. The wait bails on stop, and `still_wanted` is
+        re-checked when the rescheduled source fires, so a stop() during the
+        wait ends the run exactly as it would have anywhere else."""
+        if retries <= 0:
+            waited = LOOP_RESTART_RETRIES * LOOP_RESTART_WAIT_SECONDS
+            log.warning("Loop stopped: the speech queue held the microphone closed "
+                        "through %d restart attempts (%.0f s)",
+                        LOOP_RESTART_RETRIES, waited)
+            self._report_loop_stopped(
+                f"Continuous dictation paused: queued speech kept the microphone "
+                f"closed for {waited:.0f} s")
+            return
+        log.info("Loop restart lost the idle gap to the speech queue; re-arming "
+                 "(%d retr%s left)", retries, "y" if retries == 1 else "ies")
+
+        def _wait_then_retry():
+            self._wait_speech_gap(LOOP_RESTART_WAIT_SECONDS)
+            GLib.idle_add(self._restart_listening_cb(still_wanted, retries - 1))
+        threading.Thread(target=_wait_then_retry, daemon=True,
+                         name="loop-restart-rearm").start()
 
     def _maybe_loop_restart(self):
         """Restart listening in AI+Loop mode. Called from worker thread."""
