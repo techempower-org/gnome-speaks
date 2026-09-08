@@ -218,6 +218,18 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 
 - **ydotool stuck keys**: If a ydotool command is interrupted between key-down and key-up, the virtual device retains that key as pressed. The service auto-restarts `ydotoold` to recover. Scripts: `fix-ydotool.sh`, `install-ydotool.sh`.
 - **pw-record ignores SIGTERM**: Must use SIGKILL (`proc.kill()`) to stop PipeWire recorder processes.
+- **The wake watcher's shutdown warning is the OLD pid, not the new one (#137)**: at `Stopping`, systemd's
+  control-group SIGTERM reaches the watcher's `pw-record`, which exits rc=1 within ms (so the gotcha above is
+  not universal -- measured on 5/5 restarts of 2026-09-07; why `proc.terminate()` is ignored while systemd's
+  SIGTERM is not has NOT been established). `wyoming.detect_stream` then waits its 0.5 s for a verdict, and the
+  watcher -- still alive while the main thread tears down -- logged `recorder produced no audio (rc=1)
+  (retrying every 10s)` exactly 0.501 s into every stop, ~1 s before the next instance's `Starting` line.
+  #137 read those as the NEW pid failing at start; three days of journal hold zero start-time recorder
+  failures. **Read the pid before attributing a journal line to a start.** The watcher now returns on
+  `_shutting_down` (set first in `shutdown()` and `_on_signal`), and failed cycles retry on a bounded ramp
+  (0.5, 1, 2, 4, 8 s, DEBUG) before the unchanged #41 steady cadence (10 s recorder / 60 s server, WARNING).
+  The real start-up window is at LOGIN: the LAN name may not resolve yet (measured 09:20:20.383, 15 ms after
+  `Starting`), which used to be a flat 60 s of dead wake word. `tests/repros/wake-watcher` G/H cover both.
 - **Half-duplex drain**: On speakers, 0.5s delay after TTS before opening mic to prevent echo pickup.
 - **Config dual-write**: Mode flags exist in both the Python `CONFIG` dict (runtime) and `~/.config/speech-to-cli/config.json` (disk). `_reload_config_flags()` and `_save_config_flag()` keep them in sync. Be careful not to create drift.
 - **Schema compilation**: After editing the `.gschema.xml`, must run `glib-compile-schemas` on the install directory.

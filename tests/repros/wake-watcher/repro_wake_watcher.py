@@ -10,14 +10,26 @@ the next.  The thread under test IS the production one (found by its
 `wake-watcher` name) -- nothing here calls `_wake_watcher()` by hand, so the
 wiring in `__init__` is covered too.
 
-    python3 repro_wake_watcher.py A|B|C|D|E|F
+    python3 repro_wake_watcher.py A|B|C|D|E|F|G|H
 
   A  not-idle            armed, state=listening       -> zero Popen, zero detect
-  B  recorder EOF        detect_stream -> None        -> ONE spawn, then sleep(10)   #41
-  C  WyomingError        server unreachable           -> ONE spawn, then sleep(60)
+  B  recorder EOF        detect_stream -> None        -> one spawn per retry: ramp 0.5,1,2,4,8
+                                                        then 10 s forever; ONE warning   #41 #137
+  C  WyomingError        server unreachable           -> same ramp, then 60 s forever; ONE warning
   D  detection, idle     detect_stream -> name        -> start_listening(quick=True, wake=True) ONCE
   E  detection, raced    state left idle before verdict -> start_listening NOT called
-  F  generic exception   detect_stream raises         -> proc.kill() + wait() in finally, sleep(10)
+  F  generic exception   detect_stream raises         -> proc.kill() + wait() in finally, ramp then 10
+  G  first recorder dies, second healthy              -> armed < 2 s of fake time, NO warning   #137
+  H  shutdown mid-stream shutdown() then recorder EOF -> thread exits: no sleep, no warning    #137
+
+#137 in one line: every "recorder produced no audio (rc=1) (retrying every
+10s)" in three days of journal was logged by the OLD pid 0.5 s into
+`Stopping` -- systemd's control-group SIGTERM ends pw-record, detect_stream
+waits its 0.5 s for a verdict -- and was misread as the NEW pid failing at
+start. H is that observation; G is the start-up window the journal DOES show
+(login: the LAN name not resolving yet, then a 60 s sleep). The ramp is
+bounded and resets on a healthy stream, so the steady cadence #41 set is
+unchanged -- B and C assert it is still reached and then held.
 
 Every case that spawns also asserts the recorder was killed: pw-record ignores
 SIGTERM and a watcher that leaks one per cycle is a slower #41.
@@ -43,14 +55,17 @@ Seams, all in-process (no audio, no network, no daemon):
   * svc.start_listening -> records kwargs, flips state to listening, like the
                real one would from the main loop.
 
-Baseline (pre-#41): 11c8f60 (= 22cc2f3^).  There, case B is a spawn storm --
-detect_stream returns None and the loop respawns pw-record with no sleep
-between -- so B must FAIL against it and pass on main.  A, C, D, E, F are
-regression guards and are expected green on both sides.
+Baselines. Pre-#41: 11c8f60 (= 22cc2f3^) -- case B is a spawn storm there
+(detect_stream returns None and the loop respawns pw-record with no sleep
+between), so B must FAIL against it.  Pre-#137: a20afea -- G (second spawn
+after 10 s, not 0.5) and H (a warning and a 10 s sleep during shutdown) must
+FAIL against it; B, C and F also go red there because they assert the ramp.
+A, D, E are regression guards and are expected green on every side.
 
 exit 0 = clean, 1 = the defect is present, 2 = setup failure (the watcher
 thread never appeared or never stopped -- neither a pass nor a bug).
 """
+import logging
 import os
 import subprocess
 import sys
@@ -111,6 +126,23 @@ class FakeTime:
         return getattr(time, name)
 
 
+class WakeLogs(logging.Handler):
+    """Collects the watcher's WARNING+ lines: a transient failure that self-heals
+    must not promise a retry, and shutdown must not either."""
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.records = []
+
+    def emit(self, record):
+        msg = record.getMessage()
+        if "Wake watcher" in msg:
+            self.records.append(msg)
+
+
+RAMP = [0.5, 1.0, 2.0, 4.0, 8.0]     # the bounded start-up ramp (#137)
+
+
 class KilledDeadProc(fakes.DeadProc):
     """A recorder whose stdout is at EOF -- and that remembers being killed."""
 
@@ -148,14 +180,18 @@ class Rig:
         self.mod, _events, _inj = harness.load()
         self.ftime = FakeTime()
         self.procs = []
+        self.spawn_at = []          # fake seconds slept before each spawn
         self.detects = 0
         self.starts = []
         self.detect = lambda host, port, model, chunks: None
+        self.logs = WakeLogs()
+        self.mod.log.addHandler(self.logs)
 
         def popen(*a, **k):
             if len(self.procs) >= SPAWN_CAP:
                 raise _StopWatcher()
             p = proc_factory()
+            self.spawn_at.append(sum(self.ftime.sleeps))
             self.procs.append(p)
             return p
 
@@ -243,44 +279,58 @@ def case_a():
     ])
 
 
-def case_b():
-    """Recorder EOF (#41): one spawn, then a 10 s backoff -- not a storm."""
-    rig = Rig(KilledDeadProc)
+def _drain(host, port, model, chunks):
+    for _ in chunks:      # the real client consumes until EOF
+        pass
+    return None
 
-    def drain(host, port, model, chunks):
-        for _ in chunks:      # the real client consumes until EOF
-            pass
-        return None
-    rig.detect = drain
-    if not rig.arm(stop_after=1):
+
+def case_b():
+    """Recorder EOF (#41, #137): one spawn per retry -- the bounded ramp, then
+    the 10 s steady cadence held for good, one WARNING and only at steady
+    state. Never a storm."""
+    rig = Rig(KilledDeadProc)
+    rig.detect = _drain
+    stop_after = len(RAMP) + 2
+    if not rig.arm(stop_after=stop_after):
         return 2
-    print(f"  sleeps={rig.ftime.sleeps} spawns={len(rig.procs)} detects={rig.detects}")
-    return report("B recorder EOF -> 10 s backoff (#41)", [
-        (len(rig.procs) == 1,
-         f"exactly one recorder spawned before backing off (got {len(rig.procs)}"
+    want = RAMP + [10, 10]
+    print(f"  sleeps={rig.ftime.sleeps} spawns={len(rig.procs)} detects={rig.detects} "
+          f"warnings={rig.logs.records}")
+    return report("B recorder EOF -> ramp, then 10 s backoff (#41)", [
+        (len(rig.procs) == stop_after,
+         f"one recorder per retry, {stop_after} in all (got {len(rig.procs)}"
          f"{' -- SPAWN STORM' if len(rig.procs) >= SPAWN_CAP else ''})"),
-        (rig.ftime.sleeps[:1] == [10], f"first sleep is 10 s (got {rig.ftime.sleeps[:1]})"),
+        (rig.ftime.sleeps == want, f"sleeps are {want} (got {rig.ftime.sleeps})"),
         (all(p.killed for p in rig.procs), "every spawned recorder was killed"),
         (not rig.starts, "no session opened on EOF"),
+        (len(rig.logs.records) == 1 and "retrying every 10s" in rig.logs.records[0],
+         f"exactly one WARNING, at steady state, naming the 10 s cadence (got {rig.logs.records})"),
     ])
 
 
 def case_c():
-    """Wake server unreachable: one spawn, then a 60 s backoff."""
+    """Wake server unreachable: the same bounded ramp, then 60 s held for good
+    -- a permanently missing server still costs one connect per minute."""
     rig = Rig(KilledLiveProc)
     err = rig.mod.wyoming_mod.WyomingError
 
     def unreachable(host, port, model, chunks):
         raise err("connection refused")
     rig.detect = unreachable
-    if not rig.arm(stop_after=1):
+    stop_after = len(RAMP) + 2
+    if not rig.arm(stop_after=stop_after):
         return 2
-    print(f"  sleeps={rig.ftime.sleeps} spawns={len(rig.procs)} detects={rig.detects}")
-    return report("C WyomingError -> 60 s backoff", [
-        (len(rig.procs) == 1, f"exactly one recorder spawned (got {len(rig.procs)})"),
-        (rig.ftime.sleeps[:1] == [60], f"first sleep is 60 s (got {rig.ftime.sleeps[:1]})"),
-        (all(p.killed for p in rig.procs), "recorder killed after the error"),
+    want = RAMP + [60, 60]
+    print(f"  sleeps={rig.ftime.sleeps} spawns={len(rig.procs)} detects={rig.detects} "
+          f"warnings={rig.logs.records}")
+    return report("C WyomingError -> ramp, then 60 s backoff", [
+        (len(rig.procs) == stop_after, f"one recorder per attempt (got {len(rig.procs)})"),
+        (rig.ftime.sleeps == want, f"sleeps are {want} (got {rig.ftime.sleeps})"),
+        (all(p.killed for p in rig.procs), "recorder killed after every error"),
         (not rig.starts, "no session opened on a server error"),
+        (len(rig.logs.records) == 1 and "retrying every 60s" in rig.logs.records[0],
+         f"exactly one WARNING, at steady state, naming the 60 s cadence (got {rig.logs.records})"),
     ])
 
 
@@ -332,20 +382,85 @@ def case_f():
     def boom(host, port, model, chunks):
         raise RuntimeError("unexpected")
     rig.detect = boom
-    if not rig.arm(stop_after=1):
+    stop_after = len(RAMP) + 1
+    if not rig.arm(stop_after=stop_after):
         return 2
-    p = rig.procs[0] if rig.procs else None
+    want = RAMP + [10]
     print(f"  sleeps={rig.ftime.sleeps} spawns={len(rig.procs)} "
-          f"killed={getattr(p, 'killed', None)} waited={getattr(p, 'waited', None)}")
+          f"killed={[p.killed for p in rig.procs]} waited={[p.waited for p in rig.procs]}")
     return report("F generic exception -> finally kills proc", [
-        (p is not None, "a recorder was spawned"),
-        (p is not None and p.killed, "proc.kill() ran in finally"),
-        (p is not None and p.waited, "proc.wait() ran in finally"),
-        (rig.ftime.sleeps[:1] == [10], f"generic backoff is 10 s (got {rig.ftime.sleeps[:1]})"),
+        (len(rig.procs) == stop_after, f"a recorder per attempt (got {len(rig.procs)})"),
+        (rig.procs and all(p.killed for p in rig.procs), "proc.kill() ran in finally, every time"),
+        (rig.procs and all(p.waited for p in rig.procs), "proc.wait() ran in finally, every time"),
+        (rig.ftime.sleeps == want, f"generic backoff is the ramp then 10 s (got {rig.ftime.sleeps})"),
     ])
 
 
-CASES = {"A": case_a, "B": case_b, "C": case_c, "D": case_d, "E": case_e, "F": case_f}
+def case_g():
+    """#137: the first recorder dies the moment it starts (PipeWire not ready,
+    device not enumerated yet), the second is healthy and hears the wake word.
+    The watcher must be armed again within 2 s of fake time -- on a20afea it
+    slept 10 s first -- and a failure that healed itself is no WARNING."""
+    holder = {}
+
+    def factory():
+        return KilledDeadProc() if not holder["rig"].procs else KilledLiveProc()
+    rig = holder["rig"] = Rig(factory)
+
+    def second_time_lucky(host, port, model, chunks):
+        if rig.detects == 1:
+            return _drain(host, port, model, chunks)
+        next(iter(chunks))          # healthy recorder: one frame, then a verdict
+        return "test_model"
+    rig.detect = second_time_lucky
+    if not rig.arm(stop_after=2):   # the retry sleep, then the 2 s cooldown
+        return 2
+    armed_at = rig.spawn_at[1] if len(rig.spawn_at) > 1 else None
+    print(f"  sleeps={rig.ftime.sleeps} spawns={len(rig.procs)} spawn_at={rig.spawn_at} "
+          f"starts={rig.starts} warnings={rig.logs.records}")
+    print(f"  second recorder started after {armed_at} s of fake time")
+    return report("G first recorder dies, second healthy -> armed < 2 s (#137)", [
+        (len(rig.procs) == 2, f"two recorders: the dead one and its replacement (got {len(rig.procs)})"),
+        (armed_at is not None and armed_at < 2.0,
+         f"re-armed within 2 s of fake time (got {armed_at} s)"),
+        (rig.starts == [dict(quick=True, wake=True)],
+         f"the replacement heard the wake word and opened the mic once (got {rig.starts})"),
+        (all(p.killed for p in rig.procs), "both recorders killed"),
+        (rig.logs.records == [],
+         f"a self-healed first failure logs no WARNING (got {rig.logs.records})"),
+    ])
+
+
+def case_h():
+    """#137's actual observation, reproduced: shutdown() runs while the watcher
+    is streaming, then the recorder hits EOF (systemd's control-group SIGTERM
+    ends pw-record at the same instant). The thread must exit -- no 10 s sleep,
+    no "retrying every 10s" promised by a process that is leaving."""
+    rig = Rig(KilledDeadProc)
+
+    def sigterm_mid_stream(host, port, model, chunks):
+        try:
+            rig.svc.shutdown()      # the real one: sets the flag first
+        except Exception as e:      # harness stubs may not like the rest of it
+            print(f"  note: shutdown() raised inside the harness: {e!r}")
+        return _drain(host, port, model, chunks)
+    rig.detect = sigterm_mid_stream
+    if not rig.arm(stop_after=1):
+        return 2
+    flag = getattr(rig.svc, "_shutting_down", None)
+    print(f"  sleeps={rig.ftime.sleeps} spawns={len(rig.procs)} flag={flag} "
+          f"warnings={rig.logs.records} thread_alive={rig.thread.is_alive()}")
+    return report("H shutdown mid-stream -> watcher exits quietly (#137)", [
+        (flag is True, f"shutdown() raised _shutting_down before tearing down (got {flag})"),
+        (rig.ftime.sleeps == [], f"no retry sleep during shutdown (got {rig.ftime.sleeps})"),
+        (rig.logs.records == [], f"no WARNING promising a retry (got {rig.logs.records})"),
+        (len(rig.procs) == 1 and all(p.killed for p in rig.procs), "the one recorder was killed"),
+        (not rig.thread.is_alive(), "the watcher thread returned on its own"),
+    ])
+
+
+CASES = {"A": case_a, "B": case_b, "C": case_c, "D": case_d, "E": case_e, "F": case_f,
+         "G": case_g, "H": case_h}
 
 
 def main():
