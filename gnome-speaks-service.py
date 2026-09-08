@@ -2278,9 +2278,27 @@ class GnomeSpeaksService:
         Signal emission is queued inside the lock to prevent another thread
         from changing state between the assignment and the GLib.idle_add.
         """
+        self._set_state_if(new_state)
+
+    def _set_state_if(self, new_state, expected=None):
+        """Compare-and-set state. Returns True if the state is new_state on exit.
+
+        expected: states the transition may start from; None = any (plain
+        _set_state). With it, the read and the write are ONE step under
+        _state_lock -- the fence two paths race for (#167): the queue
+        dispatcher claims idle|speaking -> speaking, start_listening() claims
+        idle -> listening. A check-then-act pair ("state is idle" ... later
+        "_set_state") let listening land between the dispatcher's gate check
+        and its claim: the agent item played over the opening mic and its
+        worker then forced idle while the dictation ran (deterministic in
+        tests/repros/cancel-tokens/repro_g_gate_vs_listen.py). Whoever claims
+        first wins; the other sees a non-idle state and holds back.
+        """
         with self._state_lock:
             if self._state == new_state:
-                return
+                return True
+            if expected is not None and self._state not in expected:
+                return False
             allowed = self._VALID_TRANSITIONS.get(self._state, set())
             if new_state not in allowed:
                 log.warning("Unexpected transition %s -> %s (forcing)", self._state, new_state)
@@ -2300,6 +2318,7 @@ class GnomeSpeaksService:
             except Exception:
                 log.debug("Injector end() failed", exc_info=True)
         self._reset_inactivity_timer()
+        return True
 
     def _emit_state_changed(self, state_str):
         if self._connection is not None:
@@ -2499,8 +2518,11 @@ class GnomeSpeaksService:
                     GLib.idle_add(self._emit_error, missing)
                     return "error: speech not configured"
 
+            # Atomic idle -> listening (#167): the idle check above is a
+            # snapshot; the dispatcher may have claimed "speaking" since.
+            if not self._set_state_if("listening", expected=("idle",)):
+                return f"error: busy ({self.current_state})"
             self._stop_event.clear()
-            self._set_state("listening")
 
             # Issued before the thread exists: a stop() arriving in the gap
             # between here and the worker's first instruction is remembered by
@@ -2524,8 +2546,10 @@ class GnomeSpeaksService:
             GLib.idle_add(self._emit_error, "websocket-client not installed")
             return "error: no websocket support"
 
+        # Atomic idle -> listening (#167), see the batch path above.
+        if not self._set_state_if("listening", expected=("idle",)):
+            return f"error: busy ({self.current_state})"
         self._stop_event.clear()
-        self._set_state("listening")
 
         with self._stt_lock:
             self._stt_thread = threading.Thread(
@@ -3813,8 +3837,21 @@ class GnomeSpeaksService:
                 hold = self._queue_hold_reason()
                 drained = self._drain_gen != item.drain_gen
                 if hold is None and not drained:
-                    self._queue_current = item
-                    self._queue_token = token
+                    # The gate and the state claim are ONE step (#167). The
+                    # gate above reads state; start_listening() writes it with
+                    # no lock in common, so "hold is None" alone let a
+                    # dictation begin between this check and a later
+                    # _set_state("speaking") -- the item then played over the
+                    # open mic and its worker forced idle mid-dictation.
+                    # Claiming speaking under _state_lock, conditional on
+                    # idle|speaking, closes that: if the user got there first
+                    # the claim fails and the item is held back like any hold.
+                    if self._set_state_if("speaking",
+                                          expected=("idle", "speaking")):
+                        self._queue_current = item
+                        self._queue_token = token
+                    else:
+                        hold = self.current_state
             if drained:
                 self._cancels.retire(token)
                 log.info("Speech queue: item %d dropped — drained mid-claim",
@@ -3832,8 +3869,7 @@ class GnomeSpeaksService:
                           item.id, hold)
                 continue
             try:
-                if self.current_state != "speaking":
-                    self._set_state("speaking")
+                # State was claimed with the item, above.
                 # One object is both the playback claim and the cancel verdict.
                 self._speak_token = token
                 has_next = not self._tts_queue.empty()

@@ -120,7 +120,7 @@ run chronicle-perf repro_chronicle_stall.py repro_audio_info_stall.py verify_arc
 run cancel-tokens  repro_a_outcome_mislabel.py repro_b_transcript_after_stop.py \
                    repro_c_streaming_after_stop.py repro_d_mic_disconnect.py \
                    repro_e_interrupt_vs_dictation.py repro_f_interrupt_race.py \
-                   verify_cancel_invariants.py
+                   repro_g_gate_vs_listen.py verify_cancel_invariants.py
 run subtitle-token repro_e1_stale_complete_frame.py repro_e2_foreign_cancel_freeze.py \
                    repro_e3_streaming_reply_subtitle.py repro_e4_compound_cycle_then_reply.py
 run begin-refused  repro_j_first_sentence.py repro_k_remainder.py repro_l_healthy_reply.py
