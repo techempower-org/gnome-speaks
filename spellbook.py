@@ -43,6 +43,12 @@ DENYLIST = [
 VALID_ACTION_TYPES = ("say", "dbus_self", "http", "shell", "assist", "oracle")
 VALID_GATES = ("instant", "confirm")
 
+# Punctuation STT glues onto a spoken trigger word, or drops between it and
+# the incantation (#119). Sentence-final punctuation plus the dash family;
+# never apostrophes or slashes, which are parts of words.
+_TRIGGER_PUNCT = re.compile(r"[.,!?;:\-\u2013\u2014\u2026]+")
+_LEADING_PUNCT = re.compile(r"^[.,!?;:\-\u2013\u2014\u2026\s]+")
+
 FIZZLE_TEXT = "The spell fizzles."
 UNREACHABLE_TEXT = "The realm is beyond reach."
 
@@ -124,9 +130,17 @@ def match(text, book):
     norm = text.strip().lower()
     norm = re.sub(r"[.,!?;:]+$", "", norm).strip()
     words = norm.split()
-    if not words or words[0] not in book["trigger_words"]:
+    # Azure's DisplayText is punctuated, and an imperative trigger word can
+    # arrive as "cast," / "Cast." / "Invoke..." -- or with a dash after it
+    # ("Cast - skip"). Punctuation glued to the trigger, or standing alone in
+    # front of the incantation, is prosody, not words: strip it, or the whole
+    # utterance is a "miss" and gets typed at the cursor (#119). A hyphenated
+    # word ("cast-iron") loses its hyphen and still misses, as it should.
+    if not words:
         return "miss", None, None
-    incantation = " ".join(words[1:])
+    if _TRIGGER_PUNCT.sub("", words[0]) not in book["trigger_words"]:
+        return "miss", None, None
+    incantation = _LEADING_PUNCT.sub("", " ".join(words[1:]))
     if not incantation:
         return "fizzle", None, ""
     best = None  # (pattern_len, spell, remainder)

@@ -129,6 +129,7 @@ run pin-lifecycle  repro_pin_lifecycle.py repro_compound_pin_x_deadmic.py \
                    repro_compound_reply_pin.py
 run injector-seam  verify_injector_seam.py verify_ibus_injector.py repro_fallback_retry.py repro_fake_context_fallback.py
 run version-cache  verify_version_cache.py repro_a_fork_storm.py
+run spellbook      verify_spellbook.py
 
 # ---------------------------------------------------------------------------
 # offline-handoff: ONE PROCESS PER CASE, on purpose.

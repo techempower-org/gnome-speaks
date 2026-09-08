@@ -8,6 +8,8 @@
       "name": "silence",
       "patterns": [
         "silence",
+        "stop",
+        "halt",
         "be silent",
         "quiet"
       ],
