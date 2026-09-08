@@ -4,7 +4,8 @@
 
 Utterances beginning with a trigger word ("cast …") route here instead of
 typing or the LLM. Spells are data (spellbook.json in the repo, with a user
-overlay at ~/.config/speech-to-cli/spellbook.json); this module matches and
+overlay at ~/.config/speech-to-cli/spellbook.json, see USER_SPELLBOOK_PATH
+below); this module matches and
 executes them through callbacks injected by the service, so it has no GLib
 or audio dependencies of its own and can be sanity-tested standalone.
 """
@@ -19,6 +20,20 @@ import urllib.error
 import urllib.request
 
 log = logging.getLogger("gnome-speaks")
+
+# The user overlay path is a SEAM, not a literal (#152). The service reads
+# USER_SPELLBOOK_PATH when it builds its spellbook, so a test harness can pin
+# it into a scratch dir and a verdict can never depend on the personal spells
+# in ~/.config -- which carry the wake phrase and LAN names, and which a
+# spell-routing repro could otherwise match by accident. Override for a whole
+# process with the env var GS_SPELLBOOK_USER_PATH (read ONCE, at import; set it
+# to the empty string for "no overlay at all"), or assign the attribute before
+# the service is constructed.
+DEFAULT_USER_SPELLBOOK_PATH = os.path.expanduser(
+    "~/.config/speech-to-cli/spellbook.json")
+USER_SPELLBOOK_PATH = (os.environ["GS_SPELLBOOK_USER_PATH"]
+                       if "GS_SPELLBOOK_USER_PATH" in os.environ
+                       else DEFAULT_USER_SPELLBOOK_PATH)
 
 # Actions that must never be voice-castable, no matter what the config says.
 # Matched (case-insensitive) against the JSON-serialized action; an entry

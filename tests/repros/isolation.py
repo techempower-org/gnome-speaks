@@ -8,7 +8,8 @@ isolation contract had to be made five times, and copies drift.
 
 Two external inputs used to decide these repros' verdicts, and both produced
 results that read as product regressions. Everything here exists for one of
-them.
+them -- plus a third found later (#152), the user spellbook overlay, see
+SPELLBOOK_OVERLAY below.
 
 1. JP's LIVE ~/.config/speech-to-cli/config.json. state.load_config() reads it
    at import, so CONFIG started as ~47 live desktop keys. Worse,
@@ -63,6 +64,17 @@ CONFIG_PINS = {
 }
 
 REAL_STATE = os.path.join(os.path.expanduser("~/.local/state"), "gnome-speaks")
+
+# The user spellbook overlay (#152). A third external input the original
+# contract missed: the service merged ~/.config/speech-to-cli/spellbook.json
+# over the repo spells, so every harness-built service carried the developer's
+# PERSONAL spells (MEASURED: "Spellbook loaded: 24 spells" = 15 repo + 9
+# overlay). Read-only, but a spell-routing repro could match a personal
+# incantation, and those spells carry the wake phrase and LAN names. The
+# overlay is now pinned to an EMPTY file in scratch -- a real file, not a
+# missing one, so the "user" merge branch still runs and stat()s cleanly.
+SPELLBOOK_OVERLAY = "spellbook-user.json"
+REAL_SPELLBOOK_OVERLAY = os.path.expanduser("~/.config/speech-to-cli/spellbook.json")
 
 
 def setup_scratch(prefix, scratch_root):
@@ -147,7 +159,56 @@ def isolate_config(mod, scratch, pins=None):
     mod.CONFIG_PATH = path
     mod.CONFIG.clear()
     mod.CONFIG.update(baseline)
+    isolate_spellbook(mod, scratch)
     return baseline
+
+
+def isolate_spellbook(mod, scratch):
+    """Pin the user spellbook overlay to an empty file inside `scratch`.
+
+    Goes through `spellbook.USER_SPELLBOOK_PATH`, the seam the service reads
+    when it constructs its spellbook -- so this must run BEFORE
+    `GnomeSpeaksService()`; a pin applied afterwards changes nothing the
+    instance already loaded. Raises on a service whose spellbook has no seam:
+    that tree cannot be isolated, and a run that cannot be isolated must not
+    report a verdict (the same rule assert_isolated applies to an unset path).
+    """
+    sb = getattr(mod, "spellbook", None)
+    if sb is None or not hasattr(sb, "USER_SPELLBOOK_PATH"):
+        raise AssertionError(
+            "service has no spellbook.USER_SPELLBOOK_PATH seam (#152) -- "
+            "cannot pin the user overlay, refusing to run")
+    overlay = os.path.join(scratch, SPELLBOOK_OVERLAY)
+    with open(overlay, "w", encoding="utf-8") as f:
+        json.dump({"spells": []}, f)
+    sb.USER_SPELLBOOK_PATH = overlay
+    return overlay
+
+
+def repo_spell_count(svc_path):
+    """How many spells the repo spellbook.json NEXT TO the service ships."""
+    book = os.path.join(os.path.dirname(os.path.abspath(svc_path)),
+                        "spellbook.json")
+    with open(book, encoding="utf-8") as f:
+        return len(json.load(f)["spells"])
+
+
+def assert_repo_spellbook(svc, svc_path):
+    """Prove a built service loaded EXACTLY the repo spells and nothing else.
+
+    The pin above redirects the path; this checks the pin TOOK, by counting
+    what the instance actually holds against the repo file. Both halves are
+    needed (the same shape as assert_isolated vs subtitle_spy's pin check):
+    a redirected path with a stale or wrong count is still a leak. Fewer than
+    the repo count means a repo spell failed validation, which is also wrong.
+    """
+    want = repo_spell_count(svc_path)
+    got = len(getattr(svc, "_spellbook", {}).get("spells", {}))
+    if got != want:
+        raise AssertionError(
+            f"service loaded {got} spells but the repo ships {want} -- "
+            f"a spellbook overlay leaked into the harness (#152)")
+    return got
 
 
 def assert_isolated(mod, scratch):
@@ -161,6 +222,8 @@ def assert_isolated(mod, scratch):
         "CHRONICLE_PATH": getattr(mod, "CHRONICLE_PATH", None),
         "CONFIG_PATH": getattr(mod, "CONFIG_PATH", None),
         "XDG_STATE_HOME": os.environ.get("XDG_STATE_HOME"),
+        "spellbook.USER_SPELLBOOK_PATH": getattr(
+            getattr(mod, "spellbook", None), "USER_SPELLBOOK_PATH", None),
     }
     for name, value in checks.items():
         if value is None:
@@ -172,6 +235,8 @@ def assert_isolated(mod, scratch):
                 f"{scratch!r} -- refusing to run")
         if os.path.realpath(REAL_STATE) in (real, os.path.dirname(real)):
             raise AssertionError(f"{name} points at the live state dir")
+        if real == os.path.realpath(REAL_SPELLBOOK_OVERLAY):
+            raise AssertionError(f"{name} points at the live spellbook overlay")
     return True
 
 

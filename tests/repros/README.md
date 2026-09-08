@@ -48,7 +48,22 @@ Two rules the suites enforce on themselves, both learned the hard way on
   defaults plus an explicit `CONFIG_PINS` dict and repoints `CONFIG_PATH` at a
   scratch file — so the live file can be neither read nor written — then
   `assert_isolated(mod)`, which **raises** unless `CHRONICLE_PATH`,
-  `CONFIG_PATH` and `XDG_STATE_HOME` all resolve inside the scratch dir.
+  `CONFIG_PATH`, `XDG_STATE_HOME` and `spellbook.USER_SPELLBOOK_PATH` all
+  resolve inside the scratch dir.
+* **No live spellbook overlay** (#152). The service merges
+  `~/.config/speech-to-cli/spellbook.json` over the repo spells, so every
+  harness-built service used to carry the developer's *personal* spells
+  (measured: `Spellbook loaded: 24 spells` = 15 repo + 9 overlay) — read-only,
+  but a spell-routing repro could match a personal incantation, and those
+  spells carry the wake phrase and LAN names. `isolate_config()` now pins
+  `spellbook.USER_SPELLBOOK_PATH` (the seam the service reads at construction;
+  env `GS_SPELLBOOK_USER_PATH` sets it for a whole process) to an **empty**
+  overlay in scratch, `assert_isolated()` asserts it, and every
+  `make_service()` calls `isolation.assert_repo_spellbook()`, which counts
+  what the instance actually loaded against the repo `spellbook.json`. The
+  pin must land **before** `GnomeSpeaksService()` — the instance loads its
+  book in `__init__`. A service whose `spellbook.py` has no seam is refused
+  (setup failure), the same way an unset `CHRONICLE_PATH` is.
 
 ## Baselines are pinned SHAs, never branch names
 
@@ -79,7 +94,7 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 | `pin-lifecycle` | #46 ×#57 | `15dd402` | compound X: X1 FAIL, X2 PASS, X3 FAIL |
 | `version-cache` | #53 / #85 | two-sided, below | `577a05f` passes, `7eaeb02` fails |
 | `prefs-rig` | #82 | merge base of the branch | more warnings than baseline = fail |
-| `spellbook` | #119 | `025df92` | **verified** — 8 fail: `cast stop`, `cast halt`, every punctuated trigger (`Cast, stop.`, `Cast - skip`, `Invoke... skip`, …); the denylist, overlay and op-table checks stay green on both sides |
+| `spellbook` | #119, #152 | `025df92` / `a20afea` | **verified** — 8 fail on `025df92`: `cast stop`, `cast halt`, every punctuated trigger (`Cast, stop.`, `Cast - skip`, `Invoke... skip`, …); the denylist, overlay and op-table checks stay green on both sides. The #152 seam checks (`USER_SPELLBOOK_PATH` honours `GS_SPELLBOOK_USER_PATH`; the service reads the seam, not a literal) are red on `a20afea` |
 | `leak-scan` | #126 | `025df92` | **verified** — 4 hits (tracked unit ×2, two plans) |
 | `config-keys` | #120 #127 | `025df92` | **verified** — B fails: 8 keys against speech-to-cli before its #21 (`language`, `voice_commands` + 6 shell-only `show_*`), 6 after; D fails: the same 6 `show_*` (no Python reader); A, C pass |
 
@@ -190,7 +205,9 @@ form has its own short-form failure. If you do add `-e`, write every count as
   **passes**. It is the instrument, not a convenience.
 * **`assert_isolated()`** — the harness version proves the *paths* are
   redirected; `subtitle_spy.assert_isolated()` delegates to it and adds the
-  other half, that the CONFIG *pins actually took*. A path can be redirected
+  other half, that the CONFIG *pins actually took*. `assert_repo_spellbook()`
+  is the same second half for the spellbook overlay: the path pin alone cannot
+  see a pin applied *after* construction, only the loaded count can (#152). A path can be redirected
   correctly while a pin is silently missing, and `terminal_mode` really is
   `True` on the developer desktop. Keep both halves if these are ever folded
   together.
