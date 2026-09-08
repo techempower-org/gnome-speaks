@@ -16,7 +16,21 @@
 set -u
 set -o pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "$HERE/.." && pwd)"
+# Usage: tests/leak-scan.sh [REPO]
+# REPO defaults to the checkout this script lives in. It MUST be honoured:
+# the first version resolved the repo from the script's own location and
+# ignored its arguments, so `leak-scan.sh ~/Projects/speech-to-cli` scanned
+# gnome-speaks and printed PASS for the wrong repo (2026-09-08 -- a sibling
+# repo's merge gate trusted that green). More than one argument is a usage
+# error, never a silent default.
+if [ $# -gt 1 ]; then
+    echo "!! SETUP FAILURE: usage: $0 [REPO]"
+    exit 2
+fi
+REPO="$(cd "${1:-$HERE/..}" 2>/dev/null && pwd)" || {
+    echo "!! SETUP FAILURE: repo path not found: ${1:-$HERE/..}"
+    exit 2
+}
 # The pattern itself is a leak: it names the very hostnames, domain and wake
 # phrase the scan exists to keep out of this public tree (it shipped once, in
 # #142, and had to be scrubbed forward). So it lives OUTSIDE the repo -- first
@@ -52,9 +66,9 @@ hits=$(git -C "$REPO" grep -nE "$PAT" -- . ":(exclude)$SELF")
 st=$?
 case "$st" in
     0) printf '%s\n' "$hits"
-       echo "FAIL: $(printf '%s\n' "$hits" | wc -l) leak-pattern hit(s) in tracked files"
+       echo "FAIL: $(printf '%s\n' "$hits" | wc -l) leak-pattern hit(s) in tracked files of $REPO"
        exit 1 ;;
-    1) echo "PASS: no leak-pattern hits in tracked files"
+    1) echo "PASS: no leak-pattern hits in tracked files of $REPO"
        exit 0 ;;
     *) echo "!! SETUP FAILURE: git grep exited $st"
        exit 2 ;;
