@@ -4985,6 +4985,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def _send_json(self, data, status=200):
         body = json.dumps(data).encode("utf-8")
+        self._replied = True   # headers go out below; _dispatch must not add a 500
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self._set_cors_headers()
@@ -5001,7 +5002,36 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         self._set_cors_headers()
         self.end_headers()
 
+    # Every request gets a JSON answer, including the ones that blow up (#128).
+    # BaseHTTPRequestHandler lets an exception escape do_GET/do_POST straight
+    # into socketserver, which prints a traceback and closes the socket with
+    # NO response -- agents saw curl's "Empty reply from server" instead of an
+    # error they could parse, and the only trace was a stack dump in the
+    # journal. The envelope is the contract: a handler that raises is a bug,
+    # but the caller still gets {"ok": false, "error": ...} and a 500.
+    _replied = False
+
+    def _dispatch(self, handler):
+        self._replied = False   # per request: one handler instance may serve several
+        try:
+            handler()
+        except Exception as exc:  # noqa: BLE001 -- the envelope IS the point
+            log.exception("HTTP %s %s failed", self.command, self.path)
+            if self._replied:
+                return  # headers already on the wire; nothing sane to add
+            try:
+                self._send_error_json(
+                    500, f"internal error: {type(exc).__name__}: {exc}")
+            except OSError:
+                pass  # client already gone
+
     def do_GET(self):
+        self._dispatch(self._route_get)
+
+    def do_POST(self):
+        self._dispatch(self._route_post)
+
+    def _route_get(self):
         path = self.path.split("?")[0]
         if path == "/api/version":
             self._handle_version()
@@ -5016,7 +5046,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._send_error_json(404, f"Unknown endpoint: {path}")
 
-    def do_POST(self):
+    def _route_post(self):
         path = self.path.split("?")[0]
         if path == "/speak":
             self._handle_speak()
@@ -5038,16 +5068,29 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
     # -- Request body parsing ----------------------------------------------
 
     def _read_json_body(self):
-        """Read and parse JSON request body. Returns dict or None on error."""
-        content_length = int(self.headers.get("Content-Length", 0))
+        """Read and parse JSON request body. Returns dict or None on error.
+
+        Every handler does `body.get(...)` on the result, so a body that parses
+        but is not an object (a bare list, string, number) is a 400 here, not
+        an AttributeError three lines later.
+        """
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._send_error_json(400, "Invalid Content-Length header")
+            return None
         if content_length == 0:
             return {}
         try:
             raw = self.rfile.read(content_length)
-            return json.loads(raw)
+            body = json.loads(raw)
         except (json.JSONDecodeError, ValueError) as exc:
             self._send_error_json(400, f"Invalid JSON: {exc}")
             return None
+        if not isinstance(body, dict):
+            self._send_error_json(400, "JSON body must be an object")
+            return None
+        return body
 
     # -- Endpoint handlers -------------------------------------------------
 
@@ -5056,7 +5099,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         if body is None:
             return  # error already sent
         text = body.get("text", "")
-        if not text or not text.strip():
+        if not isinstance(text, str) or not text.strip():
             self._send_error_json(400, "Missing or empty 'text' field")
             return
 
@@ -5163,7 +5206,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         if body is None:
             return
         text = body.get("text", "")
-        if not text or not text.strip():
+        if not isinstance(text, str) or not text.strip():
             self._send_error_json(400, "Missing or empty 'text' field")
             return
         handled = self.service._try_cast(text)
