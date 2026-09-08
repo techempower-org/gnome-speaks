@@ -129,6 +129,17 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
   (`$XDG_RUNTIME_DIR/gnome-speaks/prior-engine` written *before* the swap, restore-on-start,
   `ExecStopPost=… --restore-ime`, and a session watchdog). Do not treat any of them as optional,
   and keep `restore_prior_engine()` dependency-free — it must run with no config and no instance.
+- **The IBus restore target is derived once per bus and layout, not per utterance** (#136): on GNOME
+  `GetGlobalEngine` answers empty on EVERY acquire (the shell owns input sources), so
+  `derive_restore_target()` is the normal path, and `bus.list_engines()` inside it deserialised 974
+  `EngineDesc`s (23 ms, serial with the first keystroke) per utterance, plus one `IBUS-WARNING` per
+  empty reply. `_EngineNameMemo` remembers the (layout, variant) → engine name per bus object (a
+  reconnect or `restore_prior_engine()`'s startup probe starts cold; a miss is never stored), and
+  `acquire()` stops asking `GetGlobalEngine` after one empty answer on that bus. The input-sources
+  read is deliberately NOT cached — it is the authority, it costs ~0.5 ms, and re-reading it is what
+  makes a layout switch land on the next utterance without a `changed` signal (which would need a
+  main loop on the thread that created the GSettings object; the STT worker has none).
+  `tests/repros/injector-seam/repro_derive_cache.py` counts both calls.
 - **The cancel wire is not the cancel verdict**: `state._cancel_event` (speech-to-cli) is a single
   process-global bit shared by every STT and TTS call. It can *interrupt* an operation, but it can
   never say **which** one was cancelled, and the next operation's `CancelRegistry.begin()`
