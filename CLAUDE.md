@@ -335,6 +335,16 @@ hand and no default that can silently point at a tree that no longer exists.
 Per-suite detail, the pinned baseline SHA each suite discriminates against, and
 why `version-cache` is expected red are in `tests/repros/README.md`.
 
+**Adding a suite = a directory with `suite.list` + `BASELINE.md`; then run
+`tests/repros/gen_readme.sh`** (#169). The runner discovers `tests/repros/*/suite.list`
+(one check per line, `label: cmd` optional, suite dir as cwd) and the README's baseline
+table is GENERATED from the `BASELINE.md` files -- the runner's first check
+(`manifests`) goes red if the block is stale or a suite dir lacks a manifest, and its
+fix is always the generator. Lanes adding suites therefore touch disjoint files; a rebase
+conflict inside the generated block is resolved by re-running `gen_readme.sh`, never by
+hand. Only `prefs-rig` (own invocation shape) and `shell-rig` (not collected) are wired by
+hand.
+
 Two hazards these suites are built to avoid, both measured on 2026-09-06 --
 keep them in mind before adding a suite, and read `tests/repros/README.md`
 before changing one:
