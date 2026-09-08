@@ -202,6 +202,18 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
   actually reached the cursor outranks both (an error notification next to text landing under the
   cursor is a lie about the outcome). Keep the ranking in one place if a third failure is added.
 
+- **AI-reply TTS is a two-thread pipeline, one sentence ahead (#134).** `_stream_conversation_worker`
+  PREPARES sentence N+1 (`_PreparedSentence` → speech-to-cli's `tts_prepare`, the network half) while the
+  speaker thread PLAYS N, and hands it over through a rendezvous (`item.taken`) so at most one sentence
+  is prepared and waiting — one connection held, one synthesis in flight. Everything keyed to PLAYBACK
+  stays on the speaker: the claim/`begin()` refusal, `"speaking"`, the partial transcription, the
+  subtitle run. Only synthesis moved earlier. A stop lands on the token; the speaker reads it before
+  every `play()` and `close()`s a prepared handle instead — never plays it (repros p2/p3). The seam is
+  resolved by `getattr` **at call time**, never at import: an older speech-to-cli has none and the
+  worker degrades to a deferred `tts()` (same audio, no prefetch); a harness that stubs `speech_tts.tts`
+  must null the seam too (`isolation.install_fake_tts`), or the reply path goes to the real Azure URL.
+  Do not put a second copy of the player loop in this repo to avoid the seam — `_tts_wyoming` took two
+  review rounds (#20) to get its exit paths right, and two copies drift.
 - **A pinned injector must also be RELEASED**: the STT cycle pins `inj = get_injector()` so a
   mid-utterance "cast typing engine" cannot retract with the wrong backend (#46) -- but the pin
   is only half of it. `get_injector()` rebuilds on the config flip and merely `cancel()`s the

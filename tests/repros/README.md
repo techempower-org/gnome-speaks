@@ -93,6 +93,7 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 | `wake-watcher` | #41, #48 / #121, #137 | `11c8f60`, `a20afea` | **verified** — pre-#41 `11c8f60`: B fails (25-spawn storm, zero sleeps). Pre-#137 `a20afea`: G fails (second recorder after 10 s of fake time, not 0.5) and H fails (a WARNING and a 10 s sleep logged *during shutdown* — the very lines #137 misread as start-time failures); B, C, F fail there too because they assert the bounded ramp before the unchanged 10 s / 60 s steady cadence. A, D, E green on every side. The fake `time.sleep` is scoped to the watcher thread by identity — the constructor also starts `tts-queue-dispatcher`, whose 0.2 s hold-polls were being recorded and stopped (A doubles as that guard: ~240 ms window, dispatcher must survive) |
 | `subtitle-token` | #42 / #78 | `65bd57b` | e1–e4 fail |
 | `begin-refused` | #79 / #84 | `15dd402`, `f290d7e` | j, k fail — **l stays green on both sides** |
+| `tts-prefetch` | #134 | `a20afea` | **verified** — p1 fails (wall 3.01 s serial vs 2.21 s pipelined, S=0.4/P=0.6); **p2, p3 report `2` (SETUP FAILURE) there, not `0`** — the prepared-ahead window they test does not exist on a service that never prefetches, and a suite that passed on it would be measuring nothing |
 | `pin-lifecycle` | #46 ×#57 | `15dd402` | compound X: X1 FAIL, X2 PASS, X3 FAIL |
 | `version-cache` | #53 / #85 | two-sided, below | `577a05f` passes, `7eaeb02` fails |
 | `prefs-rig` | #82 | merge base of the branch | more warnings than baseline = fail |
@@ -206,6 +207,14 @@ form has its own short-form failure. If you do add `-e`, write every count as
   loop, so `_emit_subtitle_update` callbacks queue and never fire. A subtitle
   assertion written without the shim reads an empty list, measures nothing and
   **passes**. It is the instrument, not a convenience.
+* **`tts-prefetch/prefetch_harness.py`'s two-phase fake** — it installs
+  `tts_prepare`/`tts_play` AND `tts`, all writing the same event kinds, so the
+  baseline (which only knows `tts()`) and the fixed service leave comparable
+  timelines. Every other harness goes through `isolation.install_fake_tts()`,
+  which stubs `tts` and **nulls the seam**: the service resolves the seam by
+  `getattr` at call time, so a harness stubbing `tts` alone would, on a
+  speech-to-cli that has the seam, send the AI-reply path at the real Azure
+  URL from inside a repro.
 * **`assert_isolated()`** — the harness version proves the *paths* are
   redirected; `subtitle_spy.assert_isolated()` delegates to it and adds the
   other half, that the CONFIG *pins actually took*. `assert_repo_spellbook()`
