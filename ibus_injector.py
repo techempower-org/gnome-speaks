@@ -37,6 +37,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 
 from injector import Injector
 
@@ -123,6 +124,74 @@ def clear_prior_engine():
 INPUT_SOURCES_SCHEMA = "org.gnome.desktop.input-sources"
 
 
+class _EngineNameMemo:
+    """Remember what the daemon calls an XKB layout, per bus (#136).
+
+    On GNOME `derive_restore_target()` runs on EVERY utterance -- the shell
+    owns input sources and leaves the daemon's global engine unset, so the
+    "fallback" is the normal path -- and 23 ms of it was `list_engines()`:
+    deserialising every EngineDesc the daemon knows (974 on the desk it was
+    measured on) to find one name. That answer depends on nothing but the
+    daemon's engine list, so it is memoised per (layout, variant) for the
+    lifetime of the bus object it was asked of. A different bus -- a
+    reconnect, or the probe `restore_prior_engine()` opens at startup --
+    starts from nothing, so the dependency-free path is never handed a name
+    learned over some other connection.
+
+    Only a FOUND name is stored. A miss is asked again next time, so a layout
+    the daemon does not (yet) know is never shadowed by a remembered "no".
+
+    Deliberately NOT cached: the input-sources read that decides WHICH layout
+    to look up. It is the authority the shell itself writes, it costs ~0.5 ms,
+    and re-reading it per call is what makes a layout switch take effect on
+    the very next utterance -- with no `changed` signal to plumb and no main
+    loop for that signal to depend on (a GSettings object created on the STT
+    worker thread would deliver its signals to a main context nothing
+    iterates, and `restore_prior_engine()` runs before the loop exists).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._bus_ref = None      # weakref to the bus these names came from
+        self._bus_strong = None   # only for a bus that cannot be weakly referenced
+        self._names = {}
+
+    def _same_bus(self, bus):
+        if self._bus_ref is not None:
+            return self._bus_ref() is bus
+        return self._bus_strong is not None and self._bus_strong is bus
+
+    def _bind(self, bus):
+        self._names = {}
+        self._bus_ref = self._bus_strong = None
+        try:
+            self._bus_ref = weakref.ref(bus)
+        except TypeError:
+            self._bus_strong = bus
+
+    def get(self, bus, layout, variant):
+        with self._lock:
+            if not self._same_bus(bus):
+                return None
+            return self._names.get((layout, variant))
+
+    def put(self, bus, layout, variant, name):
+        if not name:
+            return                      # never remember a miss
+        with self._lock:
+            if not self._same_bus(bus):
+                self._bind(bus)
+            self._names[(layout, variant)] = name
+
+    def reset(self):
+        with self._lock:
+            self._names = {}
+            self._bus_ref = self._bus_strong = None
+
+
+_ENGINE_NAMES = _EngineNameMemo()
+
+
 def _xkb_engine_for(bus, layout, variant):
     """Find the daemon's engine name for an XKB layout/variant pair.
 
@@ -131,7 +200,12 @@ def _xkb_engine_for(bus, layout, variant):
     `...:eng`. So ask the daemon what it actually has rather than constructing
     a name it may not know; setting a nonexistent engine is how you end up
     exactly where this function is trying to rescue you from.
+
+    Asked once per (bus, layout, variant); see `_EngineNameMemo`.
     """
+    cached = _ENGINE_NAMES.get(bus, layout, variant)
+    if cached:
+        return cached
     prefix = "xkb:%s:%s:" % (layout, variant)
     try:
         matches = sorted(e.get_name() for e in bus.list_engines()
@@ -141,18 +215,26 @@ def _xkb_engine_for(bus, layout, variant):
         matches = []
     if not matches:
         return None
+    chosen = None
     if len(matches) == 1:
-        return matches[0]
-    # Several languages share this layout; prefer the session's own.
-    lang = (os.environ.get("LANG") or "")[:2].lower()
-    if lang:
-        for name in matches:
-            if name.rsplit(":", 1)[-1].lower().startswith(lang[:2]):
-                return name
-    for name in matches:
-        if name.endswith(":eng"):
-            return name
-    return matches[0]
+        chosen = matches[0]
+    else:
+        # Several languages share this layout; prefer the session's own.
+        lang = (os.environ.get("LANG") or "")[:2].lower()
+        if lang:
+            for name in matches:
+                if name.rsplit(":", 1)[-1].lower().startswith(lang[:2]):
+                    chosen = name
+                    break
+        if chosen is None:
+            for name in matches:
+                if name.endswith(":eng"):
+                    chosen = name
+                    break
+        if chosen is None:
+            chosen = matches[0]
+    _ENGINE_NAMES.put(bus, layout, variant, chosen)
+    return chosen
 
 
 def derive_restore_target(bus=None):
@@ -482,6 +564,10 @@ class IbusInjector(Injector):
         self._lock = threading.RLock()
         self._prior = None
         self._active = False
+        # GetGlobalEngine answered "no global engine" on this bus. On GNOME
+        # that is the steady state, not a transient, and every further ask is
+        # a D-Bus round trip plus one IBUS-WARNING in the journal (#136).
+        self._global_engine_unset = False
         self._coalescer = _Coalescer()
         # Why the last acquire() said no: None | "secure" | "no_target" |
         # "unavailable". commit() falls back to ydotool for every reason but
@@ -525,6 +611,7 @@ class IbusInjector(Injector):
                     return False
                 self._factory = SpeaksFactory(bus, self._on_engine_created)
                 self._bus = bus
+                self._global_engine_unset = False   # a new bus gets asked afresh
                 self._registered = True
                 log.info("IBus component registered (engine %s, layout %s)",
                          ENGINE_NAME, ENGINE_LAYOUT)
@@ -586,16 +673,26 @@ class IbusInjector(Injector):
             if self._active:
                 return not self._is_secure()
             self._refusal = None
-            try:
-                prior = self._bus.get_global_engine()
-                prior_name = prior.get_name() if prior else None
-            except Exception:
-                # "No global engine" is the COMMON case on GNOME, not an
-                # error: the shell owns input sources and often leaves the
-                # daemon's global engine unset. Not a reason to give up on
-                # having somewhere to go back to.
-                log.debug("GetGlobalEngine unavailable", exc_info=True)
-                prior_name = None
+            prior_name = None
+            if not self._global_engine_unset:
+                try:
+                    prior = self._bus.get_global_engine()
+                    prior_name = prior.get_name() if prior else None
+                except Exception:
+                    # "No global engine" is the COMMON case on GNOME, not an
+                    # error: the shell owns input sources and often leaves
+                    # the daemon's global engine unset. Not a reason to give
+                    # up on having somewhere to go back to.
+                    log.debug("GetGlobalEngine unavailable", exc_info=True)
+                    prior_name = None
+                if not prior_name:
+                    # Asked, and the daemon has none. Do not ask again on this
+                    # bus: the answer comes from input-sources below either
+                    # way, and libibus g_warning()s on every empty reply --
+                    # one journal line per utterance before #136. A layout
+                    # switch still lands, because the input-sources read in
+                    # derive_restore_target() is not cached.
+                    self._global_engine_unset = True
             if prior_name == ENGINE_NAME:
                 prior_name = None  # never record ourselves as the way back
             if not prior_name:

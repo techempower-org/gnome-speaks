@@ -68,6 +68,7 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 | `chronicle-perf` | #22 / #27 | `6a1ecae` | derived (`merge^1`), not re-run |
 | `chronicle-perf/repro_audio_info_stall` | #135 | `025df92` | **verified** — 319 ms stall, probe on MainThread |
 | `injector-seam` | #24 | `ea47ff1` | derived (`merge^1`), not re-run |
+| `injector-seam/repro_derive_cache` | #136 | `a20afea` | **verified** — 6 fail: 5 acquires issue 5 `list_engines()` + 5 `GetGlobalEngine` (fixed: 1 + 1; a layout switch costs one more `list_engines()`, switching back costs none); the restore/breadcrumb/no-negative-cache/per-bus checks stay green on both sides |
 | `cancel-tokens` | #21 / #33 | `66edc79` | **verified** — 4 of 5 fail |
 | `cancel-tokens` `repro_e` | #132 | `025df92` | **verified** — E1, E3 fail; E2 stays green on both sides |
 | `cancel-tokens` `repro_f` | #132 / PR #146 review | `fd5c8cd` (PR head before revision), `0e014cc` | **verified** — F1 43/126 and 51/300 dictations hit, F2 1/1; 0/101 and clean with the fix. F1 lowers `sys.setswitchinterval` (GS_RACE_SWITCH, default 1e-5) — at CPython's 5 ms default it scored 0/300 on the unfixed tree |
