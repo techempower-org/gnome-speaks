@@ -655,6 +655,12 @@ export default class GnomeSpeaksExtension extends Extension {
                 return Clutter.EVENT_PROPAGATE;
 
             if (!wasDragging) {
+                // A pointer tap must not leave the badge holding stage key
+                // focus: while a shell actor has it, no window's text field is
+                // focused, IBus falls to its "fake" context, and an IBus commit
+                // for THIS very utterance vanishes (#109). Keyboard activation
+                // keeps focus (a11y); the pointer path hands it back first.
+                this._releaseKeyFocusFromPointer();
                 this._onBadgeClicked();
             }
             return Clutter.EVENT_STOP;
@@ -942,6 +948,10 @@ export default class GnomeSpeaksExtension extends Extension {
             // St.Button reports button 0 for keyboard activation — the only
             // honest signal of "this came from the keyboard", which the
             // Chronicle needs so it only steals focus when a keyboard asked.
+            // A pointer tap also hands stage key focus back to the user's
+            // window before acting, so an IBus commit has a real target (#109).
+            if (button !== 0)
+                this._releaseKeyFocusFromPointer();
             onActivate(button === 0);
         });
         return pill;
@@ -2097,6 +2107,20 @@ export default class GnomeSpeaksExtension extends Extension {
             duration: 200,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
         });
+    }
+
+    // Drop stage key focus a pointer click gave to badge chrome. Mutter then
+    // refocuses the window that had it, and the window's input context becomes
+    // IBus's focus again -- the place a dictated commit has to land. Keyboard
+    // users never reach this: their focus is the point (a11y).
+    _releaseKeyFocusFromPointer() {
+        try {
+            let focus = global.stage.get_key_focus();
+            if (focus && this._badge && (focus === this._badge || this._badge.contains(focus)))
+                global.stage.set_key_focus(null);
+        } catch (e) {
+            console.debug(`[GNOME Speaks] release key focus: ${e.message}`);
+        }
     }
 
     _onBadgeClicked() {

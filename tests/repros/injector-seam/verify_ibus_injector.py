@@ -154,6 +154,13 @@ class FakeFallback:
         self.enters = 0
         self.recovers = 0
         self.prepared = 0
+        # Text handed to the keystroke backend when IBus has no usable target
+        # (#109): the seam promises ydotool for every failure but a password.
+        self.commits = []
+
+    def commit(self, text):
+        self.commits.append(text)
+        return True
 
     def prepare(self):
         self.prepared += 1

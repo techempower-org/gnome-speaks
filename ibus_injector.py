@@ -65,6 +65,9 @@ ENGINE_LAYOUT = "default"
 
 # ── timings ──────────────────────────────────────────────────────────────
 FOCUS_WAIT = 0.4          # how long acquire() waits for the daemon's FocusIn
+# ibus-daemon focuses this pseudo-client when NO input context has focus --
+# e.g. right after a pointer tap on shell chrome. A commit into it vanishes.
+FAKE_CLIENT = "fake"
 CONTENT_TYPE_GRACE = 0.05  # ...then for SetContentType to settle behind it
 COALESCE_DELAY = 0.12     # back-to-back finals merge into one commit
 SESSION_MAX_SECONDS = 120  # watchdog: no session may outlive this
@@ -342,6 +345,7 @@ if HAS_IBUS:
             self.hints = 0
             self.focused = False
             self.saw_content_type = False
+            self.client = ""
             self._preediting = False
 
         # -- key events ---------------------------------------------------
@@ -356,6 +360,7 @@ if HAS_IBUS:
 
         def do_focus_in_id(self, object_path, client):
             self.focused = True
+            self.client = client or ""
             log.debug("IBus focus in (client=%s)", client)
 
         def do_focus_out(self):
@@ -363,12 +368,17 @@ if HAS_IBUS:
 
         def do_focus_out_id(self, object_path):
             self.focused = False
+            self.client = ""
             # Anything provisional dies with the focus it belonged to -- and
             # so does what we knew about the field: the next FocusIn may come
             # from a client that never sends SetContentType.
             self.saw_content_type = False
             self.clear_preedit()
             log.debug("IBus focus out")
+
+        def has_target(self):
+            """Focused on a REAL input context (not ibus-daemon\'s fake one)."""
+            return bool(self.focused and self.client != FAKE_CLIENT)
 
         def do_reset(self):
             self.clear_preedit()
@@ -473,6 +483,10 @@ class IbusInjector(Injector):
         self._prior = None
         self._active = False
         self._coalescer = _Coalescer()
+        # Why the last acquire() said no: None | "secure" | "no_target" |
+        # "unavailable". commit() falls back to ydotool for every reason but
+        # "secure" (a password field must get NOTHING, from any backend).
+        self._refusal = None
         self._flush_timer = None
         self._watchdog = None
 
@@ -566,10 +580,12 @@ class IbusInjector(Injector):
         into perfectly normal windows.
         """
         if not self.available():
+            self._refusal = "unavailable"
             return False
         with self._lock:
             if self._active:
                 return not self._is_secure()
+            self._refusal = None
             try:
                 prior = self._bus.get_global_engine()
                 prior_name = prior.get_name() if prior else None
@@ -600,11 +616,13 @@ class IbusInjector(Injector):
             try:
                 if not self._bus.set_global_engine(ENGINE_NAME):
                     log.warning("IBus refused SetGlobalEngine; not typing")
+                    self._refusal = "unavailable"
                     clear_prior_engine()
                     self._prior = None
                     return False
             except Exception:
                 log.warning("IBus SetGlobalEngine failed", exc_info=True)
+                self._refusal = "unavailable"
                 clear_prior_engine()
                 self._prior = None
                 return False
@@ -623,8 +641,20 @@ class IbusInjector(Injector):
 
         if self._is_secure():
             log.info("IBus target is a password field; refusing to type")
+            self._refusal = "secure"
             self.cancel()
             return False
+        eng = self._engine
+        if eng is not None and eng.focused and getattr(eng, "client", "") == FAKE_CLIENT:
+            # No input context has focus (a pointer tap on shell chrome does
+            # this). A commit here lands nowhere and is lost silently -- so
+            # hand the whole utterance to the keystroke backend instead (#109).
+            log.info("IBus focus is the daemon's fake context (no text field "
+                     "focused); typing this utterance via the fallback backend")
+            self._refusal = "no_target"
+            self.cancel()
+            return False
+        self._refusal = None
         return True
 
     def _is_secure(self):
@@ -632,11 +662,17 @@ class IbusInjector(Injector):
         return bool(eng is not None and eng.is_secure())
 
     def _ensure_session(self):
+        if self._refusal == "no_target":
+            return False  # decided for this utterance; end() clears it
         if self._active:
             # Re-read the purpose every time: SetContentType can arrive late,
             # and focus can move into a password field mid-session.
             if self._is_secure():
                 log.info("IBus focus moved into a password field; discarding")
+                # "secure" outranks every fallback: the keystroke backend must
+                # not type what IBus just refused (the verifier's mid-session
+                # password case caught exactly that).
+                self._refusal = "secure"
                 self.cancel()
                 return False
             return True
@@ -645,6 +681,7 @@ class IbusInjector(Injector):
     def end(self):
         """Finish cleanly: flush what is buffered, then hand the IME back."""
         with self._lock:
+            self._refusal = None
             self._cancel_timers()
             if self._active:
                 self._flush(allowed=True)
@@ -759,11 +796,23 @@ class IbusInjector(Injector):
         if not text:
             return False
         if not self._ensure_session():
-            return False
+            return self._fallback_text(text)
         with self._lock:
             self._coalescer.push(text)
             self._arm_flush()
         return True
+
+    def _fallback_text(self, text):
+        """Type through the keystroke backend when IBus has no usable target.
+
+        Never for a password field: "secure" means nothing may be typed by
+        any backend. Everything else -- fake context, daemon unavailable,
+        swap refused -- keeps the seam's promise of falling back to ydotool,
+        never to nothing.
+        """
+        if self._refusal == "secure" or self._fallback is None:
+            return False
+        return bool(self._fallback.commit(text))
 
     def type_text(self, text):
         # TEXT path: goes through the same coalesced commit so the

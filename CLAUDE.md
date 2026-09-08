@@ -148,6 +148,14 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
   only `stop()` cancels the session token and only the token may gate the transcript. A library
   result is not a cancellation check either: `stt_fixed()` calls `is_cancelled()` exactly once and
   then POSTs to Azure with a 30 s timeout, so a stop during the upload is simply never seen.
+- **IBus's `fake` client is "no text field", not a target**: ibus-daemon focuses its pseudo-client `fake` when NO
+  input context has focus -- which is exactly what a pointer tap on badge chrome produces (the tap gives the shell
+  stage key focus; the window's context loses IBus focus). A `commit_text` into it vanishes: on 2026-09-07 a
+  recognised transcript was lost that way with no toast (#109). `acquire()` therefore treats `client == "fake"` as a
+  refusal with reason `no_target`, `commit()` types that utterance through the ydotool fallback (never for
+  `secure` -- a password field gets nothing from any backend, including after a mid-session focus move), and the
+  extension hands stage key focus back to the window before acting on a pointer tap (`_releaseKeyFocusFromPointer`).
+  Keyboard activation keeps focus (a11y).
 - **`commit_text("\n")` is not the Enter key**: it inserts a newline *character*, so a shell never
   runs the command. `press_enter()` is a distinct seam method for this reason and delegates to a
   key-event backend even when IBus is active (spec §5.4, "non-text targets"). Never collapse it
