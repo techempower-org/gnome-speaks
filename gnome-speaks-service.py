@@ -1147,6 +1147,40 @@ def speech_route():
     }
 
 
+def _speech_ready(need_azure=False):
+    """Can the service speak or listen right now? None = yes, else the words
+    for what is actually missing.
+
+    The ONE owner of the "Azure Speech key not configured" verdict (#125). Six
+    copy-pasted `if not CONFIG.get("key")` gates each refused a keyless install
+    outright -- but with speech_backend=local (#108) or SPEECH_FORCE_OFFLINE the
+    STT/TTS paths never touch Azure, so the key is not what is missing. The
+    front door has to agree with the routing wyoming.skip_azure() applies
+    downstream, or a complete offline install is refused at the door.
+
+    need_azure=True is for the one caller that has no local path at all:
+    Talk is speech_tts.talk_fullduplex(), which posts to Azure directly and
+    streams Azure STT -- no Wyoming seam on either side.
+    """
+    if CONFIG.get("key"):
+        return None
+    if need_azure:
+        return ("Azure Speech key not configured (Talk is full-duplex Azure "
+                "and has no local speech path)")
+    if not wyoming_mod.enabled():
+        return ("Azure Speech key not configured and no local speech server "
+                "(wyoming_host) set")
+    if wyoming_mod.skip_azure():
+        # forced / prefer_local / azure_down: the LAN server takes the call
+        return None
+    if getattr(wyoming_mod, "prefer_local", lambda: False)():
+        # prefer_local, but the LAN server is on cooldown: the fallback IS Azure
+        return ("local speech server on cooldown after a failure, and no Azure "
+                "Speech key to fall back to")
+    return ("Azure Speech key not configured -- set speech_backend=local to "
+            "use the local speech server")
+
+
 def get_injector():
     """The process-wide injection backend (lazy, rebuilt when config changes)."""
     global _injector, _injector_method, _injector_fallback_since
@@ -2314,9 +2348,11 @@ class GnomeSpeaksService:
             if mode == "whisper" and not HAS_WHISPER:
                 GLib.idle_add(self._emit_error, "faster-whisper not installed")
                 return "error: no whisper support"
-            if mode != "whisper" and not CONFIG.get("key"):
-                GLib.idle_add(self._emit_error, "Azure Speech key not configured")
-                return "error: no API key"
+            if mode != "whisper":
+                missing = _speech_ready()
+                if missing:
+                    GLib.idle_add(self._emit_error, missing)
+                    return "error: speech not configured"
 
             self._stop_event.clear()
             self._set_state("listening")
@@ -2334,9 +2370,10 @@ class GnomeSpeaksService:
             return "ok"
 
         # Streaming mode (default)
-        if not CONFIG.get("key"):
-            GLib.idle_add(self._emit_error, "Azure Speech key not configured")
-            return "error: no API key"
+        missing = _speech_ready()
+        if missing:
+            GLib.idle_add(self._emit_error, missing)
+            return "error: speech not configured"
 
         if not HAS_WS:
             GLib.idle_add(self._emit_error, "websocket-client not installed")
@@ -3610,8 +3647,9 @@ class GnomeSpeaksService:
         if self.current_state not in ("idle",):
             self.stop(drain_queue=False)
 
-        if not CONFIG.get("key"):
-            GLib.idle_add(self._emit_error, "Azure Speech key not configured")
+        missing = _speech_ready()
+        if missing:
+            GLib.idle_add(self._emit_error, missing)
             self._release_user_speech()
             return False
 
@@ -4191,9 +4229,10 @@ class GnomeSpeaksService:
                 if self.current_state not in ("idle",):
                     self.stop(drain_queue=False)
 
-                if not CONFIG.get("key"):
-                    GLib.idle_add(self._emit_error, "Azure Speech key not configured")
-                    return "error: no API key"
+                missing = _speech_ready(need_azure=True)
+                if missing:
+                    GLib.idle_add(self._emit_error, missing)
+                    return "error: speech not configured"
 
                 self._stop_event.clear()
                 self._set_state("speaking")
@@ -5101,9 +5140,10 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # Reject up front rather than enqueueing items doomed to fail —
-        # a keyless service must not answer 200 and then say nothing.
-        if not CONFIG.get("key"):
-            self._send_error_json(503, "Azure Speech key not configured")
+        # a service that cannot speak must not answer 200 and then say nothing.
+        missing = _speech_ready()
+        if missing:
+            self._send_error_json(503, missing)
             return
 
         svc = self.service
@@ -5701,12 +5741,15 @@ def main():
     restore_prior_engine("service start")
 
     # Validate config
-    if not CONFIG.get("key"):
+    missing = _speech_ready()
+    if missing:
         log.error(
-            "No Azure Speech key found. "
-            "Set AZURE_SPEECH_KEY or configure ~/.config/speech-to-cli/config.json",
+            "%s. Set AZURE_SPEECH_KEY or configure ~/.config/speech-to-cli/config.json",
+            missing,
         )
         # Continue anyway — we will emit Error signals on method calls
+    elif not CONFIG.get("key"):
+        log.info("No Azure Speech key: running local-first on the Wyoming server")
 
     log.info(
         "Starting GNOME Speaks service (speech=%s, region=%s, vad=%s, ws=%s, whisper=%s)",
