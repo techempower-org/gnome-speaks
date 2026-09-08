@@ -216,6 +216,13 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
   unguarded `inj.name` in the swap's *log line* raised AttributeError out of the whole STT cycle
   -- nothing recognized, nothing typed, on the ordinary healthy-Azure path.
 
+- **`connection.register_object` leaks, `GLib.unix_signal_add` warns -- use the shims (#114)**: Python's
+  `register_object` shadows `g_dbus_connection_register_object_with_closures`, which GLib 2.84 deprecated
+  because the closure is handed an owned `GDBusMethodInvocation` nothing releases -- measured ~1.5 kB per D-Bus
+  method call on PyGObject 3.56 / GLib 2.88, flat through `register_object_with_closures2`. Go through
+  `_register_dbus_object()` and `_unix_signal_add` (GLibUnix when present, old API on GNOME 46-48 hosts); a
+  bare call reintroduces both the leak and the startup deprecation lines, and `tests/repros/deprecations`
+  goes red -- it runs the real `main()` on a private bus and counts warnings attributed to the service file.
 - **ydotool stuck keys**: If a ydotool command is interrupted between key-down and key-up, the virtual device retains that key as pressed. The service auto-restarts `ydotoold` to recover. Scripts: `fix-ydotool.sh`, `install-ydotool.sh`.
 - **pw-record ignores SIGTERM**: Must use SIGKILL (`proc.kill()`) to stop PipeWire recorder processes.
 - **The wake watcher's shutdown warning is the OLD pid, not the new one (#137)**: at `Stopping`, systemd's

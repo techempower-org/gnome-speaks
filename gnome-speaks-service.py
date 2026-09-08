@@ -57,6 +57,45 @@ gi.require_version("Gio", "2.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import Gio, GLib
 
+# Deprecation-free platform bindings (#114). Every start used to log three
+# deprecation lines, and the noise hid real warnings in the first ten journal
+# lines. Both replacements fall back on hosts that predate them -- the
+# extension supports GNOME 46-50, i.e. GLib 2.80-2.88.
+#
+# * GLib 2.80 split the Unix-only API into GLibUnix, and PyGObject 3.56 warns
+#   on every ACCESS of GLib.unix_signal_add (twice: SIGTERM and SIGINT).
+#   GLibUnix.signal_add has the same shape: (priority, signum, handler,
+#   user_data) -> source id; measured delivering a real signal with its
+#   user_data on GLib 2.88.
+# * GLib 2.84 deprecated g_dbus_connection_register_object_with_closures --
+#   the C function Python's DBusConnection.register_object shadows -- for
+#   register_object_with_closures2, and not cosmetically: the old closure
+#   was handed an owned GDBusMethodInvocation that nothing released.
+#   MEASURED on PyGObject 3.56.2 / GLib 2.88: ~1.5 kB leaked per D-Bus method
+#   call through register_object (3012/2916/2796 kB per 2000 calls), flat
+#   (0 kB) through register_object_with_closures2, identical dispatch of
+#   method calls, property Get and error returns. So every GetState and hotkey
+#   grew the service; the closures2 path is a fix, not a rename.
+try:
+    gi.require_version("GLibUnix", "2.0")
+    from gi.repository import GLibUnix as _GLibUnix
+    _unix_signal_add = getattr(_GLibUnix, "signal_add", None)
+except (ValueError, ImportError):
+    _unix_signal_add = None
+if _unix_signal_add is None:
+    # Old host: the attribute access below is exactly what warns on new ones,
+    # so it is taken only where there is nothing to warn about.
+    _unix_signal_add = GLib.unix_signal_add
+
+
+def _register_dbus_object(connection, object_path, interface_info,
+                          method_call, get_property, set_property):
+    """connection.register_object(...) without the deprecated (leaking) path."""
+    register = getattr(Gio.DBusConnection, "register_object_with_closures2",
+                       None) or Gio.DBusConnection.register_object
+    return register(connection, object_path, interface_info,
+                    method_call, get_property, set_property)
+
 # ---------------------------------------------------------------------------
 # Import speech modules from speech-to-cli
 # ---------------------------------------------------------------------------
@@ -5844,8 +5883,8 @@ def _spiel_get_property(connection, sender, object_path, interface_name,
 
 def _on_spiel_bus_acquired(connection, name):
     node = Gio.DBusNodeInfo.new_for_xml(SPIEL_INTERFACE_XML)
-    connection.register_object(
-        SPIEL_OBJECT_PATH,
+    _register_dbus_object(
+        connection, SPIEL_OBJECT_PATH,
         node.lookup_interface("org.freedesktop.Speech.Provider"),
         _spiel_method_call, _spiel_get_property, None)
     log.info("Spiel provider registered as %s", name)
@@ -5858,7 +5897,8 @@ def on_bus_acquired(connection, name, service, handler):
     node_info = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION_XML)
     interface_info = node_info.lookup_interface(INTERFACE_NAME)
 
-    connection.register_object(
+    _register_dbus_object(
+        connection,
         OBJECT_PATH,
         interface_info,
         handler.handle_method_call,
@@ -6040,8 +6080,8 @@ def main():
         loop.quit()
         return GLib.SOURCE_REMOVE
 
-    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, _on_signal, signal.SIGTERM)
-    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, _on_signal, signal.SIGINT)
+    _unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, _on_signal, signal.SIGTERM)
+    _unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, _on_signal, signal.SIGINT)
 
     try:
         loop.run()
