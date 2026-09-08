@@ -29,6 +29,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import itertools
 from collections import deque
 from dataclasses import dataclass
@@ -1928,6 +1929,12 @@ class GnomeSpeaksService:
 
         # Audio detection flag (FIX 12)
         self._audio_detected = False
+
+        # Set by shutdown() and the SIGTERM handler before anything is torn
+        # down. The wake watcher reads it: systemd's control-group SIGTERM ends
+        # the watcher's pw-record (rc=1) at the same instant, and that EOF is
+        # teardown, not a failure to retry (#137).
+        self._shutting_down = False
 
         # HTTP progress tracking for REST API status endpoint
         self._http_progress = {
@@ -4108,11 +4115,52 @@ class GnomeSpeaksService:
             raise ValueError(f"unknown dbus_self op: {op}")
         return None
 
+    # Retry cadence after a FAILED wake cycle -- recorder EOF, server error,
+    # anything else. The first failures after a start are usually transient:
+    # at login the LAN name may not resolve yet (measured 2026-09-07
+    # 09:20:20.383, a WyomingError 15 ms after "Starting", then a 60 s sleep
+    # with the wake word dead) and PipeWire may not have the capture device.
+    # So they retry fast and log at DEBUG. A failure that outlives the ramp
+    # gets the steady cadence #41 established, UNCHANGED: 10 s recorder /
+    # 60 s server, one WARNING per 5 min. The ramp is bounded (5 retries,
+    # 15.5 s in total) and a healthy stream resets it, so it can never become
+    # the pre-#41 storm; a permanently missing mic or server still costs one
+    # spawn per 10 s / one connect per 60 s (#137).
+    _WAKE_RETRY_RAMP = (0.5, 1.0, 2.0, 4.0, 8.0)
+    _WAKE_STEADY_RECORDER = 10
+    _WAKE_STEADY_SERVER = 60
+
+    @classmethod
+    def _wake_retry_delay(cls, failures, steady):
+        """Sleep before retry number `failures` (1-based) of a failing wake
+        cycle: the ramp while it lasts, then `steady`; never above `steady`."""
+        if failures <= len(cls._WAKE_RETRY_RAMP):
+            return min(cls._WAKE_RETRY_RAMP[failures - 1], steady)
+        return steady
+
+    @staticmethod
+    def _stderr_tail(errf, limit=200):
+        """Last line the recorder wrote to stderr, as ', stderr: ...', or ''.
+        Makes an rc self-explaining in the warning (#137 could not say why
+        rc=1 because stderr went to DEVNULL)."""
+        try:
+            errf.seek(0, os.SEEK_END)
+            errf.seek(max(0, errf.tell() - 2048))
+            lines = errf.read().decode("utf-8", "replace").strip().splitlines()
+        except Exception:
+            return ""
+        if not lines:
+            return ""
+        return ", stderr: " + lines[-1][-limit:]
+
     def _wake_watcher(self):
         """Daemon thread: streams mic audio to the Wyoming wake-word server
         while idle; a detection acts like the dictation hotkey."""
         last_fail_log = 0.0
+        failures = 0        # consecutive failed cycles; a healthy one resets it
         while True:
+            if self._shutting_down:
+                return
             if (not CONFIG.get("wake_word", False)
                     or not CONFIG.get("wyoming_host", "")
                     or not CONFIG.get("wake_word_model", "")
@@ -4123,16 +4171,23 @@ class GnomeSpeaksService:
             port = int(CONFIG.get("wyoming_wake_port", 10400))
             model = CONFIG.get("wake_word_model", "")
             proc = None
+            errf = None
             recorder_eof = False
+            failed = None       # (steady_delay, reason) when this cycle failed
             try:
+                # stderr to a temp FILE, not a pipe: nothing drains a pipe
+                # while the stream runs, and a chatty client could fill the
+                # 64 KB and stall the recorder. Read back only on failure.
+                errf = tempfile.TemporaryFile()
                 proc = subprocess.Popen(_build_rec_cmd(),
                                         stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL)
+                                        stderr=errf)
 
                 def _chunks():
                     nonlocal recorder_eof
                     while (CONFIG.get("wake_word", False)
-                           and self.current_state == "idle"):
+                           and self.current_state == "idle"
+                           and not self._shutting_down):
                         data = proc.stdout.read(3200)  # ~100 ms @ 16 kHz s16
                         if not data:
                             recorder_eof = True
@@ -4151,21 +4206,14 @@ class GnomeSpeaksService:
                     # audio (mic unplugged, stale mic_source). Without a sleep
                     # this loop respawns the recorder and reconnects to the
                     # wake server as fast as it can (#41).
-                    now = time.time()
-                    if now - last_fail_log > 300:
-                        log.warning("Wake watcher: recorder produced no audio "
-                                    "(rc=%s) (retrying every 10s)", proc.poll())
-                        last_fail_log = now
-                    time.sleep(10)
+                    failed = (self._WAKE_STEADY_RECORDER,
+                              "recorder produced no audio (rc=%s%s)"
+                              % (proc.poll(), self._stderr_tail(errf)))
             except wyoming_mod.WyomingError as e:
-                now = time.time()
-                if now - last_fail_log > 300:
-                    log.warning("Wake watcher: %s (retrying every 60s)", e)
-                    last_fail_log = now
-                time.sleep(60)
+                failed = (self._WAKE_STEADY_SERVER, str(e))
             except Exception:
                 log.exception("Wake watcher error")
-                time.sleep(10)
+                failed = (self._WAKE_STEADY_RECORDER, "error (traceback above)")
             finally:
                 if proc is not None:
                     proc.kill()  # pw-record ignores SIGTERM
@@ -4173,6 +4221,31 @@ class GnomeSpeaksService:
                         proc.wait(timeout=1)
                     except Exception:
                         pass
+                if errf is not None:
+                    errf.close()
+            if self._shutting_down:
+                # Teardown, not a failure: systemd's control-group SIGTERM ended
+                # pw-record with rc=1 and detect_stream waited its 0.5 s for a
+                # verdict. Measured on 5/5 restarts of 2026-09-07 -- the old
+                # pid logged "retrying every 10s" mid-Stopping, which #137
+                # misread as the NEW pid failing at start. Promise no retry.
+                return
+            if failed is None:
+                failures = 0
+                continue
+            failures += 1
+            steady, reason = failed
+            delay = self._wake_retry_delay(failures, steady)
+            if delay < steady:
+                log.debug("Wake watcher: %s (retry %d/%d in %.1fs)", reason,
+                          failures, len(self._WAKE_RETRY_RAMP), delay)
+            else:
+                now = time.time()
+                if now - last_fail_log > 300:
+                    log.warning("Wake watcher: %s (retrying every %ds)",
+                                reason, steady)
+                    last_fail_log = now
+            time.sleep(delay)
 
     def _drain_speech_gap(self, max_seconds=20):
         """Loop-mode gap: hold the mic closed until queued speech plays out.
@@ -5042,6 +5115,7 @@ class GnomeSpeaksService:
     def shutdown(self):
         """Clean up resources on exit."""
         log.info("Shutting down")
+        self._shutting_down = True
         self.stop()
         get_injector().recover()
         _discard_prewarmed_rec()
@@ -5957,6 +6031,7 @@ def main():
     # Handle SIGTERM/SIGINT
     def _on_signal(signum):
         log.info("Received signal %d, shutting down", signum)
+        service._shutting_down = True   # before the 0.5 s http_server.shutdown() wait
         if http_server:
             http_server.shutdown()
         service.shutdown()
