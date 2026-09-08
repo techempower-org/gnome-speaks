@@ -1,0 +1,7 @@
+# leak-scan is bash and scans the TRACKED TREE of this repo, not GS_SVC_PATH:
+# the repo is public and the maintainer's home path, LAN names and the HA
+# domain must never be committed (#126). It is excluded from its own scan and
+# proves the pattern matches a planted string before it believes a zero.
+# The script lives at tests/leak-scan.sh (it is a repo gate, not only a suite);
+# this directory holds its manifest and baseline so the runner discovers it.
+leak-scan.sh (tracked tree): ../../leak-scan.sh

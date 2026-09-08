@@ -1,0 +1,4 @@
+# Static: prefs.js keys vs speech-to-cli's load_config() whitelist vs
+# _SYNC_FLAGS vs service CONFIG reads. Reads state.py from SPEECH_ENGINE_PATH
+# (~/Projects/speech-to-cli), so a sibling-repo whitelist gap is red HERE.
+verify_config_key_contract.py

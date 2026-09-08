@@ -1,0 +1,15 @@
+# wake-watcher (#121): one process per case, same reason as offline-handoff.
+# The watcher is a daemon thread the SERVICE CONSTRUCTOR starts, so one process
+# per case guarantees exactly one watcher per verdict and no case inherits a
+# thread the previous one armed.
+# B discriminates the pre-#41 baseline (11c8f60); G and H discriminate the
+# pre-#137 baseline (a20afea), and B, C, F go red there too (they assert the
+# start-up ramp). A, D, E are guards.
+case A: repro_wake_watcher.py A
+case B: repro_wake_watcher.py B
+case C: repro_wake_watcher.py C
+case D: repro_wake_watcher.py D
+case E: repro_wake_watcher.py E
+case F: repro_wake_watcher.py F
+case G: repro_wake_watcher.py G
+case H: repro_wake_watcher.py H
