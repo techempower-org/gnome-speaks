@@ -96,6 +96,7 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 | `subtitle-token` | #42 / #78 | `65bd57b` | e1–e4 fail |
 | `begin-refused` | #79 / #84 | `15dd402`, `f290d7e` | j, k fail — **l stays green on both sides** |
 | `tts-prefetch` | #134 (×#146 for p4) | `a20afea` | **verified** — p1 fails (wall 3.01 s serial vs 2.21 s pipelined, S=0.4/P=0.6); **p2, p3, p4 report `2` (SETUP FAILURE) there, not `0`** — the prepared-ahead window they test does not exist on a service that never prefetches, and a suite that passed on it would be measuring nothing. p4 is a guard: `skip_current()` (the #146 interrupt path) is a no-op while a reply holds the queue, and the queue path has no prefetch — it goes red if either premise changes |
+| `sentence-split` | #154 | `5dde4b4` | **verified** — s1 fails (2 synthesis calls: `Beta two follows.Gamma three ends.` spoken and subtitled as one); s2 fails 7 of 13 rows — the issue's `. ` token, two boundaries in one token, `\n`, double space, `!`/`?`, an ellipsis, `e.g.` — every shape where the buffer ends in `[.!?]` + whitespace with a second boundary before it. Guards green on both sides: tokenizer-shaped tokens, `3.5`, fullwidth punctuation (not a boundary, unchanged), no terminal punctuation |
 | `pin-lifecycle` | #46 ×#57 | `15dd402` | compound X: X1 FAIL, X2 PASS, X3 FAIL |
 | `version-cache` | #53 / #85 | two-sided, below | `577a05f` passes, `7eaeb02` fails |
 | `prefs-rig` | #82 | merge base of the branch | more warnings than baseline = fail |
