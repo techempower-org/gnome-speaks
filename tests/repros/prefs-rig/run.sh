@@ -101,7 +101,8 @@ cleanup() {
     else echo "run dir kept for diagnosis: $RUN"; fi
 }
 trap cleanup EXIT
-mkdir -p "$RUN/home/.config/speech-to-cli" "$RUN/fakeext/schemas"
+mkdir -p "$RUN/home/.config/speech-to-cli" "$RUN/home-local/.config/speech-to-cli" \
+         "$RUN/fakeext/schemas"
 
 # --baseline-rev: extract into the run dir, so no caller-supplied path is
 # written to and nothing survives the run.
@@ -167,6 +168,14 @@ json.dump(cfg, open(sys.argv[1] + '/home/.config/speech-to-cli/config.json', 'w'
 print(f"FIXTURE rig-owned, {len(cfg)} pinned keys "
       f"(speaker_sink={cfg.get('speaker_sink')} mic_source={cfg.get('mic_source')} "
       f"from live wpctl); JP's config NOT read")
+# Variant for probe_backend_warning.js (#116): Local chosen, NO wyoming_host.
+# Same pinned keys, one more, one deliberately absent -- a separate HOME so the
+# main harness run never sees it.
+local_cfg = dict(cfg, speech_backend='local')
+local_cfg.pop('wyoming_host', None)
+json.dump(local_cfg, open(sys.argv[1] + '/home-local/.config/speech-to-cli/config.json', 'w'),
+          indent=2)
+print("FIXTURE-LOCAL rig-owned, speech_backend=local, wyoming_host ABSENT")
 PY
 
 # ── Per-PID broadway display ─────────────────────────────────────────────────
@@ -305,6 +314,32 @@ fi
 echo "=== BRANCH $BRANCH ==="; run "$BRANCH" "$RUN/branch.stderr" || exit 3
 echo "--- stderr ---"; cat "$RUN/branch.stderr"
 rc=0
+
+# ── #116 probe: Local without a server address must warn, visibly ────────────
+# BRANCH only -- the baseline predates the feature, so it would be red by
+# construction and gate nothing. Same exit contract: a probe that did not reach
+# EXIT_CLEAN is 3, a FAIL verdict is a REGRESSION (1). Its stderr is folded
+# into the warning count below so a banner that logs Gtk-WARNINGs is caught.
+echo "=== PROBE backend-warning (fixture-local) $BRANCH ==="
+pout=$( cd "$RUN" && GI_TYPELIB_PATH=/usr/lib/gnome-shell/girepository-1.0 \
+  LD_LIBRARY_PATH=/usr/lib/gnome-shell HOME="$RUN/home-local" \
+  GS_PREFS_EXTDIR="$RUN/fakeext" \
+  GSETTINGS_BACKEND=memory GDK_BACKEND=broadway BROADWAY_DISPLAY=$DISP \
+  timeout 60 gjs -m "$HERE/probe_backend_warning.js" "$BRANCH" 2>"$RUN/probe.stderr" )
+echo "$pout"
+case "$pout" in
+    *EXIT_CLEAN*) ;;
+    *) echo "!! HARNESS DID NOT COMPLETE for probe_backend_warning.js"
+       cat "$RUN/probe.stderr" >&2; exit 3 ;;
+esac
+case "$pout" in
+    *"BACKEND_WARN_RESULT ok"*) ;;
+    *) echo "!! REGRESSION: backend-warning probe failed (see BACKEND_WARN FAIL lines)"; rc=1 ;;
+esac
+if [ -s "$RUN/probe.stderr" ]; then
+    echo "--- probe stderr ---"; cat "$RUN/probe.stderr"
+    cat "$RUN/probe.stderr" >> "$RUN/branch.stderr"
+fi
 if [ -n "$BASE" ]; then
     bl=$(grep -c 'Gtk-WARNING\|Adw-WARNING' "$RUN/base.stderr")
     br=$(grep -c 'Gtk-WARNING\|Adw-WARNING' "$RUN/branch.stderr")

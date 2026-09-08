@@ -351,13 +351,54 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
             icon_name: 'audio-speakers-symbolic',
         });
 
-        // ── Voices ──
+        // ── Speech Backend ──
         const backendGroup = new Adw.PreferencesGroup({title: 'Speech Backend'});
         page.add(backendGroup);
-        this._addComboRow(backendGroup, 'Primary Provider', 'speech_backend', [
+        const backendOptions = [
             ['azure', 'Azure (cloud) — your local Wyoming server only as fallback'],
             ['local', 'Local (Piper / Parakeet on your Wyoming server) — Azure only as fallback'],
-        ], 'azure');
+        ];
+        const backendRow = this._addComboRow(backendGroup, 'Primary Provider',
+            'speech_backend', backendOptions, 'azure');
+        // Name the dependency where the choice is made (#116): the service
+        // honours Local only when wyoming_host is set, and used to say nothing.
+        // Plain text, assigned AFTER construction (same shape as the shortcut
+        // rows): the page is literally "Wake & Spells", and whether a ComboRow
+        // subtitle is parsed as markup differs by libadwaita version --
+        // measured on 1.9 it is NOT, so `&amp;` would show verbatim.
+        backendRow.use_markup = false;
+        backendRow.subtitle = 'Local needs a Wyoming server address (Wake & Spells → Offline Server). ' +
+            'Without one, Azure stays primary';
+
+        // Inline warning for the silent case: Local chosen, no address to
+        // reach. Lives inside the group so a hidden banner costs no space.
+        // Construct-then-assign for the title, and keep it free of '<' / '&':
+        // AdwBanner's markup handling varies by version too.
+        const backendWarn = new Adw.Banner({
+            button_label: 'Set Server Address',
+            revealed: false,
+        });
+        backendWarn.title = 'Local is selected, but no Wyoming server address is set — ' +
+            'Azure stays primary until you add one';
+        backendGroup.add(backendWarn);
+
+        // The address the SERVICE sees is the applied one, so track applies,
+        // not keystrokes: a half-typed hostname must not clear the warning.
+        this._wyomingHostApplied = String(this._config['wyoming_host'] ?? '').trim();
+        this._refreshBackendWarning = () => {
+            const chosen = backendOptions[backendRow.get_selected()]?.[0];
+            backendWarn.revealed = chosen === 'local' && this._wyomingHostApplied === '';
+        };
+        backendRow.connect('notify::selected', () => this._refreshBackendWarning());
+        this._refreshBackendWarning();
+
+        // Jump to the field that fixes it. Focusing the row also scrolls it
+        // into view (GtkViewport scroll-to-focus), so no manual scrolling.
+        backendWarn.connect('button-clicked', () => {
+            if (this._offlineServerPage)
+                window.set_visible_page(this._offlineServerPage);
+            this._wyomingHostRow?.grab_focus();
+        });
 
         const voiceGroup = new Adw.PreferencesGroup({title: 'Voices'});
         page.add(voiceGroup);
@@ -560,8 +601,16 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         const offlineGroup = new Adw.PreferencesGroup({title: 'Offline Server'});
         page.add(offlineGroup);
 
-        this._addEntryRow(offlineGroup, 'Server Address', 'wyoming_host', '',
+        const hostRow = this._addEntryRow(offlineGroup, 'Server Address', 'wyoming_host', '',
             'LAN hostname or IP of your Wyoming server — speech falls back here when the cloud is unreachable. Empty = off');
+        this._wyomingHostRow = hostRow;
+        this._offlineServerPage = page;
+        // Connected AFTER _addEntryRow's own handler, so the config write has
+        // landed by the time the Speech Backend warning re-reads the address.
+        hostRow.connect('apply', () => {
+            this._wyomingHostApplied = hostRow.get_text().trim();
+            this._refreshBackendWarning?.();
+        });
 
         this._addSpinRow(offlineGroup, 'Voice Port', 'wyoming_tts_port',
             1, 65535, 1, 0, 10200,
