@@ -1,0 +1,14 @@
+# `service-audit` — baseline
+
+The pinned SHA(s) this suite discriminates against and what fails there.
+`tests/repros/gen_readme.sh` collects the table rows below (every line that
+starts with `| ` except the header and separator) into the generated block in
+`tests/repros/README.md` — edit THIS file, then run the generator. Pin SHAs,
+never branch names (see README, "Baselines are pinned SHAs").
+
+| suite | issue / PR | baseline | expected there |
+|---|---|---|---|
+| `service-audit` | #18–#20, #110, #124 (c8 config-watch), #130 | `7899ccb` | derived (`merge^1`), not re-run; c8 batch-error-toast verified against `025df92` (E1 fails) |
+| `service-audit/repro_c9_loop_error_cap` | #117 | `a20afea` | **verified** — S1 fails (streaming: 98 cycles in 4 s, zero Errors — the silent forever-loop), B1/B2/B3 fail (batch: 1 cycle, toast on the first error, no route words — the issue's "re-enters forever" premise is *false* for batch on the baseline; it stopped, but after one hiccup). Controls B5, S2 green on both sides. B4 was re-pointed by #166 (batch silence must keep the loop ALIVE, the twin of S2) and is red on `a20afea` and `5dde4b4` for that reason |
+| `service-audit/repro_c10_batch_loop_silence` | #166 | `5dde4b4` | **verified** — 7 of 8 fail: L1 (batch loop, silence ×3 then text: 1 cycle, nothing typed, idle — the loop ended at the first quiet cycle; fixed: 35 cycles in 1.5 s, text typed, still listening), L2/L3 (tap and panic stop never got a 2nd/3rd cycle to act in), L4a/L4b (silence-then-errors: no cap toast because the silence had already ended the run), L5a/L5b (`NoAudio` read as silence — silent idle, no toast). L6 (loop OFF, one silent cycle) is the control and stays green on both sides |
+| `service-audit/repro_c11_loop_gap_busy` | #173 | `683b0be` | **verified** — 3 of 5 fail: G1 (text cycle, the speech queue claims the idle gap: 1 cycle, idle, no toast — `start_listening(quick=True)` answered `error: busy (speaking)` and the restart callback dropped it; fixed: re-armed after the item, 5 cycles, listening), G3 (the #117 cap never got its error cycles because the run was already dead), G4 (a queue that never goes quiet: silent on the baseline; fixed: ONE toast after `LOOP_RESTART_RETRIES` bounded waits, the repro pins `LOOP_RESTART_WAIT_SECONDS=0.3`). G2 (stop() during the wait) and G5 (loop OFF) are controls and stay green on both sides. The gap is opened deterministically: `GLib.idle_add` is a gated pump, so the restart sits queued while an item is enqueued and claimed |
