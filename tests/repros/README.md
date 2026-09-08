@@ -79,7 +79,7 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 | `prefs-rig` | #82 | merge base of the branch | more warnings than baseline = fail |
 | `spellbook` | #119 | `025df92` | **verified** — 8 fail: `cast stop`, `cast halt`, every punctuated trigger (`Cast, stop.`, `Cast - skip`, `Invoke... skip`, …); the denylist, overlay and op-table checks stay green on both sides |
 | `leak-scan` | #126 | `025df92` | **verified** — 4 hits (tracked unit ×2, two plans) |
-| `config-keys` | #120 | `025df92` | **verified** — B fails, 8 keys (2 need the speech-to-cli whitelist, 6 `show_*` were shell-only and left `_SYNC_FLAGS`); A, C pass |
+| `config-keys` | #120 #127 | `025df92` | **verified** — B fails: 8 keys against speech-to-cli before its #21 (`language`, `voice_commands` + 6 shell-only `show_*`), 6 after; D fails: the same 6 `show_*` (no Python reader); A, C pass |
 
 `leak-scan` (`tests/leak-scan.sh`, bash) is the odd one out: it scans this
 repo's **tracked tree**, not `GS_SVC_PATH`, so pointing the runner at an
@@ -90,7 +90,9 @@ it parses `state.py` from `SPEECH_ENGINE_PATH` (default `~/Projects/speech-to-cl
 because the whitelist it checks against lives there. It is static — no import of
 the service and no import of `state.py` (which would read the live config at
 module load) — and every extractor has a positive-control floor, so a regex
-that silently matches nothing is a `2`, not a pass.
+that silently matches nothing is a `2`, not a pass. Its D check (every
+`_SYNC_FLAGS` key has a Python reader outside the two whitelists) was PR #143's
+S2, folded in here so the contract lives in one suite; #143's S1 was B.
 
 "derived" means the SHA is the merge commit's first parent — the main tip
 immediately before the fix, correct by construction but not re-run. The method

@@ -1993,6 +1993,14 @@ class GnomeSpeaksService:
     # -- Config sync -------------------------------------------------------
 
     # Boolean flags that prefs.js can change on disk while the service runs.
+    #
+    # This is a SECOND config whitelist, and it must agree with the first:
+    # every key here must also be in speech-to-cli's state.load_config(), or it
+    # reaches CONFIG only through this side door -- which start_listening(
+    # quick=True) (a wake-word-first session) never opens (#127). And every key
+    # here must have a Python reader: extension.js-only keys were synced for
+    # nobody. tests/repros/config-keys/verify_config_key_contract.py asserts
+    # both (checks B and D; #120, #127).
     _SYNC_FLAGS = (
         # Speech provider (a STRING, applied verbatim -- the loop below does no
         # bool cast): "azure" | "local". Prefs flips it; a running service must
@@ -2022,9 +2030,7 @@ class GnomeSpeaksService:
         # Barge-in
         "enable_barge_in", "barge_in_frames", "barge_in_silence",
         # NOT the `show_*` visual toggles: only extension.js reads those (raw
-        # config.json via _getConfigFlag), the service never does, and every
-        # key here must be in speech-to-cli's load_config() whitelist --
-        # tests/repros/config-keys enforces that (#120).
+        # config.json via _getConfigFlag); the service never does (#120, #127).
         # Debug
         "debug",
     )
