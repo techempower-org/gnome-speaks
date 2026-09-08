@@ -104,6 +104,9 @@ from stt import (  # noqa: E402
     _check_end_word, _strip_end_word,
 )
 import speech_tts  # noqa: E402
+import inspect as _inspect  # noqa: E402
+# Older speech-to-cli has no stop_when on stt(); detect once, never guess.
+_STT_HAS_STOP_WHEN = "stop_when" in _inspect.signature(stt_dispatch).parameters
 
 if HAS_VAD:
     import webrtcvad  # noqa: E402
@@ -2377,7 +2380,14 @@ class GnomeSpeaksService:
                 GLib.idle_add(self._emit_transcription_ready, "")
                 self._idle_after_stt()
                 return
-            result = stt_dispatch(mode=mode)
+            # stop_when: the dictation hotkey / a loop-mode badge tap sets
+            # _stop_event, and the batch (VAD) recorder must FINISH on it --
+            # keep the words, return -- not run on until silence or 30 s. The
+            # cancel wire is deliberately not used here: that abandons (#110).
+            if _STT_HAS_STOP_WHEN:
+                result = stt_dispatch(mode=mode, stop_when=self._stop_event.is_set)
+            else:
+                result = stt_dispatch(mode=mode)
             self._deliver_stt_result(result, mode, cancel_token)
         except Exception as exc:
             log.exception("Batch STT (%s) failed: %s", mode, exc)
