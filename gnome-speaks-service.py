@@ -1746,6 +1746,7 @@ class TTSQueueItem:
     output_file: str | None = None  # save-to-disk instead of playback
     enqueued_at: float = 0.0
     source: str | None = None       # coalescing key: "only my latest matters"
+    drain_gen: int = 0              # _drain_gen when enqueued (see dispatcher)
 
 
 # Frames the kernel pipe between the recorder and this process can hold:
@@ -3426,6 +3427,7 @@ class GnomeSpeaksService:
             output_file=output_file,
             enqueued_at=time.time(),
             source=source,
+            drain_gen=self._drain_gen,
         )
         with self._enqueue_lock:
             dropped = (self._coalesce_source(source)
@@ -3559,7 +3561,6 @@ class GnomeSpeaksService:
             # in GET /queue and remain drainable by /stop during user speech.
             while self._queue_hold_reason() is not None:
                 time.sleep(0.2)
-            gen = self._drain_gen
             try:
                 item = self._tts_queue.get(timeout=0.2)
             except queue.Empty:
@@ -3575,9 +3576,14 @@ class GnomeSpeaksService:
             # an item arrives — by which time the mic may be open. Re-check
             # under the claim lock and hand the item back rather than talking
             # over an open mic (or over a /stop that crossed the dequeue).
+            # "Drained" is judged against the generation the ITEM was enqueued
+            # under, never against a snapshot this thread took before parking
+            # in get(): interrupt drains and then enqueues, and a snapshot from
+            # before the drain made the dispatcher drop the interrupting item
+            # itself as "drained" (measured 10/10 while idle, #132).
             with self._queue_current_lock:
                 hold = self._queue_hold_reason()
-                drained = self._drain_gen != gen
+                drained = self._drain_gen != item.drain_gen
                 if hold is None and not drained:
                     self._queue_current = item
                     self._queue_token = token
@@ -5234,17 +5240,48 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         # queued speech (Android hides this ability entirely; we expose it
         # but make it leave a trace).
         flushed = None
+        held = None
         if body.get("interrupt"):
             flushed = svc._drain_tts_queue()
-            svc.stop(drain_queue=False)
-            # The dispatcher clears _queue_current moments after the cancel;
-            # wait briefly so position/state in the response reflect the flush.
-            deadline = time.time() + 1.0
-            while time.time() < deadline:
-                with svc._queue_current_lock:
-                    if svc._queue_current is None:
-                        break
-                time.sleep(0.02)
+            # User outranks agents -- on THIS path too (#132). This used to
+            # call stop(drain_queue=False), and stop() runs cancel_all(): every
+            # live token, including a begun dictation (its transcript is then
+            # discarded and the state forced idle), or the user's own
+            # SpeakClipboard/Talk. Gating stop() on a snapshot of current_state
+            # was not enough either: a start_listening() landing between the
+            # read and cancel_all() still lost its stt-stream token (measured
+            # 21/300 at a 0-4 ms offset; 0/80 serialized). So this path never
+            # calls stop() at all. It cancels exactly one token -- the queue's
+            # CURRENT item, read together with the item under
+            # _queue_current_lock -- and the dispatcher only ever publishes
+            # tokens it issued itself (label "queue"), so an agent seam
+            # structurally cannot reach a user token, whatever the timing.
+            # The agent backlog is flushed above; the playing agent item is
+            # cut off here; the new item queues, and if the user is (or by
+            # then becomes) busy the dispatcher's hold speaks it afterwards.
+            cut = svc.skip_current()
+            if cut is not None:
+                log.info("Speech queue: interrupt cut off item %d", cut)
+                # The dispatcher clears _queue_current moments after the
+                # cancel; wait briefly so position/state in the response
+                # reflect the flush.
+                deadline = time.time() + 1.0
+                while time.time() < deadline:
+                    with svc._queue_current_lock:
+                        if svc._queue_current is None:
+                            break
+                    time.sleep(0.02)
+            # `held` is an ANNOTATION of the response, not a decision: it
+            # tells the caller why its item will not play right now. Nothing
+            # above depends on it, so a session that starts a microsecond
+            # after this read is simply held by the dispatcher unannounced.
+            if svc._user_speech_active.is_set():
+                held = "user speech"
+            elif svc.current_state in ("listening", "processing"):
+                held = svc.current_state
+            if held is not None:
+                log.info("Speech queue: interrupt held (%s) -- user session "
+                         "kept, %d queued item(s) flushed", held, flushed)
 
         try:
             item_id, position, dropped = svc.enqueue_speech(
@@ -5260,6 +5297,8 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
                 "position": position, "state": state_str}
         if flushed is not None:
             resp["flushed"] = flushed
+        if held is not None:
+            resp["held"] = held
         if coalesce:
             # Blast radius, same spirit as interrupt's `flushed` — but scoped
             # to the caller's own source, so it can never surprise a peer.

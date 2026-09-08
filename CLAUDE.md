@@ -230,6 +230,14 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 - **Public repo**: LAN hostnames/IPs, the HA domain, and the wake-word model name (it's the wake phrase) never enter git -- they live in `~/.config/speech-to-cli/config.json` and the user spellbook overlay. Scan patch history before pushing.
 - **systemctl scope trap**: this file prescribes `systemctl --user` for the voice service — but `systemctl --user is-active <system-unit>` answers `inactive` with **exit 0** for units that live in the system scope (e.g. litrpg-engine on this machine). A confidently wrong answer; check the scope before believing "inactive", and never build a health check or spell on the --user reading of a system unit.
 - **Speech-queue state ownership**: `_speak_token` fences playback cleanup -- a preempted worker must not reset state it no longer owns. Keep the token claims when adding new speech paths.
+- **An agent seam never calls `stop()`**: `stop()` is `cancel_all()` + `_stop_event.set()` + idle -- every live
+  token, the user's dictation included. `POST /speak {interrupt:true}` used to call it, then gated it on a
+  snapshot of `current_state`; a `start_listening()` landing between the read and `cancel_all()` still lost its
+  session (measured 43/126 in `tests/repros/cancel-tokens/repro_f_interrupt_race.py`). The interrupt path now
+  cancels exactly the queue's current item via `skip_current()` (item + token read together under
+  `_queue_current_lock`; the dispatcher only publishes tokens it issued), and `held` in the response is an
+  annotation, not a decision. Any new agent-facing "cut off speech" path must do the same -- reach for
+  `skip_current()`/`_drain_tts_queue()`, never `stop()`.
 - **St CSS: measure, don't reason.** Specificity arithmetic on paper produced two wrong (and confidently shipped) conclusions in one day (2026-08-18): pill text was believed white (it was state-tinted by later type selectors) and a "(0,2,1)" counter-rule was really (0,1,1) and inert in 4 of 5 states. The instrument that works: dump computed `St.ThemeNode` values (foreground color, margins) from a headless shell per state and diff before/after. Badge labels are addressed by NAME (`gnome-speaks-badge-label`, `gnome-speaks-pill-label`); never reintroduce `StLabel` type selectors -- pill text tints by INHERITANCE from its pill class.
 - **`--nested` is gone on GNOME 50**: the nested-shell test harness is now `dbus-run-session -- gnome-shell --headless --virtual-monitor 1280x720`. Any doc, script, or muscle memory reaching for `--nested` fails on 50+.
 - **`addTopChrome` and `affectsInputRegion`**: GNOME 49+ tracks input regions from reactive actors automatically and **rejects** the param. It defaulted to `true` on 46-48, so omitting it is behavior-identical everywhere -- never re-add it.
