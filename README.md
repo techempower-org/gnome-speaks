@@ -197,7 +197,8 @@ cd gnome-speaks
 The installer will:
 1. Copy extension files to `~/.local/share/gnome-shell/extensions/gnome-speaks@jphein/`
 2. Compile GSettings schemas
-3. Install and start the systemd user service
+3. Install and start the systemd user service — and **warn** about any drop-in
+   (`~/.config/systemd/user/gnome-speaks.service.d/*.conf`) that silently overrides it
 4. Register the D-Bus service for auto-activation (plus the inert [Spiel provider](#spiel-provider) name)
 5. Install missing Python dependencies
 6. Enable the extension
@@ -424,6 +425,30 @@ journalctl --user -u gnome-speaks -f
 
 # Restart after config changes
 systemctl --user restart gnome-speaks
+```
+
+### Troubleshooting
+
+**Stuck offline, ignoring your Azure key, or a setting that will not stick? Check for a
+systemd drop-in.** systemd merges every `~/.config/systemd/user/gnome-speaks.service.d/*.conf`
+into the unit on every start, silently, and the file survives `./install.sh`,
+`./install.sh --uninstall` and `git pull`. A leftover `offline.conf` carrying
+`Environment=SPEECH_FORCE_OFFLINE=1` forced the service offline — with **no** Azure fallback,
+because that variable is a test override, not a setting — for weeks before anyone looked
+(#103). `./install.sh` now lists every such drop-in and its `Environment=` lines with a
+`[WARN]`, and `./install.sh --check-dropins` runs only that check (exit 1 if any exist).
+
+```bash
+# What systemd actually runs: the unit, then every drop-in merged into it
+systemctl --user cat gnome-speaks
+
+# Which speech route the service took at start. "forced offline: SPEECH_FORCE_OFFLINE
+# is set, no Azure fallback" means the environment did this, not the network.
+journalctl --user -u gnome-speaks -b | grep 'Speech route at start'
+
+# Remove an unwanted drop-in and re-read the unit
+rm ~/.config/systemd/user/gnome-speaks.service.d/offline.conf
+systemctl --user daemon-reload && systemctl --user restart gnome-speaks
 ```
 
 ## HTTP API

@@ -30,6 +30,69 @@ warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERR]${NC}   $*"; }
 step()    { echo -e "${CYAN}${BOLD}==>${NC} ${BOLD}$*${NC}"; }
 
+usage() {
+    cat <<USAGE
+Usage: $0 [--uninstall|-u] [--check-dropins] [--help|-h]
+
+  (no flag)        install the extension, the systemd user service, D-Bus
+                   activation files and Python deps
+  -u, --uninstall  remove all of the above (drop-ins are listed, not deleted)
+  --check-dropins  only list systemd drop-ins that override $SYSTEMD_SERVICE
+                   and print their Environment= lines; exit 1 if any exist
+  -h, --help       this text
+
+A drop-in is any *.conf under $SYSTEMD_USER_DIR/$SYSTEMD_SERVICE.d/ (or the
+/etc and ~/.local/share equivalents). systemd merges it into the unit on every
+start and it survives install, uninstall and git pull -- a forgotten
+offline.conf carrying Environment=SPEECH_FORCE_OFFLINE=1 forced the service
+offline, with NO Azure fallback, for weeks (#103, #115). The service logs the
+route it took at start: journalctl --user -u $SYSTEMD_SERVICE -b | grep 'Speech route'
+USAGE
+}
+
+# ---- Drop-in audit -------------------------------------------
+# systemd's user lookup path for <unit>.d/*.conf, the dirs a human plausibly
+# writes (systemd.unit(5)). Every *.conf is merged into the unit; anything not
+# ending in .conf (offline.conf.disabled, a .bak) is ignored by systemd and so
+# by this check -- the two must agree, or the WARN lies in one direction.
+dropin_dirs() {
+    echo "$SYSTEMD_USER_DIR/$SYSTEMD_SERVICE.d"
+    echo "$HOME/.local/share/systemd/user/$SYSTEMD_SERVICE.d"
+    echo "/etc/systemd/user/$SYSTEMD_SERVICE.d"
+}
+
+# Lists every drop-in and its Environment= lines with a WARN.
+# Returns 0 when there are none, 1 when at least one exists. Never exits.
+check_dropins() {
+    local found=0 d f envs
+    while IFS= read -r d; do
+        [[ -d "$d" ]] || continue
+        for f in "$d"/*.conf; do
+            [[ -f "$f" ]] || continue
+            found=1
+            warn "Drop-in overrides $SYSTEMD_SERVICE: $f"
+            # `|| true`: grep exits 1 on zero matches, and under -e/pipefail
+            # a drop-in with no Environment= line would abort the installer.
+            mapfile -t envs < <(grep -nE '^[[:space:]]*Environment=' "$f" || true)
+            if [[ ${#envs[@]} -eq 0 ]]; then
+                warn "    (no Environment= lines; see the file for what it overrides)"
+            else
+                local e
+                for e in "${envs[@]}"; do warn "    $e"; done
+            fi
+        done
+    done < <(dropin_dirs)
+    if [[ $found -eq 1 ]]; then
+        warn "Drop-ins are merged into the unit on EVERY start and survive install,"
+        warn "uninstall and git pull. Environment=SPEECH_FORCE_OFFLINE=1 there forces"
+        warn "offline with NO Azure fallback (#103). If that is not what you want:"
+        warn "    rm <file> && systemctl --user daemon-reload && systemctl --user restart $SYSTEMD_SERVICE"
+        warn "Inspect the merged unit with: systemctl --user cat $SYSTEMD_SERVICE"
+        return 1
+    fi
+    return 0
+}
+
 # ============================================================
 # UNINSTALL
 # ============================================================
@@ -57,6 +120,10 @@ do_uninstall() {
     else
         warn "Systemd service file not found — nothing to remove."
     fi
+
+    # Drop-ins are user-authored, so they are listed and left in place; they
+    # will apply again to the next install (#115).
+    check_dropins || warn "Drop-ins above were NOT removed."
 
     # Reload systemd daemon
     info "Reloading systemd user daemon..."
@@ -101,9 +168,18 @@ do_uninstall() {
 # ============================================================
 # Parse flags
 # ============================================================
-if [[ "${1:-}" == "--uninstall" || "${1:-}" == "-u" ]]; then
-    do_uninstall
-fi
+case "${1:-}" in
+    --uninstall|-u) do_uninstall ;;
+    --check-dropins)
+        if check_dropins; then
+            success "No systemd drop-in overrides $SYSTEMD_SERVICE."
+            exit 0
+        fi
+        exit 1 ;;
+    --help|-h) usage; exit 0 ;;
+    "") ;;
+    *) error "Unknown option: $1"; echo; usage; exit 2 ;;
+esac
 
 # ============================================================
 # INSTALL
@@ -184,6 +260,10 @@ else
     error "Cannot install systemd service."
     exit 1
 fi
+
+# Drop-ins override what was just written and this is the only moment a
+# reader is looking at the unit (#115). `|| true`: a WARN, not a failure.
+check_dropins && success "No systemd drop-in overrides the unit." || true
 
 # Reload systemd daemon to pick up the new service
 info "Reloading systemd user daemon..."

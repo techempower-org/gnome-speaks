@@ -153,6 +153,13 @@ run deprecations   repro_114_startup_deprecations.py
 out=$(timeout 60 "$REPO/tests/leak-scan.sh" 2>&1); st=$?
 line leak-scan "leak-scan.sh (tracked tree)" "$st" "$out"
 
+# install-dropins (#115) is bash too and tests install.sh, not the service:
+# `--check-dropins` against a SCRATCH $HOME under tmp/repros/ -- planted
+# offline.conf must WARN (positive control first), .conf.disabled and an
+# empty home must not. Nothing is installed and no systemctl call is made.
+out=$(timeout 60 "$HERE/install-dropins/verify_dropin_warning.sh" 2>&1); st=$?
+line install-dropins "verify_dropin_warning.sh" "$st" "$out"
+
 # ---------------------------------------------------------------------------
 # offline-handoff: ONE PROCESS PER CASE, on purpose.
 #
