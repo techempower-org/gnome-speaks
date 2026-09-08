@@ -611,6 +611,22 @@ because their endpoints are site-specific:
 | "cast consult the oracle \<question\>" | ask the realm Oracle; streamed reply |
 | "cast torches \<request\>" | natural-language pass-through to Home Assistant Assist |
 
+**Home Assistant token** — `assist` spells need a long-lived access token. The
+service looks in order at the `HA_TOKEN` environment variable, a token cache
+file, and a Bitwarden/Vaultwarden item (`bw get password <item>`). The file and
+the item are configuration, not code, and both default to *unset* so a stock
+install never shells out to `bw`:
+
+```json
+{
+  "ha_token_cache": "~/.cache/gnome-speaks/ha-token",
+  "ha_token_item": "my-home-assistant-token"
+}
+```
+
+Set them in `~/.config/speech-to-cli/config.json` or in the preferences window
+(**Wake & Spells → Home Assistant**); changes apply at the next cast.
+
 ### Wake word
 
 With a [Wyoming openwakeword](https://github.com/rhasspy/wyoming-openwakeword)

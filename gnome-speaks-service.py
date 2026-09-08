@@ -1594,25 +1594,40 @@ _SERVICE_START_ISO = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
 def _get_ha_token():
-    """Home Assistant long-lived token: env → cache file → Vaultwarden.
-    Returns None when unavailable. The value is never logged."""
+    """Home Assistant long-lived token for the spellbook's `assist` action.
+
+    Resolution order: the ``HA_TOKEN`` environment variable, then a cache
+    file, then a Vaultwarden/Bitwarden item via ``bw get password <item>``.
+    The last two are DATA, not code (#129): ``CONFIG["ha_token_cache"]`` names
+    the file and ``CONFIG["ha_token_item"]`` names the vault item, and both
+    default to "" -- so a stock install never opens a personal path or shells
+    out to a ``bw`` it does not have (that was a 10 s timeout on every
+    "assist" cast before SpellUnreachable). Both keys are in ``_SYNC_FLAGS``,
+    so a prefs edit applies at the next cast without a restart.
+
+    Returns None when unavailable. The value is never logged.
+    """
     token = os.environ.get("HA_TOKEN", "").strip()
     if token:
         return token
-    try:
-        with open(os.path.expanduser("~/.cache/ha-token-tmp")) as f:
-            token = f.read().strip()
-        if token:
-            return token
-    except OSError:
-        pass
-    try:
-        proc = subprocess.run(["bw", "get", "password", "ha-llat"],
-                              capture_output=True, text=True, timeout=10)
-        if proc.returncode == 0 and proc.stdout.strip():
-            return proc.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    cache = str(CONFIG.get("ha_token_cache") or "").strip()
+    if cache:
+        try:
+            with open(os.path.expanduser(cache)) as f:
+                token = f.read().strip()
+            if token:
+                return token
+        except OSError:
+            pass
+    item = str(CONFIG.get("ha_token_item") or "").strip()
+    if item:
+        try:
+            proc = subprocess.run(["bw", "get", "password", item],
+                                  capture_output=True, text=True, timeout=10)
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     return None
 
 
@@ -2150,6 +2165,10 @@ class GnomeSpeaksService:
         # user cannot type.
         "injection_method",
         "speed", "pitch", "volume", "chronicle", "wake_word_secure_gate",
+        # Home Assistant token source for the spellbook's `assist` action
+        # (#129): two STRINGS, applied verbatim, read at cast time by
+        # _get_ha_token().
+        "ha_token_item", "ha_token_cache",
         # LLM provider config
         "llm_provider", "llm_model", "llm_api_key", "llm_system_prompt",
         # Chimes

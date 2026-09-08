@@ -98,6 +98,8 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 | `version-cache` | #53 / #85 | two-sided, below | `577a05f` passes, `7eaeb02` fails |
 | `prefs-rig` | #82 | merge base of the branch | more warnings than baseline = fail |
 | `spellbook` | #119, #152 | `025df92` / `a20afea` | **verified** — 8 fail on `025df92`: `cast stop`, `cast halt`, every punctuated trigger (`Cast, stop.`, `Cast - skip`, `Invoke... skip`, …); the denylist, overlay and op-table checks stay green on both sides. The #152 seam checks (`USER_SPELLBOOK_PATH` honours `GS_SPELLBOOK_USER_PATH`; the service reads the seam, not a literal) are red on `a20afea` |
+| `spellbook` | #119 | `025df92` | **verified** — 8 fail: `cast stop`, `cast halt`, every punctuated trigger (`Cast, stop.`, `Cast - skip`, `Invoke... skip`, …); the denylist, overlay and op-table checks stay green on both sides |
+| `spellbook/verify_ha_token` | #129 | `a20afea` | **verified** — 7 of 8 fail (H1 default returns a token / calls `bw`, H3–H6 the config keys are ignored, H7 not synced, H8 personal literals present); H2 (env wins) green on both sides. Token values are never printed: on the maintainer's machine the baseline's personal cache file exists and the default path returns a REAL token |
 | `leak-scan` | #126 | `025df92` | **verified** — 4 hits (tracked unit ×2, two plans) |
 | `shell-rig` | #113 | `3c70314` | **verified** — t0 fails 8 checks: state `idle`, no service row; every later step green on both sides |
 | `config-keys` | #120 #127 | `025df92` | **verified** — B fails: 8 keys against speech-to-cli before its #21 (`language`, `voice_commands` + 6 shell-only `show_*`), 6 after; D fails: the same 6 `show_*` (no Python reader); A, C pass |
