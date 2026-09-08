@@ -197,12 +197,60 @@ def main():
     real = load_real_speech_tts(mod)
     wy.mark_azure_up(); wy.mark_local_up()
     azure_player = []
-    real._tts_wyoming = lambda text, proc, **kw: {"spoken": True, "engine": "wyoming"}
-    real._take_prewarmed_player = lambda rate: azure_player.append("prewarm") or None
-    real._start_player = lambda rate: azure_player.append("start") or None
+
+    class _Stdin:
+        def __init__(self):
+            self.closed = False
+
+        def write(self, b):
+            return len(b)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    class _WyomingPlayer:
+        """A player at the SERVER's rate: what the local route legitimately
+        starts. Only an Azure-rate (24 kHz) player is the wrong route."""
+        def __init__(self):
+            self.stdin = _Stdin()
+
+        def poll(self):
+            return 0 if self.stdin.closed else None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    def _player(rate, target=None):
+        if rate == 24000:
+            azure_player.append(rate)
+            return None
+        return _WyomingPlayer()
+
+    # Pre-seam speech-to-cli: tts() reaches Wyoming through _tts_wyoming.
+    real._tts_wyoming = lambda text, proc, **kw: {"ok": True, "engine": "wyoming"}
+    # speech-to-cli#25 seam: tts() is tts_play(tts_prepare()) and the local
+    # side is opened by _open_wyoming, so stub THAT too -- with only the old
+    # stub in place the real connect is attempted, refused, trips the local
+    # breaker and the repro falls through to the REAL Azure URL (measured:
+    # a 401 from westus2 in the log, and K12 red as collateral).
+    def _fake_stream():
+        # A generator, like wyoming.synthesize_stream: _play_wyoming close()s it.
+        yield b"\x00" * 64
+
+    if hasattr(real, "_open_wyoming"):
+        real._open_wyoming = lambda text, voice=None: (_fake_stream(), (22050, 2, 1))
+    real._take_prewarmed_player = lambda rate: None
+    real._start_player = _player
     try:
         result = real.tts("K11 keyless")
-        k11 = result.get("spoken") is True and result.get("engine") == "wyoming" and not azure_player
+        k11 = (result.get("engine") == "wyoming" and "error" not in result
+               and not azure_player)
         detail = f"result={result} azure_player={azure_player}"
     except Exception as exc:  # a KeyError on CONFIG["key"] would land here
         k11, detail = False, f"raised {exc!r}"
