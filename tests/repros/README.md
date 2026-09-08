@@ -104,10 +104,15 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 | `shell-rig` | #113 | `3c70314` | **verified** — t0 fails 8 checks: state `idle`, no service row; every later step green on both sides |
 | `config-keys` | #120 #127 | `025df92` | **verified** — B fails: 8 keys against speech-to-cli before its #21 (`language`, `voice_commands` + 6 shell-only `show_*`), 6 after; D fails: the same 6 `show_*` (no Python reader); A, C pass |
 | `deprecations` | #114 | `a20afea` | **verified** — 3 deprecation lines at service start (`GLib.unix_signal_add` ×2, `Gio.DBusConnection.register_object` ×1 — PyGObject warns once per deprecated GI function per process, so two register sites make one line); `GetState` and the Spiel `Name` property answer on both sides. Runs the real `main()` on a private `dbus-run-session` bus the suite re-execs itself under; `register_object` also leaked ~1.5 kB per D-Bus method call (measured; flat through `register_object_with_closures2`) |
+| `install-dropins` | #115 / #103 | `a20afea` | **not re-run, by design** — that `install.sh` ignores unknown flags and would perform a full install (and restart the live service) when handed `--check-dropins`; the suite refuses any installer without the flag (SETUP FAILURE 2, verified against `a20afea`), so discrimination is by construction |
 
-`leak-scan` (`tests/leak-scan.sh`, bash) is the odd one out: it scans this
-repo's **tracked tree**, not `GS_SVC_PATH`, so pointing the runner at an
-extracted SHA does not re-scan that SHA — run the script from a checkout of it.
+Two suites are bash and ignore `GS_SVC_PATH`, so pointing the runner at an
+extracted SHA does not re-test that SHA — run them from a checkout of it:
+`leak-scan` (`tests/leak-scan.sh`) scans this repo's **tracked tree**, and
+`install-dropins` (`tests/repros/install-dropins/verify_dropin_warning.sh`)
+drives this repo's `install.sh --check-dropins` against a scratch `$HOME` under
+`tmp/repros/` — the developer's real `~/.config` is never read, and only the
+check flag is invoked, so nothing is installed and no `systemctl` runs.
 
 `config-keys` is the one suite whose verdict also depends on a **sibling repo**:
 it parses `state.py` from `SPEECH_ENGINE_PATH` (default `~/Projects/speech-to-cli`),
