@@ -17,11 +17,29 @@ set -u
 set -o pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
-PAT='familiar|donk|10\.0\.6\.|jphe\.in|/home/jp'
+# The pattern itself is a leak: it names the very hostnames, domain and wake
+# phrase the scan exists to keep out of this public tree (it shipped once, in
+# #142, and had to be scrubbed forward). So it lives OUTSIDE the repo -- first
+# of: $GS_LEAK_PATTERNS (an ERE), or the file $GS_LEAK_PATTERN_FILE, or
+# ~/.config/speech-to-cli/leak-patterns (one ERE, first non-comment line).
+# No source => SETUP FAILURE (exit 2), never a silent green.
+_pat_file="${GS_LEAK_PATTERN_FILE:-$HOME/.config/speech-to-cli/leak-patterns}"
+if [ -n "${GS_LEAK_PATTERNS:-}" ]; then
+    PAT="$GS_LEAK_PATTERNS"
+elif [ -r "$_pat_file" ]; then
+    PAT="$(grep -vE '^\s*(#|$)' "$_pat_file" | head -1)"
+else
+    echo "!! SETUP FAILURE: no leak pattern source (set GS_LEAK_PATTERNS or create $_pat_file)"
+    exit 2
+fi
+[ -n "$PAT" ] || { echo "!! SETUP FAILURE: empty leak pattern in $_pat_file"; exit 2; }
+# The control token is the LAST alternative of the pattern, planted verbatim,
+# so the control proves the instrument reads THIS pattern (not a hard-coded one).
+_ctrl="${PAT##*|}"
 SELF="tests/leak-scan.sh"
 
 # Positive control BEFORE trusting a zero: prove the instrument can see.
-if ! printf '%s\n' 'planted /home/jp planted' | grep -qE "$PAT"; then
+if ! printf 'planted %s planted\n' "$_ctrl" | grep -qE "$PAT"; then
     echo "!! SETUP FAILURE: leak pattern does not match its own control"
     exit 2
 fi
