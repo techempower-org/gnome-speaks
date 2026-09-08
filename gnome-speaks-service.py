@@ -2409,6 +2409,22 @@ class GnomeSpeaksService:
             _schedule_warmup()
             return
 
+        # stt_vad()/stt_fixed() report a TOTAL failure -- Azure unreachable and
+        # the Wyoming fallback failed too, or the recorder died -- as
+        # {"error": ...} with no "text" key at all. Reading only "text" turned
+        # that into "No speech detected" and a silent idle (#130); with
+        # speech_backend=local every streaming dictation is routed here, so
+        # this is the primary offline path, not a corner. Toast it like the
+        # worker's own exception path does.
+        error = result.get("error")
+        if error:
+            log.error("Batch STT (%s) failed: %s", mode, error)
+            GLib.idle_add(self._emit_error, f"STT failed: {error}")
+            GLib.idle_add(self._emit_transcription_ready, "")
+            self._idle_after_stt()
+            _schedule_warmup()
+            return
+
         user_text = result.get("text", "")
 
         self._set_state("processing")

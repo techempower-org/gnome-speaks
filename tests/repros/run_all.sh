@@ -111,7 +111,8 @@ run() {   # run <suite> <script>...
 }
 
 run service-audit  repro_c1_dispatch_gate.py repro_c2_hold.py repro_c3_config.py \
-                   repro_c4_timer.py repro_c5_ydotoold_unit.py repro_c6_speech_backend.py repro_c7_loop_tap_stops_vad.py smoke_queue_ops.py verify_queue_invariants.py
+                   repro_c4_timer.py repro_c5_ydotoold_unit.py repro_c6_speech_backend.py repro_c7_loop_tap_stops_vad.py \
+                   repro_c8_batch_error_toast.py smoke_queue_ops.py verify_queue_invariants.py
 run chronicle-perf repro_chronicle_stall.py verify_archive.py \
                    verify_chronicle_contract.py verify_endpoints.py
 run cancel-tokens  repro_a_outcome_mislabel.py repro_b_transcript_after_stop.py \
