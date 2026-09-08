@@ -7,6 +7,10 @@
 #
 # Exits non-zero if any suite fails. One line per check.
 #
+# Suites are DISCOVERED from tests/repros/<suite>/suite.list (#169) -- adding a
+# suite never edits this file. See the DISCOVERY block below and
+# tests/repros/README.md, "Adding a suite".
+#
 # NO TEST FRAMEWORK, by project rule: these are plain scripts that exit 0 (clean),
 # 1 (the defect is present) or 2 (SETUP FAILURE -- the repro could not create the
 # window it needed, so it is reporting neither a pass nor a bug).
@@ -102,97 +106,56 @@ line() {
         "$(summarise "$4" "$1/$2" "$3" | cut -c1-80)"
 }
 
-run() {   # run <suite> <script>...
-    suite="$1"; shift
-    for f in "$@"; do
-        out=$(cd "$HERE/$suite" && timeout 300 python3 "$f" 2>/dev/null); st=$?
-        line "$suite" "$f" "$st" "$out"
-    done
-}
-
-run service-audit  repro_c1_dispatch_gate.py repro_c2_hold.py repro_c3_config.py \
-                   repro_c4_timer.py repro_c5_ydotoold_unit.py repro_c6_speech_backend.py repro_c7_loop_tap_stops_vad.py \
-                   repro_c8_batch_error_toast.py repro_c8_config_watch.py repro_c8_keyless_local.py \
-                   repro_c9_loop_error_cap.py repro_c10_batch_loop_silence.py repro_c11_loop_gap_busy.py \
-                   smoke_queue_ops.py verify_queue_invariants.py
-run chronicle-perf repro_chronicle_stall.py repro_audio_info_stall.py verify_archive.py \
-                   verify_chronicle_contract.py verify_endpoints.py verify_http_envelope.py
-run cancel-tokens  repro_a_outcome_mislabel.py repro_b_transcript_after_stop.py \
-                   repro_c_streaming_after_stop.py repro_d_mic_disconnect.py \
-                   repro_e_interrupt_vs_dictation.py repro_f_interrupt_race.py \
-                   repro_g_gate_vs_listen.py verify_cancel_invariants.py
-run subtitle-token repro_e1_stale_complete_frame.py repro_e2_foreign_cancel_freeze.py \
-                   repro_e3_streaming_reply_subtitle.py repro_e4_compound_cycle_then_reply.py
-run begin-refused  repro_j_first_sentence.py repro_k_remainder.py repro_l_healthy_reply.py
-run tts-prefetch   repro_p1_one_ahead.py repro_p2_stop_after_first.py \
-                   repro_p3_claim_window_prefetched.py repro_p4_skip_cannot_reach_reply.py
-# sentence-split (#154): what TEXT the AI reply spoke. Real worker, the fake
-# records the full text handed to synthesis and the GLib spy the subtitle
-# frames; every row asserts speech == reply joined by single spaces.
-run sentence-split repro_s1_token_fusion.py repro_s2_edge_table.py
-run dead-recorder  repro_e_single_shot_turn_end.py repro_f_text_survives_yank.py \
-                   repro_g_ws_init_unbound.py repro_h_stale_prewarm.py \
-                   repro_i_healthy_loop.py
-run pin-lifecycle  repro_pin_lifecycle.py repro_compound_pin_x_deadmic.py \
-                   repro_compound_reply_pin.py
-run injector-seam  verify_injector_seam.py verify_ibus_injector.py repro_fallback_retry.py repro_fake_context_fallback.py \
-                   repro_derive_cache.py
-run version-cache  verify_version_cache.py repro_a_fork_storm.py
-run spellbook      verify_spellbook.py verify_ha_token.py
-# Static: prefs.js keys vs speech-to-cli's load_config() whitelist vs
-# _SYNC_FLAGS vs service CONFIG reads. Reads state.py from SPEECH_ENGINE_PATH
-# (~/Projects/speech-to-cli), so a sibling-repo whitelist gap is red HERE.
-run config-keys    verify_config_key_contract.py
-# deprecations (#114): runs the REAL main() on a private dbus-run-session bus
-# (the suite re-execs itself under one), so it needs no live service to be
-# absent and touches nothing on the desktop. Owns org.gnome.Speaks there,
-# round-trips GetState and the Spiel Name property, then SIGTERMs itself
-# through the signal source under test.
-run deprecations   repro_114_startup_deprecations.py
-
-# leak-scan is bash and scans the TRACKED TREE of this repo, not GS_SVC_PATH:
-# the repo is public and the maintainer's home path, LAN names and the HA
-# domain must never be committed (#126). It is excluded from its own scan and
-# proves the pattern matches a planted string before it believes a zero.
-out=$(timeout 60 "$REPO/tests/leak-scan.sh" 2>&1); st=$?
-line leak-scan "leak-scan.sh (tracked tree)" "$st" "$out"
-
-# install-dropins (#115) is bash too and tests install.sh, not the service:
-# `--check-dropins` against a SCRATCH $HOME under tmp/repros/ -- planted
-# offline.conf must WARN (positive control first), .conf.disabled and an
-# empty home must not. Nothing is installed and no systemctl call is made.
-out=$(timeout 60 "$HERE/install-dropins/verify_dropin_warning.sh" 2>&1); st=$?
-line install-dropins "verify_dropin_warning.sh" "$st" "$out"
-
 # ---------------------------------------------------------------------------
-# offline-handoff: ONE PROCESS PER CASE, on purpose.
+# DISCOVERY (#169). Suites are collected from tests/repros/<suite>/suite.list,
+# in LC_ALL=C order of the directory name, so lanes adding suites touch DISJOINT
+# files -- the hand-maintained `run <suite> ...` list here conflicted on every
+# concurrent PR. No order file: every suite is its own process with per-PID
+# scratch and none depends on another (verified 2026-09-08 by diffing the
+# per-check verdict lines of the hand-ordered runner against this one).
 #
-# (1) A red must name its scenario. This suite caught
-#     `[FAIL] D azure-healthy-unchanged` on a trial merge while every other
-#     suite was green, because nothing else exercises the ordinary
-#     healthy-Azure dictation path; a single rc=1 line would not have said so.
-# (2) Case ordering is load bearing. Case H replaces stt.wyoming.transcribe and
-#     never restores it, and is safe only because build() re-stubs it on every
-#     call; case G restores _rest_stt_fallback explicitly because build() does
-#     NOT re-stub that one. A process per case makes this irrelevant instead of
-#     merely currently-true.
+# suite.list: one CHECK per line, in run order. Blank lines and `#` comments
+# are skipped. Two shapes:
+#     repro_x.py                     label = the script; python3 repro_x.py
+#     case A: repro_x.py A           label "case A"; python3 repro_x.py A
+# i.e. an optional `label: ` prefix (first ": "), then the command, which is
+# split on whitespace (no quoting). The first token is resolved relative to the
+# suite directory and the check runs WITH THAT DIRECTORY AS CWD. A `*.py` token
+# runs under python3 with stderr discarded and a 300 s timeout (the shape the
+# python suites always had); anything else is executed directly with stderr
+# merged and a 60 s timeout (the shape leak-scan and install-dropins had).
+#
+# ONE PROCESS PER CASE (offline-handoff, wake-watcher) is expressed as one line
+# per case -- the reasons are in each suite.list, next to the lines they govern.
+#
+# The manifest/README check runs FIRST: gen_readme.sh --check fails when a
+# suite directory has no suite.list (the runner would silently skip it -- a
+# gate green on a test that never ran), no BASELINE.md, or when the generated
+# table in README.md is stale. Its fix is always "run tests/repros/gen_readme.sh".
 # ---------------------------------------------------------------------------
-for c in A B C D E F G H I; do
-    out=$(cd "$HERE/offline-handoff" && timeout 300 python3 repro_offline_handoff.py "$c" 2>/dev/null)
-    st=$?
-    line offline-handoff "case $c" "$st" "$out"
-done
+out=$(timeout 60 "$HERE/gen_readme.sh" --check 2>&1); st=$?
+line manifests "gen_readme.sh --check" "$st" "$out"
 
-# wake-watcher (#121): same shape, same reason. The watcher is a daemon thread
-# the SERVICE CONSTRUCTOR starts, so one process per case guarantees exactly one
-# watcher per verdict and no case inherits a thread the previous one armed.
-# B discriminates the pre-#41 baseline (11c8f60); G and H discriminate the
-# pre-#137 baseline (a20afea), and B, C, F go red there too (they assert the
-# start-up ramp). A, D, E are guards.
-for c in A B C D E F G H; do
-    out=$(cd "$HERE/wake-watcher" && timeout 300 python3 repro_wake_watcher.py "$c" 2>/dev/null)
-    st=$?
-    line wake-watcher "case $c" "$st" "$out"
+for list in $(cd "$HERE" && ls -d -- */suite.list 2>/dev/null | LC_ALL=C sort); do
+    suite="${list%/suite.list}"
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        # strip comments and surrounding whitespace
+        raw="${raw%%#*}"
+        raw="$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [ -n "$raw" ] || continue
+        case "$raw" in
+            *": "*) label="${raw%%: *}"; cmd="${raw#*: }" ;;
+            *)      label="$raw";        cmd="$raw" ;;
+        esac
+        # shellcheck disable=SC2086  -- word splitting is the contract
+        set -- $cmd
+        first="$1"; shift
+        case "$first" in
+            *.py) out=$(cd "$HERE/$suite" && timeout 300 python3 "$first" "$@" 2>/dev/null); st=$? ;;
+            *)    out=$(cd "$HERE/$suite" && timeout 60 "$HERE/$suite/$first" "$@" 2>&1); st=$? ;;
+        esac
+        line "$suite" "$label" "$st" "$out"
+    done < "$HERE/$list"
 done
 
 # ---------------------------------------------------------------------------

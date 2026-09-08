@@ -1,0 +1,5 @@
+# sentence-split (#154): what TEXT the AI reply spoke. Real worker, the fake
+# records the full text handed to synthesis and the GLib spy the subtitle
+# frames; every row asserts speech == reply joined by single spaces.
+repro_s1_token_fusion.py
+repro_s2_edge_table.py

@@ -65,6 +65,47 @@ Two rules the suites enforce on themselves, both learned the hard way on
   book in `__init__`. A service whose `spellbook.py` has no seam is refused
   (setup failure), the same way an unset `CHRONICLE_PATH` is.
 
+## Adding a suite (three files, none of them shared)
+
+Every suite is a directory under `tests/repros/` that owns its own manifest,
+so two lanes adding suites in the same night touch **disjoint** files (#169 —
+before this, every PR appended a row to the table below and a `run` line to
+`run_all.sh` at the same spot, and three consecutive PRs conflicted there):
+
+1. `tests/repros/<suite>/suite.list` — one **check** per line, in run order.
+   `run_all.sh` discovers every `*/suite.list` (LC_ALL=C order of the directory
+   name) and runs each line with the suite directory as cwd. Two shapes:
+
+   ```
+   repro_x.py              # label = the script;  python3 repro_x.py
+   case A: repro_x.py A    # label "case A";       python3 repro_x.py A
+   ```
+
+   An optional `label: ` prefix (split at the first `: `), then the command,
+   split on whitespace (no quoting). A `*.py` first token runs under `python3`
+   with stderr discarded and a 300 s timeout; anything else is executed
+   directly (resolved relative to the suite dir — `../../leak-scan.sh` is how
+   `leak-scan/` reaches the repo-level script) with stderr merged and a 60 s
+   timeout. Blank lines and `#` comments are skipped — put the *why* next to
+   the lines it governs (see `offline-handoff/suite.list` for one-process-per-
+   case). No order file exists: no suite depends on another, and the runner is
+   serial anyway.
+2. `tests/repros/<suite>/BASELINE.md` — the suite's row(s) for the table below:
+   pinned SHA, what fails there, verified or derived. Any line starting with
+   `| ` (except the `| suite |` header) is collected verbatim.
+3. Run `tests/repros/gen_readme.sh`. It rewrites the marked block below from
+   every `BASELINE.md` and is the **only** writer of that block. `run_all.sh`
+   runs `gen_readme.sh --check` as its first check (`manifests`), which goes
+   red when the block is stale, when a suite directory has no `suite.list`
+   (the runner would silently skip it — a gate green on a test that never ran)
+   or no `BASELINE.md`. **On a rebase conflict inside the block, re-run the
+   generator; never resolve the hunk by hand.**
+
+Two directories are wired by hand and have no `suite.list`, on purpose:
+`prefs-rig` (its own invocation shape — merge-base baseline, `gjs` probe, SKIP
+lines — stays in `run_all.sh`) and `shell-rig` (a headless gnome-shell, not
+collected at all). `gen_readme.sh` knows both by name (`HAND_WIRED`).
+
 ## Baselines are pinned SHAs, never branch names
 
 A suite that diffs against a moving ref goes vacuous the moment its fix merges:
@@ -77,38 +118,43 @@ git archive <baseline-sha> | tar -x -C /tmp/base   # disposable
 tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 ```
 
+The table is **generated** from `tests/repros/*/BASELINE.md` by
+`tests/repros/gen_readme.sh` — edit the suite's file, then re-run it.
+
+<!-- BEGIN GENERATED: baselines -- written by tests/repros/gen_readme.sh from tests/repros/*/BASELINE.md; edit those, then re-run it. Never edit this block by hand. -->
 | suite | issue / PR | baseline | expected there |
 |---|---|---|---|
-| `service-audit` | #18–#20, #110, #124 (c8 config-watch), #130 | `7899ccb` | derived (`merge^1`), not re-run; c8 batch-error-toast verified against `025df92` (E1 fails) |
-| `service-audit/repro_c9_loop_error_cap` | #117 | `a20afea` | **verified** — S1 fails (streaming: 98 cycles in 4 s, zero Errors — the silent forever-loop), B1/B2/B3 fail (batch: 1 cycle, toast on the first error, no route words — the issue's "re-enters forever" premise is *false* for batch on the baseline; it stopped, but after one hiccup). Controls B5, S2 green on both sides. B4 was re-pointed by #166 (batch silence must keep the loop ALIVE, the twin of S2) and is red on `a20afea` and `5dde4b4` for that reason |
-| `service-audit/repro_c10_batch_loop_silence` | #166 | `5dde4b4` | **verified** — 7 of 8 fail: L1 (batch loop, silence ×3 then text: 1 cycle, nothing typed, idle — the loop ended at the first quiet cycle; fixed: 35 cycles in 1.5 s, text typed, still listening), L2/L3 (tap and panic stop never got a 2nd/3rd cycle to act in), L4a/L4b (silence-then-errors: no cap toast because the silence had already ended the run), L5a/L5b (`NoAudio` read as silence — silent idle, no toast). L6 (loop OFF, one silent cycle) is the control and stays green on both sides |
-| `service-audit/repro_c11_loop_gap_busy` | #173 | `683b0be` | **verified** — 3 of 5 fail: G1 (text cycle, the speech queue claims the idle gap: 1 cycle, idle, no toast — `start_listening(quick=True)` answered `error: busy (speaking)` and the restart callback dropped it; fixed: re-armed after the item, 5 cycles, listening), G3 (the #117 cap never got its error cycles because the run was already dead), G4 (a queue that never goes quiet: silent on the baseline; fixed: ONE toast after `LOOP_RESTART_RETRIES` bounded waits, the repro pins `LOOP_RESTART_WAIT_SECONDS=0.3`). G2 (stop() during the wait) and G5 (loop OFF) are controls and stay green on both sides. The gap is opened deterministically: `GLib.idle_add` is a gated pump, so the restart sits queued while an item is enqueued and claimed |
-| `chronicle-perf` | #22 / #27 | `6a1ecae` | derived (`merge^1`), not re-run |
-| `chronicle-perf/repro_audio_info_stall` | #135 | `025df92` | **verified** — 319 ms stall, probe on MainThread |
-| `injector-seam` | #24 | `ea47ff1` | derived (`merge^1`), not re-run |
-| `injector-seam/repro_derive_cache` | #136 | `a20afea` | **verified** — 6 fail: 5 acquires issue 5 `list_engines()` + 5 `GetGlobalEngine` (fixed: 1 + 1; a layout switch costs one more `list_engines()`, switching back costs none); the restore/breadcrumb/no-negative-cache/per-bus checks stay green on both sides |
+| `begin-refused` | #79 / #84 | `15dd402`, `f290d7e` | j, k fail — **l stays green on both sides** |
 | `cancel-tokens` | #21 / #33 | `66edc79` | **verified** — 4 of 5 fail |
 | `cancel-tokens` `repro_e` | #132 | `025df92` | **verified** — E1, E3 fail; E2 stays green on both sides |
 | `cancel-tokens` `repro_f` | #132 / PR #146 review | `fd5c8cd` (PR head before revision), `0e014cc` | **verified** — F1 43/126 and 51/300 dictations hit, F2 1/1; 0/101 and clean with the fix. F1 lowers `sys.setswitchinterval` (GS_RACE_SWITCH, default 1e-5) — at CPython's 5 ms default it scored 0/300 on the unfixed tree |
 | `cancel-tokens` `repro_g` | #167 | `99e0214` | **verified** — G1 fails (3 checks: state idle with the STT thread alive, agent item spoken over the mic, item 'done'); G2, G3 green on both sides. This is repro_f's residual `state 'idle'` red made deterministic — no interrupt involved |
-| `dead-recorder` | #57, #48 / #72 | `e863b2c` | **verified** — e, f, h fail; g, i pass |
-| `offline-handoff` | #49 / #70 | `70ff468` | **verified** — pre-#70 *and* pre-#72 |
-| `wake-watcher` | #41, #48 / #121, #137 | `11c8f60`, `a20afea` | **verified** — pre-#41 `11c8f60`: B fails (25-spawn storm, zero sleeps). Pre-#137 `a20afea`: G fails (second recorder after 10 s of fake time, not 0.5) and H fails (a WARNING and a 10 s sleep logged *during shutdown* — the very lines #137 misread as start-time failures); B, C, F fail there too because they assert the bounded ramp before the unchanged 10 s / 60 s steady cadence. A, D, E green on every side. The fake `time.sleep` is scoped to the watcher thread by identity — the constructor also starts `tts-queue-dispatcher`, whose 0.2 s hold-polls were being recorded and stopped (A doubles as that guard: ~240 ms window, dispatcher must survive) |
-| `subtitle-token` | #42 / #78 | `65bd57b` | e1–e4 fail |
-| `begin-refused` | #79 / #84 | `15dd402`, `f290d7e` | j, k fail — **l stays green on both sides** |
-| `tts-prefetch` | #134 (×#146 for p4) | `a20afea` | **verified** — p1 fails (wall 3.01 s serial vs 2.21 s pipelined, S=0.4/P=0.6); **p2, p3, p4 report `2` (SETUP FAILURE) there, not `0`** — the prepared-ahead window they test does not exist on a service that never prefetches, and a suite that passed on it would be measuring nothing. p4 is a guard: `skip_current()` (the #146 interrupt path) is a no-op while a reply holds the queue, and the queue path has no prefetch — it goes red if either premise changes |
-| `sentence-split` | #154 | `5dde4b4` | **verified** — s1 fails (2 synthesis calls: `Beta two follows.Gamma three ends.` spoken and subtitled as one); s2 fails 7 of 13 rows — the issue's `. ` token, two boundaries in one token, `\n`, double space, `!`/`?`, an ellipsis, `e.g.` — every shape where the buffer ends in `[.!?]` + whitespace with a second boundary before it. Guards green on both sides: tokenizer-shaped tokens, `3.5`, fullwidth punctuation (not a boundary, unchanged), no terminal punctuation |
-| `pin-lifecycle` | #46 ×#57 | `15dd402` | compound X: X1 FAIL, X2 PASS, X3 FAIL |
-| `version-cache` | #53 / #85 | two-sided, below | `577a05f` passes, `7eaeb02` fails |
-| `prefs-rig` | #82 | merge base of the branch | more warnings than baseline = fail |
-| `spellbook` | #119, #152 | `025df92` / `a20afea` | **verified** — 8 fail on `025df92`: `cast stop`, `cast halt`, every punctuated trigger (`Cast, stop.`, `Cast - skip`, `Invoke... skip`, …); the denylist, overlay and op-table checks stay green on both sides. The #152 seam checks (`USER_SPELLBOOK_PATH` honours `GS_SPELLBOOK_USER_PATH`; the service reads the seam, not a literal) are red on `a20afea` |
-| `spellbook` | #119 | `025df92` | **verified** — 8 fail: `cast stop`, `cast halt`, every punctuated trigger (`Cast, stop.`, `Cast - skip`, `Invoke... skip`, …); the denylist, overlay and op-table checks stay green on both sides |
-| `spellbook/verify_ha_token` | #129 | `a20afea` | **verified** — 7 of 8 fail (H1 default returns a token / calls `bw`, H3–H6 the config keys are ignored, H7 not synced, H8 personal literals present); H2 (env wins) green on both sides. Token values are never printed: on the maintainer's machine the baseline's personal cache file exists and the default path returns a REAL token |
-| `leak-scan` | #126 | `025df92` | **verified** — 4 hits (tracked unit ×2, two plans) |
-| `shell-rig` | #113 | `3c70314` | **verified** — t0 fails 8 checks: state `idle`, no service row; every later step green on both sides |
+| `chronicle-perf` | #22 / #27 | `6a1ecae` | derived (`merge^1`), not re-run |
+| `chronicle-perf/repro_audio_info_stall` | #135 | `025df92` | **verified** — 319 ms stall, probe on MainThread |
 | `config-keys` | #120 #127 | `025df92` | **verified** — B fails: 8 keys against speech-to-cli before its #21 (`language`, `voice_commands` + 6 shell-only `show_*`), 6 after; D fails: the same 6 `show_*` (no Python reader); A, C pass |
+| `dead-recorder` | #57, #48 / #72 | `e863b2c` | **verified** — e, f, h fail; g, i pass |
 | `deprecations` | #114 | `a20afea` | **verified** — 3 deprecation lines at service start (`GLib.unix_signal_add` ×2, `Gio.DBusConnection.register_object` ×1 — PyGObject warns once per deprecated GI function per process, so two register sites make one line); `GetState` and the Spiel `Name` property answer on both sides. Runs the real `main()` on a private `dbus-run-session` bus the suite re-execs itself under; `register_object` also leaked ~1.5 kB per D-Bus method call (measured; flat through `register_object_with_closures2`) |
+| `injector-seam` | #24 | `ea47ff1` | derived (`merge^1`), not re-run |
+| `injector-seam/repro_derive_cache` | #136 | `a20afea` | **verified** — 6 fail: 5 acquires issue 5 `list_engines()` + 5 `GetGlobalEngine` (fixed: 1 + 1; a layout switch costs one more `list_engines()`, switching back costs none); the restore/breadcrumb/no-negative-cache/per-bus checks stay green on both sides |
 | `install-dropins` | #115 / #103 | `a20afea` | **not re-run, by design** — that `install.sh` ignores unknown flags and would perform a full install (and restart the live service) when handed `--check-dropins`; the suite refuses any installer without the flag (SETUP FAILURE 2, verified against `a20afea`), so discrimination is by construction |
+| `leak-scan` | #126 | `025df92` | **verified** — 4 hits (tracked unit ×2, two plans) |
+| `offline-handoff` | #49 / #70 | `70ff468` | **verified** — pre-#70 *and* pre-#72 |
+| `pin-lifecycle` | #46 ×#57 | `15dd402` | compound X: X1 FAIL, X2 PASS, X3 FAIL |
+| `prefs-rig` | #82 | merge base of the branch | more warnings than baseline = fail |
+| `sentence-split` | #154 | `5dde4b4` | **verified** — s1 fails (2 synthesis calls: `Beta two follows.Gamma three ends.` spoken and subtitled as one); s2 fails 7 of 13 rows — the issue's `. ` token, two boundaries in one token, `
+`, double space, `!`/`?`, an ellipsis, `e.g.` — every shape where the buffer ends in `[.!?]` + whitespace with a second boundary before it. Guards green on both sides: tokenizer-shaped tokens, `3.5`, fullwidth punctuation (not a boundary, unchanged), no terminal punctuation |
+| `service-audit` | #18–#20, #110, #124 (c8 config-watch), #130 | `7899ccb` | derived (`merge^1`), not re-run; c8 batch-error-toast verified against `025df92` (E1 fails) |
+| `service-audit/repro_c9_loop_error_cap` | #117 | `a20afea` | **verified** — S1 fails (streaming: 98 cycles in 4 s, zero Errors — the silent forever-loop), B1/B2/B3 fail (batch: 1 cycle, toast on the first error, no route words — the issue's "re-enters forever" premise is *false* for batch on the baseline; it stopped, but after one hiccup). Controls B5, S2 green on both sides. B4 was re-pointed by #166 (batch silence must keep the loop ALIVE, the twin of S2) and is red on `a20afea` and `5dde4b4` for that reason |
+| `service-audit/repro_c10_batch_loop_silence` | #166 | `5dde4b4` | **verified** — 7 of 8 fail: L1 (batch loop, silence ×3 then text: 1 cycle, nothing typed, idle — the loop ended at the first quiet cycle; fixed: 35 cycles in 1.5 s, text typed, still listening), L2/L3 (tap and panic stop never got a 2nd/3rd cycle to act in), L4a/L4b (silence-then-errors: no cap toast because the silence had already ended the run), L5a/L5b (`NoAudio` read as silence — silent idle, no toast). L6 (loop OFF, one silent cycle) is the control and stays green on both sides |
+| `service-audit/repro_c11_loop_gap_busy` | #173 | `683b0be` | **verified** — 3 of 5 fail: G1 (text cycle, the speech queue claims the idle gap: 1 cycle, idle, no toast — `start_listening(quick=True)` answered `error: busy (speaking)` and the restart callback dropped it; fixed: re-armed after the item, 5 cycles, listening), G3 (the #117 cap never got its error cycles because the run was already dead), G4 (a queue that never goes quiet: silent on the baseline; fixed: ONE toast after `LOOP_RESTART_RETRIES` bounded waits, the repro pins `LOOP_RESTART_WAIT_SECONDS=0.3`). G2 (stop() during the wait) and G5 (loop OFF) are controls and stay green on both sides. The gap is opened deterministically: `GLib.idle_add` is a gated pump, so the restart sits queued while an item is enqueued and claimed |
+| `shell-rig` | #113 | `3c70314` | **verified** — t0 fails 8 checks: state `idle`, no service row; every later step green on both sides |
+| `spellbook` | #119, #152 | `025df92` / `a20afea` | **verified** — 8 fail on `025df92`: `cast stop`, `cast halt`, every punctuated trigger (`Cast, stop.`, `Cast - skip`, `Invoke... skip`, …); the denylist, overlay and op-table checks stay green on both sides. The #152 seam checks (`USER_SPELLBOOK_PATH` honours `GS_SPELLBOOK_USER_PATH`; the service reads the seam, not a literal) are red on `a20afea` |
+| `spellbook/verify_ha_token` | #129 | `a20afea` | **verified** — 7 of 8 fail (H1 default returns a token / calls `bw`, H3–H6 the config keys are ignored, H7 not synced, H8 personal literals present); H2 (env wins) green on both sides. Token values are never printed: on the maintainer's machine the baseline's personal cache file exists and the default path returns a REAL token |
+| `subtitle-token` | #42 / #78 | `65bd57b` | e1–e4 fail |
+| `tts-prefetch` | #134 (×#146 for p4) | `a20afea` | **verified** — p1 fails (wall 3.01 s serial vs 2.21 s pipelined, S=0.4/P=0.6); **p2, p3, p4 report `2` (SETUP FAILURE) there, not `0`** — the prepared-ahead window they test does not exist on a service that never prefetches, and a suite that passed on it would be measuring nothing. p4 is a guard: `skip_current()` (the #146 interrupt path) is a no-op while a reply holds the queue, and the queue path has no prefetch — it goes red if either premise changes |
+| `version-cache` | #53 / #85 | two-sided, below | `577a05f` passes, `7eaeb02` fails |
+| `wake-watcher` | #41, #48 / #121, #137 | `11c8f60`, `a20afea` | **verified** — pre-#41 `11c8f60`: B fails (25-spawn storm, zero sleeps). Pre-#137 `a20afea`: G fails (second recorder after 10 s of fake time, not 0.5) and H fails (a WARNING and a 10 s sleep logged *during shutdown* — the very lines #137 misread as start-time failures); B, C, F fail there too because they assert the bounded ramp before the unchanged 10 s / 60 s steady cadence. A, D, E green on every side. The fake `time.sleep` is scoped to the watcher thread by identity — the constructor also starts `tts-queue-dispatcher`, whose 0.2 s hold-polls were being recorded and stopped (A doubles as that guard: ~240 ms window, dispatcher must survive) |
+<!-- END GENERATED: baselines -->
 
 Two suites are bash and ignore `GS_SVC_PATH`, so pointing the runner at an
 extracted SHA does not re-test that SHA — run them from a checkout of it:
@@ -288,7 +334,8 @@ reaper, not the service. Run it when touching the probe or the reaper.
 
 `tests/repros/shell-rig/run.sh [checkout]` is the other non-python suite and,
 like prefs-rig, is **not** collected by `run_all.sh` (a headless shell is
-~15 s of startup and needs `gnome-shell` on the machine). It installs a
+~15 s of startup and needs `gnome-shell` on the machine) — it has a
+`BASELINE.md` but no `suite.list`, and `gen_readme.sh` lists it as `HAND_WIRED`. It installs a
 checkout's `extension.js` + `stylesheet.css` into a sandboxed
 `XDG_DATA_HOME`, boots `gnome-shell --headless --virtual-monitor 1280x720`
 on a private bus with **no service activation**, and reads the badge from
@@ -323,7 +370,10 @@ reads a false negative.
 
 `prefs-rig/` is a GJS/bash rig (`run.sh` → `gjs` + `gtk4-broadwayd`) testing
 `prefs.js`: 10 files, zero `.py`, by design. A `*.py` inventory returns a false
-negative on it and a python collector must never try to import it. Its exit
+negative on it and a python collector must never try to import it. It has no
+`suite.list` either: its `run_all.sh` block is hand-written (it needs a
+merge-base baseline and a `gjs` probe) and `gen_readme.sh` lists it as
+`HAND_WIRED`. Its exit
 contract is its own: **0** = both runs completed; **1** = a run did not
 complete, or the branch emits *more* warnings than the baseline. A **differing
 stderr is not a failure** — a fix is supposed to change stderr.

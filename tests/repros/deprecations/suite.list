@@ -1,0 +1,6 @@
+# deprecations (#114): runs the REAL main() on a private dbus-run-session bus
+# (the suite re-execs itself under one), so it needs no live service to be
+# absent and touches nothing on the desktop. Owns org.gnome.Speaks there,
+# round-trips GetState and the Spiel Name property, then SIGTERMs itself
+# through the signal source under test.
+repro_114_startup_deprecations.py

@@ -1,0 +1,20 @@
+# ONE PROCESS PER CASE, on purpose.
+#
+# (1) A red must name its scenario. This suite caught
+#     `[FAIL] D azure-healthy-unchanged` on a trial merge while every other
+#     suite was green, because nothing else exercises the ordinary
+#     healthy-Azure dictation path; a single rc=1 line would not have said so.
+# (2) Case ordering is load bearing. Case H replaces stt.wyoming.transcribe and
+#     never restores it, and is safe only because build() re-stubs it on every
+#     call; case G restores _rest_stt_fallback explicitly because build() does
+#     NOT re-stub that one. A process per case makes this irrelevant instead of
+#     merely currently-true.
+case A: repro_offline_handoff.py A
+case B: repro_offline_handoff.py B
+case C: repro_offline_handoff.py C
+case D: repro_offline_handoff.py D
+case E: repro_offline_handoff.py E
+case F: repro_offline_handoff.py F
+case G: repro_offline_handoff.py G
+case H: repro_offline_handoff.py H
+case I: repro_offline_handoff.py I
