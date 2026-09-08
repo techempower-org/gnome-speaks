@@ -53,6 +53,36 @@ judge only the delta.
 3. **A row must not lie while loading.** With `speaker_sink` set in config, the
    synchronous snapshot must show that device *selected*, not "System Default".
 
+## The #116 probe — Local without a server address must warn
+
+`run.sh` also runs `probe_backend_warning.js` against the **branch** file, on a
+second rig-owned fixture (`home-local/`: the same pinned keys plus
+`speech_backend=local`, `wyoming_host` deliberately absent). Baseline is
+skipped on purpose — it predates the feature and would be red by construction,
+gating nothing. It asserts on **rendered** label text, never properties:
+
+- the `Primary Provider` subtitle names the dependency and renders;
+- exactly one `Adw.Banner` mentioning the Wyoming address exists, is revealed,
+  renders, and has a button;
+- building the window wrote nothing;
+- provider flips hide/show it (those writes are user choices and are asserted
+  exactly); typing into `Server Address` alone does **not** clear it, `apply`
+  does, clearing it again re-shows it;
+- the banner button switches to the page holding the field and focuses it.
+
+Verdict line is `BACKEND_WARN_RESULT ok|FAIL <n>`; a FAIL is a `!! REGRESSION`
+(exit 1), a probe that never prints `EXIT_CLEAN` is exit 3. Its stderr is
+folded into the branch warning count. Control (measured): against the merge
+base before the fix it reports `banner_present FAIL found=0` and exit 1.
+
+Two measured facts it depends on, worth knowing before editing prefs.js:
+`Adw.ComboRow` and `Adw.Banner` do **not** parse markup on libadwaita 1.9
+(`&amp;` renders verbatim) while `Adw.ActionRow` does — so the subtitle sets
+`use_markup = false` explicitly and is assigned after construction, and the
+banner title stays free of `<`/`&`. Read `win.get_visible_page()` in a probe,
+not the `visible_page` property: the property fast path logs a Gjs-WARNING
+about Adw's introspection that the branch itself never emits.
+
 ## Failure paths worth re-running
 
 - **Window closed mid-probe** — `sed 's|^win.present();|&\nwin.close();|'` on
