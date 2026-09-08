@@ -77,6 +77,23 @@ SPELLBOOK_OVERLAY = "spellbook-user.json"
 REAL_SPELLBOOK_OVERLAY = os.path.expanduser("~/.config/speech-to-cli/spellbook.json")
 
 
+def install_fake_tts(mod, fake_tts):
+    """Replace speech_tts.tts with `fake_tts` -- AND null the two-phase seam.
+
+    #134: the service resolves ``speech_tts.tts_prepare`` / ``tts_play`` by
+    getattr at call time and prefers them when present, deferring to ``tts()``
+    only when they are absent. A harness that stubs ``tts`` alone would, on a
+    speech-to-cli that has the seam, send the AI-reply path at the REAL
+    prepare -- an Azure POST with key "test-key" from inside a repro. Nulling
+    both here keeps "stub tts" meaning what it always meant: every sentence of
+    every reply goes through the fake, serially. The tts-prefetch suite is the
+    one place that installs a two-phase fake instead.
+    """
+    mod.speech_tts.tts = fake_tts
+    mod.speech_tts.tts_prepare = None
+    mod.speech_tts.tts_play = None
+
+
 def setup_scratch(prefix, scratch_root):
     """Choose this run's scratch dir and point XDG_STATE_HOME at it.
 
