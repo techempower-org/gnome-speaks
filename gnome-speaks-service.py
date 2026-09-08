@@ -2021,9 +2021,10 @@ class GnomeSpeaksService:
         "max_record_seconds",
         # Barge-in
         "enable_barge_in", "barge_in_frames", "barge_in_silence",
-        # Visual feedback toggles
-        "show_waveform", "show_vad_dot", "show_silence_fade",
-        "show_badge_pulse", "show_badge_scale", "show_word_highlights",
+        # NOT the `show_*` visual toggles: only extension.js reads those (raw
+        # config.json via _getConfigFlag), the service never does, and every
+        # key here must be in speech-to-cli's load_config() whitelist --
+        # tests/repros/config-keys enforces that (#120).
         # Debug
         "debug",
     )
