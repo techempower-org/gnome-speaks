@@ -80,6 +80,7 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 | suite | issue / PR | baseline | expected there |
 |---|---|---|---|
 | `service-audit` | #18–#20, #110, #124 (c8 config-watch), #130 | `7899ccb` | derived (`merge^1`), not re-run; c8 batch-error-toast verified against `025df92` (E1 fails) |
+| `service-audit/repro_c9_loop_error_cap` | #117 | `a20afea` | **verified** — S1 fails (streaming: 98 cycles in 4 s, zero Errors — the silent forever-loop), B1/B2/B3 fail (batch: 1 cycle, toast on the first error, no route words — the issue's "re-enters forever" premise is *false* for batch on the baseline; it stopped, but after one hiccup). Controls B4, B5, S2 green on both sides |
 | `chronicle-perf` | #22 / #27 | `6a1ecae` | derived (`merge^1`), not re-run |
 | `chronicle-perf/repro_audio_info_stall` | #135 | `025df92` | **verified** — 319 ms stall, probe on MainThread |
 | `injector-seam` | #24 | `ea47ff1` | derived (`merge^1`), not re-run |
