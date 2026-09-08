@@ -203,7 +203,7 @@ footer {
     <div class="card">
       <div class="glyph">⌨️</div>
       <h3>Dictation, anywhere</h3>
-      <p>Streaming speech-to-text typed live at your cursor — Wayland or X11 — with terminal mode, spoken punctuation, and custom auto-corrections.</p>
+      <p>Streaming speech-to-text typed live at your cursor — Wayland or X11 — with terminal mode, spoken punctuation, phrase hints, and custom auto-corrections. Choose your typing engine: the ydotool virtual keyboard, or IBus — no stuck keys, and fields an app declares as password/PIN are skipped.</p>
     </div>
     <div class="card">
       <div class="glyph">🗣️</div>
@@ -222,8 +222,8 @@ footer {
     </div>
     <div class="card">
       <div class="glyph">🕯️</div>
-      <h3>Offline fallback</h3>
-      <p>If the cloud is unreachable, speech reroutes to a Wyoming server on your LAN — Piper speaks, local models transcribe — behind a circuit breaker that skips dead timeouts.</p>
+      <h3>Local or cloud — your call</h3>
+      <p>Pick a <em>Primary Provider</em>: Azure in the cloud, or Piper and Parakeet on your own Wyoming server. Whichever you choose, the other is the fallback behind a circuit breaker — and <code>GET /status</code> always tells you which one is speaking.</p>
     </div>
     <div class="card">
       <div class="glyph">🎼</div>
@@ -240,7 +240,7 @@ footer {
 
 <section class="wrap" id="quickstart">
   <h2><span class="numeral">II.</span>Quickstart</h2>
-  <p class="sub">GNOME Shell 46–50, Ubuntu 26.04 LTS included. Azure Speech key required for cloud voices; the sibling <a href="https://github.com/techempower-org/speech-to-cli">speech-to-cli</a> engine provides audio and STT/TTS.</p>
+  <p class="sub">GNOME Shell 46–50, Ubuntu 26.04 LTS included. Bring an Azure Speech key for cloud voices, or a Wyoming server on your LAN for a fully local, keyless install — choose which is primary under Preferences → Voice &amp; Sound. The sibling <a href="https://github.com/techempower-org/speech-to-cli">speech-to-cli</a> engine provides audio and STT/TTS.</p>
   <pre class="block"><span class="c"># clone the extension and its engine side by side</span>
 git clone https://github.com/techempower-org/gnome-speaks
 git clone https://github.com/techempower-org/speech-to-cli

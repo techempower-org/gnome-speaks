@@ -1,6 +1,6 @@
 # GNOME Speaks
 
-A GNOME Shell extension that adds voice interaction to your desktop — speech-to-text dictation, text-to-speech readback, hands-free wake-word activation, and a spoken command "spellbook" — powered by [Azure Speech Services](https://azure.microsoft.com/en-us/products/ai-services/speech-services), with automatic offline fallback to a LAN [Wyoming](https://github.com/rhasspy/wyoming) server (Piper + local STT) when the cloud is unreachable.
+A GNOME Shell extension that adds voice interaction to your desktop — speech-to-text dictation, text-to-speech readback, hands-free wake-word activation, and a spoken command "spellbook". Speech runs on either of two providers, and you pick which one is **primary**: [Azure Speech Services](https://azure.microsoft.com/en-us/products/ai-services/speech-services) in the cloud, or a [Wyoming](https://github.com/rhasspy/wyoming) server on your LAN (Piper TTS + local STT such as Parakeet). Whichever you choose, the other is the automatic fallback — see [Speech backend](#speech-backend).
 
 ## Ecosystem
 
@@ -45,7 +45,8 @@ GNOME Speaks preferences can configure all four projects from one unified settin
 - **Wake word** — hands-free activation via a LAN openwakeword server; speaking your wake phrase opens the mic like the keyboard shortcut (idle-only, never over TTS)
 - **Voice spellbook** — "cast …" utterances run local spells instead of being typed: mode switching, status reports spoken back in themed voices, home-automation rituals, oracle consultations — with confirmation gates and a hardcoded denylist for anything destructive
 - **Speech queue** — the HTTP API queues utterances FIFO so concurrent callers (agents, scripts, browsers) never cut each other off; your own speech always preempts
-- **Offline fallback** — network-class Azure failures automatically reroute STT/TTS to a Wyoming server on your LAN (Piper voice, local transcription) behind a circuit breaker
+- **Local or cloud, your call** — *Primary Provider* (Preferences → Voice & Sound → Speech Backend) makes either Azure or your LAN Wyoming server (Piper / Parakeet) the first choice; the other is the fallback. A fully local, keyless install works
+- **Automatic fallback** — a failure on the primary provider trips a 60 s circuit breaker and the session runs on the other one; `GET /status` reports the live route under `speech`
 - **Panel menu** — quick access to all voice actions from the top bar
 - **Speech-to-text** — real-time streaming transcription via Azure WebSocket STT
 - **Live typing** — partial transcriptions appear in the text field as you speak, replaced by the final text when done
@@ -56,7 +57,8 @@ GNOME Speaks preferences can configure all four projects from one unified settin
 - **Continuous STT session** — in loop mode, the recorder and WebSocket stay alive across cycles (no restart overhead)
 - **Voice quality toggle** — switch between HD (DragonHD, eastus) and Fast (Neural, westus) modes via `Super+Alt+V` or the panel menu
 - **Keyboard shortcuts** — `Super+Alt+Space` (listen), `Super+Alt+C` (speak clipboard), `Super+Alt+R` (read selection), `Super+Alt+V` (toggle voice quality)
-- **Dictation mode** — transcribed text is typed at the cursor position via ydotool (Wayland) or xdotool (X11)
+- **Dictation mode** — transcribed text is typed at the cursor through a selectable [typing engine](#typing-engine): the ydotool virtual keyboard, or the IBus input method (no stuck keys; skips fields the app declares as password/PIN)
+- **Phrase hints** — comma-separated names and jargon the Azure recognizer should favour (Preferences → Dictation → Typing → Phrase Hints)
 - **Conversation mode** — voice-to-LLM-to-voice with support for Anthropic, OpenAI, Azure AI, Google Vertex, and AWS Bedrock
 - **Continuous dictation** — keeps listening after each utterance
 - **Voice commands** — spoken punctuation ("period", "comma", "new line") converted to characters
@@ -96,6 +98,8 @@ GNOME Speaks has several modes that can be combined for different workflows:
 
 Click the badge or press `Super+Alt+Space` → speak → text is typed at the cursor position. Click again, say "over", or pause for silence to stop. The transcription appears character-by-character as you speak (live typing through the [typing engine](#typing-engine) — the ydotool virtual keyboard by default, or the IBus input method).
 
+A pointer tap on the badge hands keyboard focus straight back to the window you were in before it acts, so the words land in the text field you were typing into — the badge never keeps the focus for itself. (Activating it from the keyboard keeps focus where it is, for accessibility.)
+
 ### AI Mode
 
 Enable via the panel menu or preferences. Your speech is sent to an LLM (Claude, GPT, Gemini, etc.) and the response is spoken aloud. With streaming LLM→TTS, speech starts on the first complete sentence — you don't wait for the full reply.
@@ -108,6 +112,8 @@ Enable via the panel menu. After each pause, listening automatically restarts. W
 - **AI + Loop (Hands-Free)**: Speak → AI responds → auto-listens again. Full voice assistant loop.
 
 The `loop_silence_timeout` setting (default 1.2s) controls how quickly each cycle ends on silence — shorter values mean faster turnaround.
+
+**Stopping a loop.** While the loop is listening, a tap on the badge (or the listening shortcut) **ends the current utterance, keeps its text, and stops the loop for this run** — the badge goes idle instead of restarting. Continuous Dictation stays switched on for next time; to turn the mode itself off, use the 🔄 pill on the badge, the panel menu, or say "cast loop". This works on the offline (VAD) path too: a stop finishes the recording immediately rather than waiting for silence or the recording limit.
 
 ### Terminal Mode
 
@@ -140,7 +146,9 @@ Automatically reads GNOME desktop notifications aloud as they arrive.
 - GNOME Shell 46–50 (developed on 46–48; verified on 50.1 / Ubuntu 26.04 LTS)
 - PipeWire (for audio capture and playback)
 - Python 3.10+
-- An [Azure Speech Services](https://azure.microsoft.com/en-us/products/ai-services/speech-services) API key
+- A speech provider — at least one of:
+  - an [Azure Speech Services](https://azure.microsoft.com/en-us/products/ai-services/speech-services) API key (cloud voices, streaming STT, and the Talk D-Bus API), or
+  - a [Wyoming](https://github.com/rhasspy/wyoming) server on your LAN running Piper (TTS) and an STT service such as Parakeet — a fully local, keyless install (see [Speech backend](#speech-backend))
 
 ### Python dependencies
 
@@ -249,11 +257,55 @@ Create `~/.config/speech-to-cli/config.json`:
 
 You can get a free Azure Speech key at [Azure Portal](https://portal.azure.com) — the free tier includes 500K characters/month for TTS and 5 hours/month for STT.
 
+### Speech backend
+
+Two providers can speak and listen: Azure in the cloud, and a Wyoming server on your LAN.
+**Primary Provider** (Preferences → Voice & Sound → Speech Backend; `speech_backend` in
+`config.json`) decides which one is asked first:
+
+| Value | Primary | Fallback |
+|-------|---------|----------|
+| `azure` (default) | Azure Speech — streaming STT, HD/Fast neural voices | Your Wyoming server, when Azure is unreachable |
+| `local` | Your Wyoming server — Piper voice, local STT such as Parakeet | Azure, when the local server fails (only if a key is configured) |
+
+The fallback is automatic and symmetric: a failure on the primary provider trips a 60 s
+circuit breaker for that provider and the current session runs on the other one; when the
+breaker expires the primary is tried again. `local` **depends on the Offline Server**
+settings — Preferences → Wake & Spells → Offline Server → **Server Address**
+(`wyoming_host`), plus the Voice and Hearing ports (`wyoming_tts_port` 10200,
+`wyoming_stt_port` 10300). With no Server Address there is nothing local to prefer:
+`local` then behaves exactly like `azure`, and a keyless install is refused at the door
+with a message naming `wyoming_host`.
+
+A **keyless install** is supported: with `speech_backend: "local"` and a Server Address, no
+Azure key is needed for dictation, readback, spells or the wake word. The one exception is
+the [Talk](#talk-mode-d-bus-api) D-Bus API, which is full-duplex Azure and has no local path.
+
+You can always see which route is live: `GET /status` carries a `speech` object —
+
+```json
+"speech": {"backend": "local", "offline_reason": "prefer_local",
+           "local_down": false, "forced_offline": false, "wyoming_configured": true}
+```
+
+`offline_reason` is `null` while Azure is live, otherwise `prefer_local` (you asked for
+local), `azure_down` (Azure is on cooldown after a failure) or `forced`
+(`SPEECH_FORCE_OFFLINE=1` in the environment — a test override that also removes the Azure
+fallback; it is not a setting). The service logs the same words at start-up.
+
+### Phrase hints
+
+**Phrase Hints** (Preferences → Dictation → Typing; `phrase_list` in `config.json`) is a
+comma-separated list of words the Azure recognizer should favour — product names, people,
+project jargon, anything it keeps mishearing. The list is handed to Azure when the service
+starts, so after editing it use Advanced → Service → **Restart Speech Service**. It shapes
+recognition only; for deterministic rewrites of what was heard, use Auto-Corrections.
+
 ### Typing engine
 
 `injection_method` in `~/.config/speech-to-cli/config.json` picks how dictated text
-reaches the cursor (also the *Typing Engine* row in preferences, or "cast typing engine"
-by voice):
+reaches the cursor (also **Typing Engine** under Preferences → Dictation → Typing, or
+"cast typing engine" by voice):
 
 | Value | How it types |
 |-------|--------------|
@@ -320,7 +372,21 @@ Open GNOME Extensions app → GNOME Speaks → Preferences, or:
 gnome-extensions prefs gnome-speaks@jphein
 ```
 
-Settings include voice selection (HD/fast), silence timeout, keyboard shortcuts, conversation mode (LLM provider and model), auto-corrections, badge positioning, the typing engine (Dictation → Typing → **Typing Engine**: `ydotool` virtual keyboard, `ibus` input method, or `auto`), and the wake-word gate (Wake Word → **Only Type Into Known Fields**, see below).
+Six pages: **Dictation**, **AI Chat**, **Voice & Sound**, **Wake & Spells**, **Accounts**, **Advanced**. The rows this README refers to:
+
+| Setting | Where |
+|---|---|
+| **Typing Engine** — `ydotool` virtual keyboard, `ibus` input method, or `auto` | Dictation → Typing |
+| **Phrase Hints** — words Azure should recognise | Dictation → Typing |
+| **Continuous Dictation** and the loop's **Continuous Pause** | Dictation → Flow |
+| **Primary Provider** — Azure first, or your local Wyoming server first | Voice & Sound → Speech Backend |
+| HD / Fast / Offline voice, Speed, Pitch, Volume | Voice & Sound → Voices |
+| **Wake Word**, **Only Type Into Known Fields**, Wake Model, Wake Server Port | Wake & Spells → Wake Word |
+| **Server Address**, Voice Port, Hearing Port (the Wyoming server) | Wake & Spells → Offline Server |
+| Azure Speech API key, LLM provider credentials | Accounts |
+| Audio devices, Auto-Corrections, **Restart Speech Service** | Advanced |
+
+Most settings apply live — the service polls `config.json` — but restart it after changing devices, accounts, the AI provider, or Phrase Hints.
 
 ## Keyboard shortcuts
 
@@ -374,7 +440,7 @@ current utterance immediately and holds the queue until you finish.
 | `POST /stop` | Panic button: stop playback and drain the queue. Returns `{ok, cleared}`. (SSIP calls this `CANCEL` — note the inverted verbs if you have speech-dispatcher reflexes.) |
 | `POST /pause` / `POST /resume` | Pause/resume. Queue-level: while paused, the next queued item won't start either. |
 | `GET /queue` | Queue introspection: `{current, pending, depth, recent}`. Each entry carries its `source` (`null` when unset). `recent` holds the last 16 terminal outcomes — `done`, `canceled` (dropped before starting), `interrupted` (cut off mid-play), or `error` — so callers can learn the fate of a submitted `id`. |
-| `GET /status` | Service state, pause flag, `queue_depth`, playback progress. |
+| `GET /status` | Service state, pause flag, `queue_depth`, playback progress, and `speech` — the live provider route (`backend`, `offline_reason`, `local_down`, `forced_offline`, `wyoming_configured`; see [Speech backend](#speech-backend)). |
 | `GET /voices` | Available Azure voices (cached 5 min). |
 | `GET /chronicle` | Read the [Chronicle](#the-chronicle). Query params: `limit` (default 20, capped at 500), `q` (case-insensitive substring), `kind` (`you` / `spoken`). Returns `{entries, enabled}`, oldest-first — ready to display. |
 | `POST /respeak` | Play a Chronicle line again. Body `{"id": N}`; omit `id` to replay the last thing spoken. Returns `{ok, respeaking}`, or `404` on a bad id, an empty chronicle, or a full queue. |
@@ -506,7 +572,9 @@ they route to a local spellbook instead of being typed or sent to the LLM. Works
 every mode; a realm chime confirms the match instantly (~2 ms) and spoken replies
 ride the speech queue (during continuous dictation, replies wait for the mic to
 close — casting never speaks over an open microphone). An unknown incantation
-speaks "The spell fizzles" instead of silently typing.
+speaks "The spell fizzles" instead of silently typing. The recognizer's own punctuation
+is ignored — "Cast, stop." and "Invoke… skip" match — and when two patterns fit, the
+longest wins, so "cast stop the loop" reaches the loop spell, not the panic stop.
 
 Spells are data: the repo ships `spellbook.json` with the self-control spells;
 a user overlay at `~/.config/speech-to-cli/spellbook.json` merges over it by
@@ -518,8 +586,8 @@ into that body field, and `"reply"` speaks a fixed success line.
 
 | Incantation | Effect |
 |---|---|
-| "cast silence" / "cast skip" | stop everything / skip current utterance |
-| "cast terminal mode" / "ai mode" / "type mode" | switch modes |
+| "cast silence" / "cast stop" / "cast halt" — "cast skip" / "cast next" | stop everything / skip current utterance |
+| "cast terminal mode" / "ai mode" (or "conversation mode") / "type mode" (or "dictation mode") | switch modes |
 | "cast read notifications" | toggle the notification herald |
 | "cast wake word" | arm or disarm the [waking watch](#wake-word) |
 | "cast deep thought" | toggle extended LLM thinking |
