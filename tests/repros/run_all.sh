@@ -135,6 +135,12 @@ run spellbook      verify_spellbook.py
 # _SYNC_FLAGS vs service CONFIG reads. Reads state.py from SPEECH_ENGINE_PATH
 # (~/Projects/speech-to-cli), so a sibling-repo whitelist gap is red HERE.
 run config-keys    verify_config_key_contract.py
+# deprecations (#114): runs the REAL main() on a private dbus-run-session bus
+# (the suite re-execs itself under one), so it needs no live service to be
+# absent and touches nothing on the desktop. Owns org.gnome.Speaks there,
+# round-trips GetState and the Spiel Name property, then SIGTERMs itself
+# through the signal source under test.
+run deprecations   repro_114_startup_deprecations.py
 
 # leak-scan is bash and scans the TRACKED TREE of this repo, not GS_SVC_PATH:
 # the repo is public and the maintainer's home path, LAN names and the HA
