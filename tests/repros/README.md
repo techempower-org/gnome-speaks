@@ -99,6 +99,7 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 | `prefs-rig` | #82 | merge base of the branch | more warnings than baseline = fail |
 | `spellbook` | #119, #152 | `025df92` / `a20afea` | **verified** — 8 fail on `025df92`: `cast stop`, `cast halt`, every punctuated trigger (`Cast, stop.`, `Cast - skip`, `Invoke... skip`, …); the denylist, overlay and op-table checks stay green on both sides. The #152 seam checks (`USER_SPELLBOOK_PATH` honours `GS_SPELLBOOK_USER_PATH`; the service reads the seam, not a literal) are red on `a20afea` |
 | `leak-scan` | #126 | `025df92` | **verified** — 4 hits (tracked unit ×2, two plans) |
+| `shell-rig` | #113 | `3c70314` | **verified** — t0 fails 8 checks: state `idle`, no service row; every later step green on both sides |
 | `config-keys` | #120 #127 | `025df92` | **verified** — B fails: 8 keys against speech-to-cli before its #21 (`language`, `voice_commands` + 6 shell-only `show_*`), 6 after; D fails: the same 6 `show_*` (no Python reader); A, C pass |
 | `deprecations` | #114 | `a20afea` | **verified** — 3 deprecation lines at service start (`GLib.unix_signal_add` ×2, `Gio.DBusConnection.register_object` ×1 — PyGObject warns once per deprecated GI function per process, so two register sites make one line); `GetState` and the Spiel `Name` property answer on both sides. Runs the real `main()` on a private `dbus-run-session` bus the suite re-execs itself under; `register_object` also leaked ~1.5 kB per D-Bus method call (measured; flat through `register_object_with_closures2`) |
 
@@ -271,6 +272,41 @@ B. reaper ENABLED   -> rc=0  26 orphans reaped
 
 It is not wired into `run_all.sh`: it starts 26 processes and verifies the
 reaper, not the service. Run it when touching the probe or the reaper.
+
+## shell-rig is a real headless gnome-shell
+
+`tests/repros/shell-rig/run.sh [checkout]` is the other non-python suite and,
+like prefs-rig, is **not** collected by `run_all.sh` (a headless shell is
+~15 s of startup and needs `gnome-shell` on the machine). It installs a
+checkout's `extension.js` + `stylesheet.css` into a sandboxed
+`XDG_DATA_HOME`, boots `gnome-shell --headless --virtual-monitor 1280x720`
+on a private bus with **no service activation**, and reads the badge from
+*inside* the shell through a rig-only probe extension: computed
+`St.ThemeNode` colours, accessible name, label visibility, panel-menu rows,
+the notifications `Main.notify` produced. It is the instrument the "St CSS:
+measure, don't reason" gotcha asks for. The timeline: no service on the bus
+→ a stub owns `org.gnome.Speaks` and announces `listening` → the stub dies
+→ hover / keyboard focus → a badge tap → the dictation-hotkey seam → the
+stub returns idle → dies again → disable / re-enable. Exit 0 also requires
+zero gnome-speaks `JS ERROR` / `CRITICAL` / St-warning lines in the shell log.
+
+Two things it is careful about, both measured:
+
+- **The tap spawns `systemctl --user start gnome-speaks.service` for real**,
+  against a sandboxed `XDG_RUNTIME_DIR`, so it fails to connect (`Failed to
+  connect to user scope bus via local transport`) and can never start, stop
+  or touch the real unit. `run.sh` proves that with a control *before* the
+  shell starts and aborts if the sandboxed systemctl ever reaches a manager.
+  The failure is what the rig wants: it is the toast path.
+- **Its bus socket is `$RUN/runtime/bus`** (`unix:runtime=yes`). The stock
+  `unix:dir=` form appends `/dbus-XXXXXXXXXX` and overflowed `sun_path` from a
+  worktree path — surfacing only as `dbus-run-session: EOF reading address`.
+  A depth guard now fails setup with the reason instead.
+
+The pending "Starting…" state is read by `TapAndDump`, which taps and dumps
+in **one main-loop turn**: on a machine where the sandboxed spawn fails in
+under 300 ms a dump scheduled "shortly after" the tap arrives too late and
+reads a false negative.
 
 ## prefs-rig is not python
 

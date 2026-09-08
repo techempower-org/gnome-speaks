@@ -307,6 +307,8 @@ scripts that exit 0 or 1. Validate changes by:
 5. Shell-side changes: headless session (`--nested` is dead on 50, see gotchas) --
    `dbus-run-session -- gnome-shell --headless --virtual-monitor 1280x720`, then
    enable/disable/re-enable and require **zero** JS errors, shell CRITICALs, and St warnings.
+   `tests/repros/shell-rig/run.sh [checkout]` does exactly that in a sandbox and reads the
+   badge's computed `St.ThemeNode` values from inside the shell (see `tests/repros/README.md`).
 6. Wake-word secure gate: `python3 verify_wake_gate.py` from the checkout root -- no env vars,
    no desktop, no daemon (it imports `ibus_injector` from its own directory). 24 checks; exit 0
    means all passed.

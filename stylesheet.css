@@ -253,6 +253,46 @@
 }
 
 /* ============================================================
+ * STATE: UNAVAILABLE — the service is gone (#113)
+ *
+ * Idle's compact glass, dimmed a step further, with the struck mic as
+ * the whole signal: nothing lights because there is nothing to light.
+ * Hover and keyboard focus borrow the "trouble" ember at low opacity and
+ * reveal the label ("Service not running — tap to start") as the tooltip.
+ * The same rule serves :hover and :focus so a keyboard user gets the
+ * identical reveal a pointer does.
+ * ============================================================ */
+
+.gnome-speaks-unavailable {
+    padding: 6px 9px;
+    background-color: rgba(16, 18, 26, 0.52);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.22);
+}
+
+.gnome-speaks-unavailable StIcon {
+    icon-size: 18px;
+    color: rgba(255, 255, 255, 0.34);
+}
+
+.gnome-speaks-unavailable .gnome-speaks-badge-label {
+    color: rgba(255, 214, 214, 0.86);
+    font-weight: normal;
+}
+
+.gnome-speaks-unavailable:hover,
+.gnome-speaks-unavailable:focus {
+    background-color: rgba(30, 16, 18, 0.80);
+    border: 1px solid rgba(255, 96, 96, 0.38);
+    box-shadow: 0 0 12px rgba(255, 96, 96, 0.16);
+}
+
+.gnome-speaks-unavailable:hover StIcon,
+.gnome-speaks-unavailable:focus StIcon {
+    color: rgba(255, 150, 150, 0.9);
+}
+
+/* ============================================================
  * PILLS — one shared shape, tinted by meaning
  * ============================================================ */
 
@@ -512,6 +552,12 @@
 
 .gnome-speaks-panel-speaking {
     color: rgba(178, 122, 255, 1.0);
+}
+
+/* The struck mic in the top bar, dimmed below idle: visible at a glance,
+ * never loud -- the badge carries the affordance. */
+.gnome-speaks-panel-unavailable {
+    color: rgba(255, 255, 255, 0.38);
 }
 
 /* ============================================================

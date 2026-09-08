@@ -1,0 +1,7 @@
+{
+  "uuid": "speaks-probe@rig",
+  "name": "GNOME Speaks rig probe",
+  "description": "Test-only: exports org.gnome.Speaks.RigProbe to read the badge's St.ThemeNode values inside a headless shell. Never install on a real desktop.",
+  "shell-version": ["46", "47", "48", "49", "50"],
+  "version": 1
+}

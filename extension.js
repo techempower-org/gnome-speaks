@@ -175,7 +175,18 @@ const States = {
     LISTENING: 'listening',
     PROCESSING: 'processing',
     SPEAKING: 'speaking',
+    // Not a service state: the extension's own verdict that org.gnome.Speaks
+    // has no owner on the bus. Entered from the name-vanished watch and the
+    // proxy-failure paths, left when the name appears again (#113).
+    UNAVAILABLE: 'unavailable',
 };
+
+// The systemd user unit install.sh writes; what a tap starts while the
+// badge is in the UNAVAILABLE state.
+const SERVICE_UNIT = 'gnome-speaks.service';
+// How long after a successful `systemctl start` we wait for the bus name
+// before telling the user the unit came up without claiming it.
+const SERVICE_START_WAIT_MS = 10000;
 
 const STATE_CONFIG = {
     [States.IDLE]: {
@@ -207,6 +218,16 @@ const STATE_CONFIG = {
         styleClass: 'gnome-speaks-speaking',
         showLabel: true,
         accessibleName: 'GNOME Speaks — speaking, activate to stop',
+    },
+    [States.UNAVAILABLE]: {
+        // The struck mic IS the state: dimmed glass, no ring, and the label
+        // is revealed on hover/focus as a tooltip rather than shown always,
+        // so the badge stays as compact as idle.
+        iconName: 'microphone-disabled-symbolic',
+        label: 'Service not running — tap to start',
+        styleClass: 'gnome-speaks-unavailable',
+        showLabel: false,
+        accessibleName: 'GNOME Speaks service not running — activate to start it',
     },
 };
 
@@ -240,6 +261,7 @@ export default class GnomeSpeaksExtension extends Extension {
         this._dragBadgeStartX = 0;
         this._dragBadgeStartY = 0;
         this._badgeVisible = true;
+        this._serviceStartPending = false;
         this._audioLevel = 0;
         this._lastAudioLevelTime = 0;
         this._lastPartialTime = 0;
@@ -288,7 +310,11 @@ export default class GnomeSpeaksExtension extends Extension {
             Gio.BusNameWatcherFlags.NONE,
             () => {
                 if (this._destroyed) return;
-                // Name appeared (service started or restarted)
+                // Name appeared (service started or restarted). Leave the
+                // unavailable state optimistically; the GetState reply
+                // below corrects it if the service is already busy.
+                if (this._state === States.UNAVAILABLE)
+                    this._setState(States.IDLE);
                 if (this._proxyReady)
                     this._syncState();
                 else if (!this._proxyPending)
@@ -296,8 +322,11 @@ export default class GnomeSpeaksExtension extends Extension {
             },
             () => {
                 if (this._destroyed) return;
-                // Name vanished (service stopped) — reset badge to idle
-                this._setState(States.IDLE);
+                // Name vanished (service stopped, crashed, or was never
+                // running -- GLib fires this immediately when the name has
+                // no owner at watch time). Say so on the badge instead of
+                // pretending to be idle; a tap here starts the unit (#113).
+                this._setState(States.UNAVAILABLE);
             },
         );
     }
@@ -609,6 +638,13 @@ export default class GnomeSpeaksExtension extends Extension {
             return Clutter.EVENT_PROPAGATE;
         });
         this._signals.push({obj: this._badge, id: pressId});
+
+        // Tooltip for the unavailable state: the label rides along on
+        // hover and keyboard focus, and goes away with them.
+        for (let sig of ['notify::hover', 'key-focus-in', 'key-focus-out']) {
+            let id = this._badge.connect(sig, () => this._refreshUnavailableLabel());
+            this._signals.push({obj: this._badge, id});
+        }
 
         let motionId = this._badge.connect('motion-event', (actor, event) => {
             if (this._dragButton !== 1)
@@ -1387,6 +1423,16 @@ export default class GnomeSpeaksExtension extends Extension {
     _buildPanelMenu() {
         let menu = this._panelButton.menu;
 
+        // Service health, first thing in the menu: an insensitive info row
+        // while running, an actionable one while not (#113).
+        this._menuServiceItem = new PopupMenu.PopupMenuItem('Service: running');
+        this._menuServiceItem.connect('activate', () => {
+            if (this._state === States.UNAVAILABLE)
+                this._startService();
+        });
+        menu.addMenuItem(this._menuServiceItem);
+        this._updateServiceMenuItem();
+
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Actions'));
 
         this._menuListenItem = new PopupMenu.PopupMenuItem('Start Listening');
@@ -1563,6 +1609,11 @@ export default class GnomeSpeaksExtension extends Extension {
             return;
 
         switch (this._state) {
+        case States.UNAVAILABLE:
+            this._menuListenItem.label.text = 'Start Listening';
+            this._menuListenItem.setSensitive(false);
+            this._menuStopItem.setSensitive(false);
+            break;
         case States.IDLE:
             this._menuListenItem.label.text = 'Start Listening';
             this._menuListenItem.setSensitive(true);
@@ -1598,8 +1649,121 @@ export default class GnomeSpeaksExtension extends Extension {
             this._menuConversationToggle = null;
             this._menuVoiceQualityItem = null;
             this._menuAudioInfoItem = null;
+            this._menuServiceItem = null;
             this._langSubMenu = null;
         }
+    }
+
+    _updateServiceMenuItem() {
+        if (!this._menuServiceItem)
+            return;
+        if (this._state === States.UNAVAILABLE) {
+            this._menuServiceItem.label.text = this._serviceStartPending
+                ? 'Service: starting…'
+                : 'Service: not running — activate to start';
+            this._menuServiceItem.setSensitive(!this._serviceStartPending);
+        } else {
+            this._menuServiceItem.label.text = 'Service: running';
+            this._menuServiceItem.setSensitive(false);
+        }
+    }
+
+    // -- Service lifecycle (the extension's only subprocess) ---------------
+
+    _isCompactState(state) {
+        return state === States.IDLE || state === States.UNAVAILABLE;
+    }
+
+    // The unavailable badge is as compact as idle; its label doubles as the
+    // tooltip and is shown only while hovered, focused, or starting.
+    _refreshUnavailableLabel() {
+        if (!this._label || !this._badge)
+            return;
+        if (this._state !== States.UNAVAILABLE)
+            return;
+        let reveal = this._serviceStartPending || this._badge.hover || this._badge.has_key_focus();
+        if (reveal) {
+            this._label.text = this._serviceStartPending
+                ? 'Starting service…'
+                : STATE_CONFIG[States.UNAVAILABLE].label;
+            this._label.show();
+        } else {
+            this._label.text = '';
+            this._label.hide();
+        }
+    }
+
+    // `systemctl --user start gnome-speaks.service`, asynchronously: the
+    // shell's main loop never waits on it. Success is not "systemctl exited
+    // 0" -- it is the bus name appearing, which the name watch turns into a
+    // state change; a unit that exits 0 and never claims the name is
+    // reported after SERVICE_START_WAIT_MS. Failure gets ONE toast.
+    _startService() {
+        if (this._destroyed || this._serviceStartPending)
+            return;
+        if (this._state !== States.UNAVAILABLE)
+            return;
+        this._serviceStartPending = true;
+        this._refreshUnavailableLabel();
+        this._updateServiceMenuItem();
+
+        let proc;
+        try {
+            proc = Gio.Subprocess.new(
+                ['systemctl', '--user', 'start', SERVICE_UNIT],
+                Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_PIPE);
+        } catch (e) {
+            // systemctl missing, or spawn refused
+            this._onServiceStartFinished(false, e.message);
+            return;
+        }
+        proc.communicate_utf8_async(null, null, (p, res) => {
+            if (this._destroyed) return;
+            let ok = false;
+            let detail = '';
+            try {
+                let [, , stderr] = p.communicate_utf8_finish(res);
+                ok = p.get_successful();
+                detail = (stderr || '').trim().split('\n')[0];
+            } catch (e) {
+                detail = e.message;
+            }
+            this._onServiceStartFinished(ok, detail);
+        });
+    }
+
+    _onServiceStartFinished(ok, detail) {
+        if (this._destroyed) return;
+        if (!ok) {
+            console.warn(`[GNOME Speaks] systemctl --user start ${SERVICE_UNIT} failed: ${detail}`);
+            this._serviceStartPending = false;
+            this._refreshUnavailableLabel();
+            this._updateServiceMenuItem();
+            this._showError('service start failed');
+            Main.notify('GNOME Speaks',
+                `Could not start ${SERVICE_UNIT}${detail ? `: ${detail}` : ''}`);
+            return;
+        }
+        // systemctl returned 0. Either the name has already appeared (the
+        // watch flipped the state and cleared the pending flag) or the unit
+        // is still coming up -- give it a bounded wait before saying so.
+        if (this._state !== States.UNAVAILABLE)
+            return;
+        let timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SERVICE_START_WAIT_MS, () => {
+            this._removeTimeout('service-start-wait');
+            if (this._destroyed) return GLib.SOURCE_REMOVE;
+            if (this._state === States.UNAVAILABLE && this._serviceStartPending) {
+                console.warn(`[GNOME Speaks] ${SERVICE_UNIT} started but did not claim ${DBUS_NAME} within ${SERVICE_START_WAIT_MS} ms`);
+                this._serviceStartPending = false;
+                this._refreshUnavailableLabel();
+                this._updateServiceMenuItem();
+                this._showError('service did not come up');
+                Main.notify('GNOME Speaks',
+                    `${SERVICE_UNIT} started but is not on the bus yet — check its journal.`);
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+        this._trackTimeout(timeoutId, 'service-start-wait');
     }
 
     _positionBadge() {
@@ -1719,6 +1883,7 @@ export default class GnomeSpeaksExtension extends Extension {
                         console.warn(`[GNOME Speaks] DBus proxy creation failed: ${error.message}`);
                         this._proxy = null;
                         this._proxyReady = false;
+                        this._setState(States.UNAVAILABLE);
                         return;
                     }
                     this._proxy = p;
@@ -1732,6 +1897,7 @@ export default class GnomeSpeaksExtension extends Extension {
             this._proxyPending = false;
             this._proxy = null;
             this._proxyReady = false;
+            this._setState(States.UNAVAILABLE);
         }
     }
 
@@ -1894,6 +2060,13 @@ export default class GnomeSpeaksExtension extends Extension {
         this._badge.add_style_class_name(config.styleClass);
         this._badge.accessible_name = config.accessibleName;
 
+        // The service is back (or we are being told it is): a start we
+        // kicked off has done its job, and the wait for it is moot.
+        if (oldState === States.UNAVAILABLE) {
+            this._serviceStartPending = false;
+            this._cancelTimeout('service-start-wait');
+        }
+
         // Update waveform bar color for state
         if (this._waveformBars) {
             let barClass = {
@@ -1910,7 +2083,7 @@ export default class GnomeSpeaksExtension extends Extension {
         // Update icon
         if (this._icon) {
             this._icon.icon_name = config.iconName;
-            this._icon.x_expand = (newState === States.IDLE);
+            this._icon.x_expand = this._isCompactState(newState);
         }
 
         // Update label
@@ -1923,10 +2096,12 @@ export default class GnomeSpeaksExtension extends Extension {
                 this._label.hide();
             }
         }
+        // Unavailable reveals its label as a tooltip (hover/focus) instead.
+        this._refreshUnavailableLabel();
 
-        // Pills: hidden in idle, shown when active
-        let showPills = newState !== States.IDLE;
-        let wasShowingPills = oldState && oldState !== States.IDLE;
+        // Pills: hidden in idle/unavailable, shown when active
+        let showPills = !this._isCompactState(newState);
+        let wasShowingPills = oldState && !this._isCompactState(oldState);
         if (showPills !== wasShowingPills) {
             this._showPills(showPills);
             // Only refresh pill content when transitioning visibility
@@ -1941,6 +2116,7 @@ export default class GnomeSpeaksExtension extends Extension {
         // Update panel icon and menu
         this._updatePanelIcon(newState);
         this._updatePanelMenu();
+        this._updateServiceMenuItem();
 
         // Re-sync mode flags when returning to idle (catches one-shot AI mode).
         // Debounce: skip if we just synced < 2s ago (avoids D-Bus flood in AI+Loop)
@@ -1977,7 +2153,7 @@ export default class GnomeSpeaksExtension extends Extension {
         }
 
         // Fade waveform when leaving active states
-        if (newState === States.IDLE && this._waveformContainer) {
+        if (this._isCompactState(newState) && this._waveformContainer) {
             this._waveformContainer.ease({
                 opacity: 0, duration: 400,
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
@@ -2005,11 +2181,11 @@ export default class GnomeSpeaksExtension extends Extension {
             this._cancelTimeout('subtitle-fadeout');
         }
 
-        // Reposition badge + glow + subtitle if going to/from idle (size changes)
-        if ((oldState === States.IDLE && newState !== States.IDLE) ||
-            (oldState !== States.IDLE && newState === States.IDLE)) {
+        // Reposition badge + glow + subtitle if going to/from a compact
+        // state (idle/unavailable) -- the size changes
+        if (this._isCompactState(oldState) !== this._isCompactState(newState)) {
             if (!this._customPosition) {
-                let delay = (newState === States.IDLE) ? 16 : 50;
+                let delay = this._isCompactState(newState) ? 16 : 50;
                 let timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
                     if (this._destroyed) return GLib.SOURCE_REMOVE;
                     this._positionBadge();
@@ -2037,6 +2213,7 @@ export default class GnomeSpeaksExtension extends Extension {
             'gnome-speaks-panel-listening',
             'gnome-speaks-panel-processing',
             'gnome-speaks-panel-speaking',
+            'gnome-speaks-panel-unavailable',
         ];
 
         for (let cls of panelClasses)
@@ -2125,6 +2302,9 @@ export default class GnomeSpeaksExtension extends Extension {
 
     _onBadgeClicked() {
         switch (this._state) {
+        case States.UNAVAILABLE:
+            this._startService();
+            break;
         case States.IDLE:
             this._callMethod('StartListening');
             break;
@@ -2142,6 +2322,16 @@ export default class GnomeSpeaksExtension extends Extension {
 
     _callMethod(methodName, ...args) {
         if (this._destroyed) return;
+        if (this._state === States.UNAVAILABLE) {
+            // Nothing is listening on the other end. Reaching for dictation
+            // means "bring it back"; anything else gets told why it did
+            // nothing instead of a red flash and a debug-level log line.
+            if (methodName === 'StartListening' || methodName === 'StopListening')
+                this._startService();
+            else
+                Main.notify('GNOME Speaks', 'The service is not running — tap the badge to start it.');
+            return;
+        }
         if (!this._proxy) {
             this._initProxy();
             let timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
