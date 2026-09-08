@@ -76,6 +76,11 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 | `version-cache` | #53 / #85 | two-sided, below | `577a05f` passes, `7eaeb02` fails |
 | `prefs-rig` | #82 | merge base of the branch | more warnings than baseline = fail |
 | `spellbook` | #119 | `025df92` | **verified** — 8 fail: `cast stop`, `cast halt`, every punctuated trigger (`Cast, stop.`, `Cast - skip`, `Invoke... skip`, …); the denylist, overlay and op-table checks stay green on both sides |
+| `leak-scan` | #126 | `025df92` | **verified** — 4 hits (tracked unit ×2, two plans) |
+
+`leak-scan` (`tests/leak-scan.sh`, bash) is the odd one out: it scans this
+repo's **tracked tree**, not `GS_SVC_PATH`, so pointing the runner at an
+extracted SHA does not re-scan that SHA — run the script from a checkout of it.
 
 "derived" means the SHA is the merge commit's first parent — the main tip
 immediately before the fix, correct by construction but not re-run. The method

@@ -173,14 +173,14 @@ SERVICE_EXEC="$PROJECT_DIR/gnome-speaks-service.py"
 
 mkdir -p "$SYSTEMD_USER_DIR"
 
-# Copy the service file and update ExecStart to use the actual project path
-if [[ -f "$PROJECT_DIR/gnome-speaks.service" ]]; then
-    sed -e "s|^ExecStart=.*|ExecStart=$SERVICE_EXEC|" \
-        -e "s|^ExecStopPost=.*|ExecStopPost=-$SERVICE_EXEC --restore-ime|" \
-        "$PROJECT_DIR/gnome-speaks.service" > "$SYSTEMD_FILE"
+# Render the same template meson.build feeds to configure_file, with the same
+# substitution, so there is exactly one unit source of truth (#126).
+if [[ -f "$PROJECT_DIR/gnome-speaks.service.in" ]]; then
+    sed -e "s|@SERVICE_EXEC@|$SERVICE_EXEC|g" \
+        "$PROJECT_DIR/gnome-speaks.service.in" > "$SYSTEMD_FILE"
     success "Installed systemd service to $SYSTEMD_FILE"
 else
-    error "gnome-speaks.service not found in $PROJECT_DIR"
+    error "gnome-speaks.service.in not found in $PROJECT_DIR"
     error "Cannot install systemd service."
     exit 1
 fi
