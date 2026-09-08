@@ -25,7 +25,11 @@ resets the streak.
   B2  batch, stt_dispatch returns {"error": ...}     -> same (the #130 shape)
   B3  batch, errors are NOT consecutive (e e text e e e) -> the text resets the
       streak: 6 cycles, 1 Error, and the text was typed
-  B4  control: batch SILENCE ({"text": ""}) never trips the cap -> 0 Errors
+  B4  batch SILENCE ({"text": ""}) never trips the cap -> 0 Errors, and the
+      loop is STILL RUNNING after several silent cycles (#166) -- the batch
+      twin of S2. Until #166 this asserted the run SETTLED: silence ended the
+      batch loop after one cycle while streaming waited through it, so B4 is
+      red on a20afea for that reason too.
   B5  control: loop OFF, one error -> exactly 1 Error at once (#130 preserved),
       1 cycle, and it does not carry the loop wording
   S1  streaming, ws.recv/ws.send raise every cycle   -> 3 cycles, 1 Error
@@ -51,6 +55,7 @@ CAP = 3                 # the contract, not mod.LOOP_ERROR_CAP: a changed cap mu
 ROUTE_WORDS = "Azure on cooldown after a failure"     # _SPEECH_ROUTE_WORDS["azure_down"]
 SETTLE = 6.0            # s to wait for a batch run to go quiet
 STREAM_WINDOW = 4.0     # s the streaming session may run before we look
+QUIET_SLEEP = 0.05      # s a fake silent cycle takes (#166: silence keeps looping)
 
 
 def check(label, cond, detail=""):
@@ -186,12 +191,15 @@ def settle(svc, quiet=0.3, timeout=SETTLE):
     return False
 
 
-def run_batch(mod, script, loop_on=True):
+def run_batch(mod, script, loop_on=True, window=SETTLE):
     """Drive the batch (vad) worker with a scripted stt_dispatch.
 
     script: list of callables or values; each cycle pops one.  A callable is
     CALLED (so it may raise); anything else is returned as the result.  When the
-    script runs out the fake returns silence, which ends a batch loop cleanly.
+    script runs out the fake returns silence -- which since #166 KEEPS a batch
+    loop alive, so past-the-end silence sleeps QUIET_SLEEP per cycle (a count,
+    not a busy spin) and a case that does not end by itself is ended by stop()
+    when `window` expires (settled=False).
     Returns (cycles, errors, typed, settled, flag_after).
     """
     calls = [0]
@@ -204,6 +212,7 @@ def run_batch(mod, script, loop_on=True):
         i = calls[0]
         calls[0] += 1
         if i >= len(script):
+            time.sleep(QUIET_SLEEP)
             return {"text": ""}
         step = script[i]
         return step() if callable(step) else step
@@ -213,10 +222,12 @@ def run_batch(mod, script, loop_on=True):
     rc = svc.start_listening()
     if rc != "ok":
         raise RuntimeError(f"start_listening refused: {rc}")
-    settled = settle(svc)
+    settled = settle(svc, timeout=window)
     if not settled:
         svc.stop()
-        time.sleep(0.3)
+        t = svc._stt_thread
+        if t is not None:
+            t.join(timeout=2.0)
     return calls[0], errors, inj.typed, settled, mod.CONFIG.get("continuous_dictation")
 
 
@@ -295,9 +306,12 @@ def main():
           and typed == ["hello there"] and flag is True,
           f"cycles={cycles} errors={len(errors)} typed={typed!r} settled={settled}")
 
-    # --- B4: control -- silence never trips the cap -------------------------
-    cycles, errors, typed, settled, flag = run_batch(mod, [{"text": ""}] * 6)
-    check("B4", settled and errors == [] and flag is True and typed == [],
+    # --- B4: silence never trips the cap, and never ends the loop (#166) ----
+    def quiet():
+        time.sleep(QUIET_SLEEP)
+        return {"text": ""}
+    cycles, errors, typed, settled, flag = run_batch(mod, [quiet] * 6, window=1.5)
+    check("B4", not settled and cycles >= 3 and errors == [] and flag is True and typed == [],
           f"cycles={cycles} errors={errors!r} settled={settled} flag={flag}")
 
     # --- B5: control -- loop OFF keeps the #130 immediate toast -------------
