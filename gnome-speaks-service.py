@@ -5589,9 +5589,14 @@ class DBusHandler:
                 result = self.service.get_terminal_mode()
                 invocation.return_value(GLib.Variant("(b)", (result,)))
 
+            # Shells out to wpctl (3 s timeout) on every call, pw-dump when the
+            # sink changed and pw-cli until the EC probe is cached -- the same
+            # probes #50 measured at 3.9 s while PipeWire was still coming up.
+            # The extension calls this at proxy init and on every
+            # bus-name-appeared, i.e. exactly that window, so it goes to the
+            # pool like every other blocking method (#135).
             elif method_name == "GetAudioInfo":
-                result = self.service.get_audio_info()
-                invocation.return_value(GLib.Variant("(s)", (result,)))
+                self._run_async(invocation, "(s)", self.service.get_audio_info)
 
             elif method_name == "SetSTTMode":
                 mode = parameters.unpack()[0]
