@@ -125,7 +125,7 @@ run subtitle-token repro_e1_stale_complete_frame.py repro_e2_foreign_cancel_free
                    repro_e3_streaming_reply_subtitle.py repro_e4_compound_cycle_then_reply.py
 run begin-refused  repro_j_first_sentence.py repro_k_remainder.py repro_l_healthy_reply.py
 run tts-prefetch   repro_p1_one_ahead.py repro_p2_stop_after_first.py \
-                   repro_p3_claim_window_prefetched.py
+                   repro_p3_claim_window_prefetched.py repro_p4_skip_cannot_reach_reply.py
 run dead-recorder  repro_e_single_shot_turn_end.py repro_f_text_survives_yank.py \
                    repro_g_ws_init_unbound.py repro_h_stale_prewarm.py \
                    repro_i_healthy_loop.py
