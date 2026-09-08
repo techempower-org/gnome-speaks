@@ -64,7 +64,7 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 
 | suite | issue / PR | baseline | expected there |
 |---|---|---|---|
-| `service-audit` | #18–#20 | `7899ccb` | derived (`merge^1`), not re-run |
+| `service-audit` | #18–#20, #110, #130 | `7899ccb` | derived (`merge^1`), not re-run; c8 verified against `025df92` (E1 fails) |
 | `chronicle-perf` | #22 / #27 | `6a1ecae` | derived (`merge^1`), not re-run |
 | `injector-seam` | #24 | `ea47ff1` | derived (`merge^1`), not re-run |
 | `cancel-tokens` | #21 / #33 | `66edc79` | **verified** — 4 of 5 fail |
