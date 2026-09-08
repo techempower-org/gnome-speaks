@@ -272,6 +272,14 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 - **Public repo**: LAN hostnames/IPs, the HA domain, and the wake-word model name (it's the wake phrase) never enter git -- they live in `~/.config/speech-to-cli/config.json` and the user spellbook overlay. Scan patch history before pushing.
 - **systemctl scope trap**: this file prescribes `systemctl --user` for the voice service — but `systemctl --user is-active <system-unit>` answers `inactive` with **exit 0** for units that live in the system scope (e.g. litrpg-engine on this machine). A confidently wrong answer; check the scope before believing "inactive", and never build a health check or spell on the --user reading of a system unit.
 - **Speech-queue state ownership**: `_speak_token` fences playback cleanup -- a preempted worker must not reset state it no longer owns. Keep the token claims when adding new speech paths.
+- **State claims are compare-and-set, not check-then-act** (#167): the dispatcher's gate (`_queue_hold_reason()`)
+  and `start_listening()`'s idle check are snapshots of a fence neither path locked, so a dictation could begin
+  between the gate check and the dispatcher's `_set_state("speaking")` -- the agent item played over the opening
+  mic and its worker then forced idle while the dictation ran (repro_f's residual `state 'idle'` red, ~1/120
+  dictations; deterministic in `repro_g_gate_vs_listen.py`). Both now claim through `_set_state_if(new,
+  expected=...)` under `_state_lock`: dispatcher idle|speaking→speaking inside its gate (else the item is held
+  back), `start_listening()` idle→listening (else `busy`). A new path that starts an utterance must claim the
+  state the same way; a bare `_set_state()` after a separate state check reopens the window.
 - **An agent seam never calls `stop()`**: `stop()` is `cancel_all()` + `_stop_event.set()` + idle -- every live
   token, the user's dictation included. `POST /speak {interrupt:true}` used to call it, then gated it on a
   snapshot of `current_state`; a `start_listening()` landing between the read and `cancel_all()` still lost its
