@@ -7,14 +7,14 @@ the injector and the network stubbed, so a run touches no device, no port and
 nothing on the developer's live desktop.
 
 ```sh
-tests/run-repros.sh                       # the service in this repo
-tests/run-repros.sh /path/to/service.py   # a worktree, or an extracted SHA
+tests/repros/run_all.sh                   # the service in this repo
+tests/repros/run_all.sh /path/to/service.py   # a worktree, or an extracted SHA
 ```
 
 ## Env contract
 
 `GS_SVC_PATH` — the `gnome-speaks-service.py` under test — is the **only** input
-a suite needs, and `run-repros.sh` sets it. Everything else is derived:
+a suite needs, and `run_all.sh` sets it. Everything else is derived:
 
 ⚠️ **It must be ABSOLUTE.** Each suite runs via `cd "$HERE/<suite>"`, so a
 relative path resolves against the *suite* directory and every suite dies with
