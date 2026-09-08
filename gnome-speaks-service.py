@@ -2669,6 +2669,20 @@ class GnomeSpeaksService:
             self._stt_error_exit(mode, str(error), cancel_token)
             return
 
+        # No frames at all is NOT silence -- silence has frames (the VAD
+        # recorder keeps its calibration frames). stt_vad()/stt_whisper()
+        # answer {"text": "", "status": "NoAudio"} when the recorder yielded
+        # nothing -- a lost microphone -- and they answer in milliseconds.
+        # Read as silence it was a quiet idle single-shot (the streaming path
+        # toasts a lost mic, #57), and now that silence continues the loop
+        # (#166) it would be a hot loop of recorder spawns. So it takes the
+        # error exit: a toast at once single-shot, the #117 cap in a loop.
+        if result.get("status") == "NoAudio":
+            log.error("Batch STT (%s): recorder produced no audio", mode)
+            self._stt_error_exit(mode, "recorder produced no audio (microphone lost?)",
+                                 cancel_token)
+            return
+
         # Text or clean silence: the backend answered, so the error streak
         # (#117) is over whatever happens next.
         self._loop_error_cycles = 0
@@ -2710,7 +2724,32 @@ class GnomeSpeaksService:
         self._idle_after_stt()
         _schedule_warmup()
 
-        if user_text and CONFIG.get("continuous_dictation", False) and not self._stop_event.is_set():
+        # Continuous dictation re-enters listening after text AND after clean
+        # silence (#166). The streaming cycle loop always did -- a quiet cycle
+        # is "no speech in loop cycle, continuing", and only a stop or the
+        # error cap (#117) ends the run -- but here the restart was gated on
+        # user_text, so a silent {"text": ""} went idle with no restart and no
+        # toast, Loop pill still on. With speech_backend=local every session
+        # is routed to this path, so "Loop" meant one utterance or one
+        # NO_SPEECH_TIMEOUT of quiet, then silently off. A silent cycle is one
+        # NO_SPEECH_TIMEOUT recording (7 s, speech-to-cli state.py) and one
+        # STT round trip; the streaming loop streams audio through its 60 s
+        # windows, so parity holds for cost as well as for semantics. Not a
+        # hot loop: a recorder yielding no frames is NoAudio and took the
+        # error exit above. The guard is the standard one and is re-checked
+        # when the source fires (_restart_listening_cb): the loop flag and
+        # _stop_event. A badge tap (#110) sets _stop_event before the recorder
+        # returns, so a tapped-out cycle -- text or silence -- ends the run
+        # here; a stop() never reaches this line (its token verdict returned
+        # above).
+        if CONFIG.get("continuous_dictation", False) and not self._stop_event.is_set():
+            if not user_text:
+                # Quiet cycle = the natural gap for starved queue items
+                # (agent messages, spell replies) to play before the mic
+                # reopens -- the same call the streaming loop makes on its
+                # quiet cycles. No-op on an empty queue; bails on stop.
+                log.info("Loop: no speech this cycle (%s), re-entering listening", mode)
+                self._drain_speech_gap()
             GLib.idle_add(self._restart_listening_cb(
                 lambda: (CONFIG.get("continuous_dictation", False)
                          and not self._stop_event.is_set())))

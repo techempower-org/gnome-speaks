@@ -12,7 +12,15 @@ routed to this batch path, so the swallow was on the PRIMARY offline path.
   E2  ... and still emits TranscriptionReady("") and returns to idle
   E3  ... and never types or clipboards anything
   E4  control: a text-present result types the text and emits NO Error
-  E5  control: an empty-text result (genuine silence) emits NO Error
+  E5  control: an empty-text result (genuine silence) emits NO Error.
+      Genuine silence is what stt_vad() returns after uploading a quiet
+      recording: {"text": "", "engine": ...} -- it HAS frames. Until #166
+      this case used {"text": "", "status": "NoAudio"} as its silence, but
+      that is stt_vad()'s "the recorder yielded ZERO frames" answer (a lost
+      microphone, returned in milliseconds), not silence.
+  E6  {"text": "", "status": "NoAudio"} emits exactly one Error naming the
+      recorder, TranscriptionReady("") and idle -- an error, not silence (#166;
+      the loop-mode half is repro_c10 L5a)
 
 Run:  GS_SVC_PATH=<gnome-speaks-service.py> python3 repro_c8_batch_error_toast.py
 Exit 0 = all hold; 1 = a verdict failed; 2 = setup failure.
@@ -89,11 +97,18 @@ def main():
     check("E4", typed == ["hello there"] and errors == [],
           f"typed={typed!r} errors={errors!r}")
 
-    calls, typed = deliver(mod, svc, {"text": "", "status": "NoAudio"})
+    calls, typed = deliver(mod, svc, {"text": "", "engine": "wyoming"})
     errors = [a[0] for n, a in calls if n == "_emit_error"]
     ready = [a[0] for n, a in calls if n == "_emit_transcription_ready"]
     check("E5", errors == [] and ready == [""] and typed == [],
           f"errors={errors!r} ready={ready!r}")
+
+    calls, typed = deliver(mod, svc, {"text": "", "status": "NoAudio"})
+    errors = [a[0] for n, a in calls if n == "_emit_error"]
+    ready = [a[0] for n, a in calls if n == "_emit_transcription_ready"]
+    check("E6", len(errors) == 1 and "no audio" in errors[0] and ready == [""]
+          and typed == [] and svc._state == "idle",
+          f"errors={errors!r} ready={ready!r} state={svc._state}")
 
     if FAILS:
         print(f"FAIL: {len(FAILS)} verdict(s) -- a batch STT error dict is swallowed as silence")

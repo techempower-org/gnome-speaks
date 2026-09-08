@@ -103,7 +103,7 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 |------|-------------|
 | Type (default) | STT -> typed at cursor via ydotool |
 | AI | STT -> LLM -> TTS (streaming sentence-level) |
-| Loop | Auto-restart listening after each utterance. A badge tap while listening ENDS the utterance (text kept), stops the loop for this run and goes idle (#110, JP's choice (a)); the Loop pill / "cast loop" turns the mode off. Every restart guard checks `_stop_event`, and the batch (VAD) recorder honours it via `stt(stop_when=…)` -- before that a tap in offline/loop mode did nothing until VAD silence or 30 s |
+| Loop | Auto-restart listening after each utterance. A badge tap while listening ENDS the utterance (text kept), stops the loop for this run and goes idle (#110, JP's choice (a)); the Loop pill / "cast loop" turns the mode off. Every restart guard checks `_stop_event`, and the batch (VAD) recorder honours it via `stt(stop_when=…)` -- before that a tap in offline/loop mode did nothing until VAD silence or 30 s. **Silence continues the loop on BOTH paths** (#166): streaming waits 60 s per cycle and re-enters; the batch (VAD) path re-enters after each `NO_SPEECH_TIMEOUT` (7 s) recording -- it used to restart only on text, so with `speech_backend=local` "Loop" ended silently at the first quiet cycle, pill still on. Only a stop or the error cap (#117) ends a run; `{"status": "NoAudio"}` (recorder yielded zero frames = lost mic, answered in ms) is an ERROR cycle, not silence, or a lost mic would hot-loop recorder spawns |
 | Terminal | Lowercase, no punctuation, lexical output |
 | Talk | D-Bus API for external apps (blocking call) |
 | Half/Full Duplex | Auto-detected speaker vs headphone routing |
