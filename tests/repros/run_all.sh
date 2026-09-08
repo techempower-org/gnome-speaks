@@ -157,6 +157,16 @@ for c in A B C D E F G H I; do
     line offline-handoff "case $c" "$st" "$out"
 done
 
+# wake-watcher (#121): same shape, same reason. The watcher is a daemon thread
+# the SERVICE CONSTRUCTOR starts, so one process per case guarantees exactly one
+# watcher per verdict and no case inherits a thread the previous one armed.
+# Only B discriminates the pre-#41 baseline (11c8f60); A, C, D, E, F are guards.
+for c in A B C D E F; do
+    out=$(cd "$HERE/wake-watcher" && timeout 300 python3 repro_wake_watcher.py "$c" 2>/dev/null)
+    st=$?
+    line wake-watcher "case $c" "$st" "$out"
+done
+
 # ---------------------------------------------------------------------------
 # prefs-rig is GJS/bash, not python: run.sh -> gjs + gtk4-broadwayd. A *.py
 # inventory returns a false negative on it and a python collector must never
