@@ -150,7 +150,7 @@ def load(fake_tts_seconds=1.0):
         events.append(("end", tag, time.monotonic() - t0))
         return {"spoken": True}
 
-    mod.speech_tts.tts = fake_tts
+    isolation.install_fake_tts(mod, fake_tts)   # also nulls the #134 seam
     return mod, events
 
 

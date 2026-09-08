@@ -1792,6 +1792,83 @@ class TTSQueueItem:
     drain_gen: int = 0              # _drain_gen when enqueued (see dispatcher)
 
 
+class _PreparedSentence:
+    """One sentence of an AI reply whose synthesis is opened AHEAD of playback.
+
+    #134: ``speech_tts.tts()`` synthesizes and plays in one call, so sentence
+    N+1 could not even be *requested* until N had finished playing, and every
+    sentence boundary paid the full synthesis round trip as a gap in the voice
+    (Azure REST RTT, or Piper's 230-510 ms first chunk). This wraps
+    speech-to-cli's two-phase seam -- ``tts_prepare()`` opens the network side
+    (route selection, breakers, the Azure POST or the Wyoming stream up to
+    ``audio-start``) and ``tts_play()`` runs the existing player loop -- so the
+    streaming worker can prepare N+1 while N is still playing.
+
+    Resolved through ``getattr`` at call time, never at import: an older
+    speech-to-cli has no seam, and the repro harnesses stub ``speech_tts.tts``
+    alone. Without the seam this degrades to a DEFERRED ``tts()`` call -- same
+    audio, no prefetch, never a second copy of the player loop in this repo.
+
+    ``close()`` is the cancel half. A handle that was prepared and then
+    abandoned (a stop landed before its turn) holds an open connection with
+    audio buffered behind it; it must be released, and it must never be
+    played -- the verdict is the reply's CancelToken, read by the speaker
+    before every ``play()``, never by this class.
+    """
+
+    __slots__ = ("text", "taken", "_kw", "_handle", "_play", "_done")
+
+    def __init__(self, text, kw):
+        self.text = text
+        self.taken = threading.Event()   # set by the speaker on dequeue
+        self._kw = kw
+        self._handle = None
+        self._play = None
+        self._done = False
+        prep = getattr(speech_tts, "tts_prepare", None)
+        play = getattr(speech_tts, "tts_play", None)
+        if prep is None or play is None:
+            return
+        try:
+            self._handle = prep(text, **kw)
+            self._play = play
+        except Exception as exc:
+            # The seam contract is "never raise from prepare"; if it does,
+            # the deferred tts() below still speaks the sentence and reports
+            # its own error the way it always has.
+            log.warning("tts_prepare failed, deferring to tts(): %s", exc)
+            self._handle = None
+            self._play = None
+
+    @property
+    def prefetched(self):
+        return self._handle is not None
+
+    def play(self, audio_level_cb=None):
+        """Play it (blocking). Exactly once; a closed handle plays nothing."""
+        if self._done:
+            return {"spoken": False, "cancelled": True}
+        self._done = True
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            return self._play(handle, audio_level_cb=audio_level_cb)
+        return speech_tts.tts(self.text, audio_level_cb=audio_level_cb,
+                              **self._kw)
+
+    def close(self):
+        """Release a handle that will never be played."""
+        if self._done:
+            return
+        self._done = True
+        handle, self._handle = self._handle, None
+        closer = getattr(handle, "close", None)
+        if closer is not None:
+            try:
+                closer()
+            except Exception as exc:
+                log.debug("prepared sentence close failed: %s", exc)
+
+
 # Frames the kernel pipe between the recorder and this process can hold:
 # 65536 B / 960 B = 68 frames = 2.048 s of 16 kHz mono PCM (measured with
 # F_GETPIPE_SZ). Used as the loop-mode carry-over bound below, so a tapped
@@ -4919,6 +4996,8 @@ class GnomeSpeaksService:
         # cleared the wire — before that point a stop is carried by
         # _stop_event and the LLM stream, not by the TTS wire.
         cancel_token = None
+        speaker = None          # the speaker thread, while it is running
+        speech_q = None
         try:
             provider = CONFIG.get("llm_provider", "anthropic")
             model = CONFIG.get("llm_model", "claude-opus-4.6")
@@ -4954,6 +5033,17 @@ class GnomeSpeaksService:
                 return
 
             # --- Consume token stream, buffer sentences, speak incrementally ---
+            #
+            # #134: two threads, one sentence ahead. This (producer) thread
+            # reads LLM tokens, splits sentences and PREPARES each one -- the
+            # synthesis is opened now, while the previous sentence is still
+            # playing on the speaker thread -- then hands it over and waits
+            # until the speaker TAKES it. That rendezvous is the bound: at any
+            # moment at most one sentence is playing and one is prepared and
+            # waiting, so one connection is held and one synthesis is in
+            # flight. Everything that is keyed to PLAYBACK (the claim/begin()
+            # refusal, the "speaking" state, the partial transcription, the
+            # subtitle run) moves to the speaker; only synthesis moves earlier.
 
             full_reply = []     # all tokens for conversation history
             buffer = ""         # accumulates tokens until sentence boundary
@@ -4961,6 +5051,12 @@ class GnomeSpeaksService:
             first_sentence = True
             spoke_anything = False
             aborted = False     # begin() refused: a stop beat the first note
+            # Set by the speaker once nothing more may be played: the token
+            # was cancelled, begin() refused, or a stop landed. The producer
+            # stops PREPARING at that point (no synthesis started after a
+            # stop), and the speaker closes -- never plays -- whatever was
+            # already prepared.
+            playback_over = False
 
             def _claim_playback():
                 """Issue this reply's token and take the wire.
@@ -4972,6 +5068,9 @@ class GnomeSpeaksService:
                 before opening the mic); this one used to ignore the answer and
                 speak anyway, so a reply the user had already stopped was
                 spoken in full (#79).
+
+                Runs on the SPEAKER thread, at the first sentence's playback --
+                a prepared-ahead synthesis is not a note, so it claims nothing.
                 """
                 nonlocal cancel_token, first_sentence
                 # One object claims playback AND carries the verdict.
@@ -5003,6 +5102,88 @@ class GnomeSpeaksService:
                 target=self._subtitle_queue_worker,
                 args=(subtitle_q,), daemon=True)
             subtitle_thread.start()
+
+            def _speak_prepared(item):
+                """Play one prepared sentence, in order, on the speaker thread.
+
+                The verdict is read HERE, at playback, off the token (and the
+                stop event before a token exists -- the same carrier the old
+                code used between sentences): a sentence prepared before the
+                stop and dequeued after it is closed, not played. That is the
+                cancel case of #134 -- an abandoned reply must not leave a
+                prefetched synthesis playing.
+                """
+                nonlocal spoke_anything, aborted, playback_over
+                if (playback_over or self._stop_event.is_set()
+                        or (cancel_token is not None and cancel_token.cancelled)):
+                    playback_over = True
+                    item.close()
+                    return
+                if first_sentence and not _claim_playback():
+                    aborted = True
+                    playback_over = True
+                    item.close()
+                    return
+                spoke_anything = True
+                log.info("Streaming TTS sentence%s: %s",
+                         " (prefetched)" if item.prefetched else "",
+                         item.text[:80])
+                GLib.idle_add(self._emit_partial_transcription, item.text)
+                _sf = 22.0 if self._voice_quality == "fast" else 15.0
+                _sd = max(1.0, len(item.text) / _sf)
+                _ss = threading.Event()
+                subtitle_q.put((item.text, _sd, _ss, cancel_token))
+                try:
+                    item.play(audio_level_cb=self._tts_level_cb)
+                finally:
+                    _ss.set()
+                if self._stop_event.is_set() or cancel_token.cancelled:
+                    playback_over = True
+
+            def _speaker():
+                nonlocal playback_over
+                while True:
+                    item = speech_q.get()
+                    if item is None:
+                        break
+                    # Hand the one-ahead slot back BEFORE playing: the producer
+                    # may now open the next sentence's synthesis, which is the
+                    # whole point -- it overlaps this one's playback.
+                    item.taken.set()
+                    try:
+                        _speak_prepared(item)
+                    except Exception as exc:
+                        log.exception("AI reply sentence failed: %s", exc)
+                        GLib.idle_add(self._emit_error, f"TTS failed: {exc}")
+                        playback_over = True
+                        item.close()
+
+            speech_q = queue.Queue()
+            speaker = threading.Thread(target=_speaker, daemon=True,
+                                       name="ai-reply-speaker")
+            speaker.start()
+
+            def _enqueue_sentence(text):
+                """Prepare one sentence NOW and hand it to the speaker.
+
+                Blocks until the speaker takes it -- i.e. until the previous
+                sentence has finished playing -- so exactly one sentence is
+                ever prepared ahead. Returns False once nothing more should be
+                prepared (stop landed, begin() refused, speaker gone).
+                """
+                if playback_over or self._stop_event.is_set():
+                    return False
+                item = _PreparedSentence(text, dict(
+                    quality=self._voice_quality,
+                    speed=CONFIG.get("speed", 1.0),
+                    pitch=CONFIG.get("pitch", "default"),
+                    volume=CONFIG.get("volume", "default")))
+                speech_q.put(item)
+                while not item.taken.wait(0.2):
+                    if not speaker.is_alive():
+                        item.close()
+                        return False
+                return not playback_over
 
             for token in token_iter:
                 if self._stop_event.is_set():
@@ -5051,54 +5232,26 @@ class GnomeSpeaksService:
                     sentence = sentence.strip()
                     if not sentence:
                         continue
-
-                    if first_sentence and not _claim_playback():
-                        aborted = True
+                    if not _enqueue_sentence(sentence):
                         break
 
-                    spoke_anything = True
-                    log.info("Streaming TTS sentence: %s", sentence[:80])
-                    GLib.idle_add(self._emit_partial_transcription, sentence)
-                    _sf = 22.0 if self._voice_quality == "fast" else 15.0
-                    _sd = max(1.0, len(sentence) / _sf)
-                    _ss = threading.Event()
-                    subtitle_q.put((sentence, _sd, _ss, cancel_token))
-                    speech_tts.tts(sentence, quality=self._voice_quality,
-                                   speed=CONFIG.get("speed", 1.0),
-                                   pitch=CONFIG.get("pitch", "default"),
-                                   volume=CONFIG.get("volume", "default"),
-                                   audio_level_cb=self._tts_level_cb)
-                    _ss.set()
-
-                    if self._stop_event.is_set():
-                        break
-
-                if aborted:
+                if playback_over:
                     break
 
-            # Speak any remaining buffered text after stream ends
+            # Speak any remaining buffered text after stream ends. The claim
+            # for a remainder-only reply happens in the speaker, exactly as
+            # for a first sentence (#79's second site, repro k).
             remainder = buffer.strip()
-            # Decided once: _stop_event could otherwise flip between a guard
-            # that claims playback and a guard that speaks.
-            speak_remainder = (bool(remainder) and not aborted
-                               and not self._stop_event.is_set())
-            if speak_remainder and first_sentence and not _claim_playback():
-                aborted = True
-                speak_remainder = False
-            if speak_remainder:
-                spoke_anything = True
+            if (remainder and not aborted and not playback_over
+                    and not self._stop_event.is_set()):
                 log.info("Streaming TTS remainder: %s", remainder[:80])
-                GLib.idle_add(self._emit_partial_transcription, remainder)
-                _sf = 22.0 if self._voice_quality == "fast" else 15.0
-                _sd = max(1.0, len(remainder) / _sf)
-                _ss = threading.Event()
-                subtitle_q.put((remainder, _sd, _ss, cancel_token))
-                speech_tts.tts(remainder, quality=self._voice_quality,
-                               speed=CONFIG.get("speed", 1.0),
-                               pitch=CONFIG.get("pitch", "default"),
-                               volume=CONFIG.get("volume", "default"),
-                               audio_level_cb=self._tts_level_cb)
-                _ss.set()
+                _enqueue_sentence(remainder)
+
+            # Let the speaker finish the sentence it holds, then stop it. The
+            # old code blocked in tts() on this very thread for the same span.
+            speech_q.put(None)
+            speaker.join()
+            speaker = None
 
             # Stop subtitle queue worker and wait for it to finish
             subtitle_q.put(None)
@@ -5151,6 +5304,11 @@ class GnomeSpeaksService:
                 GLib.timeout_add(2000, self._restart_listening_cb(
                     lambda: not self._stop_event.is_set()))
         finally:
+            if speaker is not None and speech_q is not None:
+                # An exception above left the speaker running: let it finish
+                # (or refuse) what it holds, then retire the token it carries.
+                speech_q.put(None)
+                speaker.join()
             self._cancels.retire(cancel_token)
             self._release_user_speech()
 
