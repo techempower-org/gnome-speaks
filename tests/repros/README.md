@@ -75,6 +75,7 @@ tests/repros/run_all.sh /tmp/base/gnome-speaks-service.py
 | `pin-lifecycle` | #46 ×#57 | `15dd402` | compound X: X1 FAIL, X2 PASS, X3 FAIL |
 | `version-cache` | #53 / #85 | two-sided, below | `577a05f` passes, `7eaeb02` fails |
 | `prefs-rig` | #82 | merge base of the branch | more warnings than baseline = fail |
+| `spellbook` | #119 | `025df92` | **verified** — 8 fail: `cast stop`, `cast halt`, every punctuated trigger (`Cast, stop.`, `Cast - skip`, `Invoke... skip`, …); the denylist, overlay and op-table checks stay green on both sides |
 
 "derived" means the SHA is the merge commit's first parent — the main tip
 immediately before the fix, correct by construction but not re-run. The method
