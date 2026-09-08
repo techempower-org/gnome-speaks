@@ -597,6 +597,22 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         });
         spellGroup.add(overlayRow);
 
+        // ── Home Assistant (the `assist` spell action) ──
+        // Both keys default to EMPTY: a stock install must never shell out to
+        // `bw` or open a personal cache path (#129). HA_TOKEN in the service's
+        // environment always wins over both.
+        const haGroup = new Adw.PreferencesGroup({
+            title: 'Home Assistant',
+            description: 'Where "assist" spells find their long-lived access token. Checked in order: the HA_TOKEN environment variable, the cache file, then the vault item. Leave both empty if you do not use Home Assistant.',
+        });
+        page.add(haGroup);
+
+        this._addEntryRow(haGroup, 'Token Cache File', 'ha_token_cache', '',
+            'A file holding only the token, e.g. ~/.cache/gnome-speaks/ha-token. Read fresh on every cast. Empty = not used');
+
+        this._addEntryRow(haGroup, 'Vault Item', 'ha_token_item', '',
+            'Bitwarden/Vaultwarden item name — resolved with `bw get password <item>` when the file is missing or empty. Needs an unlocked bw session. Empty = not used');
+
         // ── Offline Server ──
         const offlineGroup = new Adw.PreferencesGroup({title: 'Offline Server'});
         page.add(offlineGroup);
