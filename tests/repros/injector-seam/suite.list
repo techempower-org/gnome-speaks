@@ -3,3 +3,4 @@ verify_ibus_injector.py
 repro_fallback_retry.py
 repro_fake_context_fallback.py
 repro_derive_cache.py
+repro_no_global_engine_noise.py
