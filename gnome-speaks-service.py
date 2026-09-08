@@ -5172,7 +5172,8 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._send_error_json(400, f"Invalid JSON: {exc}")
             return None
         if not isinstance(body, dict):
-            self._send_error_json(400, "JSON body must be an object")
+            self._send_error_json(
+                400, f"JSON body must be an object, got {type(body).__name__}")
             return None
         return body
 
