@@ -90,6 +90,32 @@ class FakeEngineDesc:
         return self._name
 
 
+
+
+class FakeConnection:
+    """The daemon's GlobalEngine property, as GDBus hands it to a caller (#177).
+
+    Unset -> a GLib.Error carrying the daemon's exact text; set -> `(v)` around
+    a serialized IBusEngineDesc (child 2 is the name). No real daemon.
+    """
+
+    def __init__(self, bus):
+        self._bus = bus
+
+    def call_sync(self, dest, path, iface, member, params, reply_type, *rest):
+        from gi.repository import GLib
+        self._bus.n_property_get = getattr(self._bus, "n_property_get", 0) + 1
+        assert (iface, member) == ("org.freedesktop.DBus.Properties", "Get"), (iface, member)
+        assert params.unpack() == ("org.freedesktop.IBus", "GlobalEngine"), params.unpack()
+        current = self._bus.current
+        if not current:
+            raise GLib.Error("GDBus.Error:org.freedesktop.DBus.Error.Failed: "
+                             "No global engine.", "g-dbus-error-quark", 0)
+        desc = GLib.Variant("(sa{sv}ssssssssussssssss)",
+                            ("IBusEngineDesc", {}, current) + ("",) * 7 + (0,) + ("",) * 8)
+        return GLib.Variant("(v)", (desc,))
+
+
 class FakeBus:
     """Records engine swaps. Never speaks to a real daemon."""
 
@@ -115,6 +141,13 @@ class FakeBus:
             return False
         self.current = name
         return True
+
+    def get_connection(self):
+        # #177: the fixed tree asks the GlobalEngine property directly.
+        # raise_on_get is the daemon's real answer for "unset" -- an error.
+        if self.raise_on_get:
+            return FakeConnection(type("B", (), {"current": None})())
+        return FakeConnection(self)
 
 
 class FakeEngine:

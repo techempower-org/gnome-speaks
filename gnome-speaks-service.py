@@ -2081,6 +2081,10 @@ class GnomeSpeaksService:
         # the watcher's pw-record (rc=1) at the same instant, and that EOF is
         # teardown, not a failure to retry (#137).
         self._shutting_down = False
+        # shutdown() ran. main() reaches shutdown() twice on every stop -- from
+        # the SIGTERM handler and again from loop.run()'s `finally` -- and each
+        # step in it is a teardown that must run once (#177).
+        self._shutdown_done = False
 
         # HTTP progress tracking for REST API status endpoint
         self._http_progress = {
@@ -5597,7 +5601,16 @@ class GnomeSpeaksService:
     # -- Cleanup -----------------------------------------------------------
 
     def shutdown(self):
-        """Clean up resources on exit."""
+        """Clean up resources on exit. Idempotent.
+
+        main() calls this from the signal handler AND from loop.run()'s
+        `finally`, so every stop ran it twice (measured: 36 "Shutting down"
+        for 18 stops, #177). Twice meant recover() twice -- two IBus probes
+        (each one libibus warning) and two ydotoold resets per stop.
+        """
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         log.info("Shutting down")
         self._shutting_down = True
         self.stop()

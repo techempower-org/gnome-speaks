@@ -28,6 +28,16 @@ by an IBus engine. So:
 Any one of those alone is a coin flip. Together they mean the worst case
 self-heals on the next service start, which systemd does automatically.
 
+An EMPTY global engine is NOT, by itself, that crash state (#177). On GNOME the
+shell owns input sources and never sets one when the only source is an xkb
+layout, so `ibus engine` answers "No engine is set." on a perfectly healthy
+desktop -- it is the steady state here. The crash state is "there WAS one
+before we swapped, and now there is none", and the only witness to "there was
+one" is the prior-engine breadcrumb. Read the FILE to tell them apart, never
+the property; and read the property through `global_engine_name()`, which
+asks quietly -- `IBus.Bus.get_global_engine()` g_warning()s on every empty
+answer, four journal lines per service restart.
+
 We build on `gi.repository.IBus` rather than hand-rolling the wire protocol.
 libibus then owns the two GVariant shapes that are easy to get silently wrong
 (the 4-argument preedit update, and variant-wrapped attribute lists).
@@ -119,6 +129,74 @@ def clear_prior_engine():
         pass
     except OSError:
         log.debug("Could not clear prior-engine file", exc_info=True)
+
+
+IBUS_SERVICE = "org.freedesktop.IBus"
+IBUS_PATH = "/org/freedesktop/IBus"
+IBUS_INTERFACE = "org.freedesktop.IBus"
+# The daemon's exact error text for an unset GlobalEngine property
+# (bus/ibusimpl.c). Matched as a substring of the GLib.Error message.
+NO_GLOBAL_ENGINE = "No global engine"
+
+
+def _engine_name_from_variant(variant):
+    """Name of a serialized IBusEngineDesc GVariant, or None."""
+    try:
+        return IBus.Serializable.deserialize_object(variant).get_name() or None
+    except Exception:
+        pass
+    # Wire shape `(sa{sv}s...)`: child 0 is the type name, child 2 the engine
+    # name (ibusenginedesc.c serializes name first after the parent's two).
+    # Measured equal to libibus's own get_name() for all 974 engines on the
+    # desk this was written on; here only if the bindings cannot decode.
+    try:
+        if (variant.n_children() > 2
+                and variant.get_child_value(0).get_string() == "IBusEngineDesc"):
+            return variant.get_child_value(2).get_string() or None
+    except Exception:
+        log.debug("Unreadable GlobalEngine variant", exc_info=True)
+    return None
+
+
+def global_engine_name(bus):
+    """Name of the daemon's global engine, or None when none is set -- QUIETLY.
+
+    `IBus.Bus.get_global_engine()` is `ibus_bus_call_sync()` underneath, and
+    that g_warning()s EVERY D-Bus error before returning NULL:
+
+        ibus_bus_call_sync: org.freedesktop.DBus.Properties.Get:
+            GDBus.Error:org.freedesktop.DBus.Error.Failed: No global engine.
+
+    On GNOME "No global engine." is the steady state whenever the only input
+    source is an xkb layout -- the shell owns input sources and never sets
+    one -- so that line was in the journal four times per service restart
+    (#177) and read like the crash state this module guards against. It is
+    not: see the module docstring. So ask the property over the bus's own
+    GDBusConnection, where the error comes back as a GLib.Error and nothing
+    logs on our behalf (measured 2026-09-08, libibus 1.5.34: the libibus call
+    warns on stderr, this call is silent). Any other failure is also answered
+    None, at DEBUG -- the callers already treated every failure as "no prior
+    engine" and derive the restore target from input-sources instead.
+    """
+    try:
+        conn = bus.get_connection() if bus is not None else None
+        if conn is None:
+            log.debug("IBus bus has no connection; cannot read the global engine")
+            return None
+        reply = conn.call_sync(
+            IBUS_SERVICE, IBUS_PATH, "org.freedesktop.DBus.Properties", "Get",
+            GLib.Variant("(ss)", (IBUS_INTERFACE, "GlobalEngine")),
+            GLib.VariantType("(v)"), Gio.DBusCallFlags.NONE, -1, None)
+    except GLib.Error as exc:
+        if NO_GLOBAL_ENGINE in (exc.message or ""):
+            log.debug("no global engine set -- nothing to snapshot")
+        else:
+            log.debug("GlobalEngine property unreadable", exc_info=True)
+        return None
+    except Exception:
+        log.debug("GlobalEngine property read failed", exc_info=True)
+        return None
+    return _engine_name_from_variant(reply.get_child_value(0).get_variant())
 
 
 INPUT_SOURCES_SCHEMA = "org.gnome.desktop.input-sources"
@@ -306,17 +384,29 @@ def restore_prior_engine(reason="startup"):
     if not name and HAS_IBUS:
         # No breadcrumb, but we may still be the installed engine -- a crash
         # before the breadcrumb was written, or a build that predates it.
-        # Being stranded is detectable without one, so detect it.
+        # Being stranded is detectable without one, so detect it -- QUIETLY
+        # (#177): the probe used to be get_global_engine(), which g_warning()s
+        # when none is set, and none set is GNOME's normal.
         try:
             IBus.init()
             probe = IBus.Bus()
             if probe.is_connected():
-                current = probe.get_global_engine()
-                if current is not None and current.get_name() == ENGINE_NAME:
+                current = global_engine_name(probe)
+                if current == ENGINE_NAME:
                     name = derive_restore_target(probe)
                     if name:
                         log.warning("Found the session stranded on %s with no "
                                     "breadcrumb; restoring %r", ENGINE_NAME, name)
+                elif current is None:
+                    # The explicit no-op. One line, INFO, so the reader who
+                    # used to see libibus's warning here learns it is healthy.
+                    log.info("IBus %s: no prior-engine breadcrumb and no global "
+                             "engine set -- nothing to restore (unset is normal "
+                             "when the shell owns a single xkb layout; the crash "
+                             "state is a breadcrumb naming an engine)", reason)
+                else:
+                    log.debug("IBus %s: no breadcrumb; global engine is %r -- "
+                              "nothing to restore", reason, current)
         except Exception:
             log.debug("Stranded-engine probe failed", exc_info=True)
     if not name:
@@ -332,8 +422,7 @@ def restore_prior_engine(reason="startup"):
             log.warning("Stranded IBus engine recorded (%s) but the daemon is "
                         "not reachable; leaving the breadcrumb for next time", name)
             return False
-        current = bus.get_global_engine()
-        current_name = current.get_name() if current else None
+        current_name = global_engine_name(bus)
         if current_name == name:
             # Someone already put it back; the breadcrumb is just stale.
             clear_prior_engine()
@@ -566,7 +655,8 @@ class IbusInjector(Injector):
         self._active = False
         # GetGlobalEngine answered "no global engine" on this bus. On GNOME
         # that is the steady state, not a transient, and every further ask is
-        # a D-Bus round trip plus one IBUS-WARNING in the journal (#136).
+        # a D-Bus round trip (#136; the IBUS-WARNING it used to carry is gone
+        # since #177 -- see global_engine_name()).
         self._global_engine_unset = False
         self._coalescer = _Coalescer()
         # Why the last acquire() said no: None | "secure" | "no_target" |
@@ -675,23 +765,19 @@ class IbusInjector(Injector):
             self._refusal = None
             prior_name = None
             if not self._global_engine_unset:
-                try:
-                    prior = self._bus.get_global_engine()
-                    prior_name = prior.get_name() if prior else None
-                except Exception:
-                    # "No global engine" is the COMMON case on GNOME, not an
-                    # error: the shell owns input sources and often leaves
-                    # the daemon's global engine unset. Not a reason to give
-                    # up on having somewhere to go back to.
-                    log.debug("GetGlobalEngine unavailable", exc_info=True)
-                    prior_name = None
+                # "No global engine" is the COMMON case on GNOME, not an
+                # error: the shell owns input sources and leaves the daemon's
+                # global engine unset. global_engine_name() answers None for
+                # it without libibus's g_warning() (#177); not a reason to
+                # give up on having somewhere to go back to.
+                prior_name = global_engine_name(self._bus)
                 if not prior_name:
                     # Asked, and the daemon has none. Do not ask again on this
                     # bus: the answer comes from input-sources below either
-                    # way, and libibus g_warning()s on every empty reply --
-                    # one journal line per utterance before #136. A layout
-                    # switch still lands, because the input-sources read in
-                    # derive_restore_target() is not cached.
+                    # way, and the ask is a D-Bus round trip per utterance
+                    # (#136). A layout switch still lands, because the
+                    # input-sources read in derive_restore_target() is not
+                    # cached.
                     self._global_engine_unset = True
             if prior_name == ENGINE_NAME:
                 prior_name = None  # never record ourselves as the way back

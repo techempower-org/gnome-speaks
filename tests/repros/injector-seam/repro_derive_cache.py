@@ -73,6 +73,32 @@ class FakeEngineDesc:
         return self._name
 
 
+
+
+class FakeConnection:
+    """The daemon's GlobalEngine property, as GDBus hands it to a caller (#177).
+
+    Unset -> a GLib.Error carrying the daemon's exact text; set -> `(v)` around
+    a serialized IBusEngineDesc (child 2 is the name). No real daemon.
+    """
+
+    def __init__(self, bus):
+        self._bus = bus
+
+    def call_sync(self, dest, path, iface, member, params, reply_type, *rest):
+        from gi.repository import GLib
+        self._bus.n_property_get = getattr(self._bus, "n_property_get", 0) + 1
+        assert (iface, member) == ("org.freedesktop.DBus.Properties", "Get"), (iface, member)
+        assert params.unpack() == ("org.freedesktop.IBus", "GlobalEngine"), params.unpack()
+        current = self._bus.current
+        if not current:
+            raise GLib.Error("GDBus.Error:org.freedesktop.DBus.Error.Failed: "
+                             "No global engine.", "g-dbus-error-quark", 0)
+        desc = GLib.Variant("(sa{sv}ssssssssussssssss)",
+                            ("IBusEngineDesc", {}, current) + ("",) * 7 + (0,) + ("",) * 8)
+        return GLib.Variant("(v)", (desc,))
+
+
 class CountingBus:
     """GNOME's shape: no global engine, ever. Counts what it is asked."""
 
@@ -89,6 +115,18 @@ class CountingBus:
     def get_global_engine(self):
         self.n_get_global += 1
         return None                      # libibus: NULL + an IBUS-WARNING
+
+    def get_connection(self):
+        # #177: the fixed tree reads the property itself. Same counter -- the
+        # question this file asks is "how often was the daemon asked", not
+        # "through which call".
+        bus = self
+
+        class Conn(FakeConnection):
+            def call_sync(self, *a, **kw):
+                bus.n_get_global += 1
+                return FakeConnection.call_sync(self, *a, **kw)
+        return Conn(self)
 
     def set_global_engine(self, name):
         self.swaps.append(name)
@@ -123,6 +161,9 @@ class GioShim:
         def new(schema):
             GioShim.n_new += 1
             return GioShim.settings
+
+    class DBusCallFlags:            # #177: global_engine_name() passes Gio.DBusCallFlags.NONE
+        NONE = 0
 
 
 class FakeEngine:

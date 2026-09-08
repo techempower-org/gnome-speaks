@@ -129,6 +129,16 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
   (`$XDG_RUNTIME_DIR/gnome-speaks/prior-engine` written *before* the swap, restore-on-start,
   `ExecStopPost=… --restore-ime`, and a session watchdog). Do not treat any of them as optional,
   and keep `restore_prior_engine()` dependency-free — it must run with no config and no instance.
+  ⚠️ **But an empty global engine is the crash state only if there WAS one before the swap** (#177).
+  On GNOME the shell owns input sources and sets no IBus global engine when the only source is an
+  xkb layout — `ibus engine` answers "No engine is set." on a healthy desktop, forever. **The
+  `prior-engine` file is the discriminator, not `ibus engine`**: breadcrumb naming an engine + none
+  set = stranded, restore it; no breadcrumb + none set = normal, an explicit no-op (one INFO line).
+  Read the property through `global_engine_name()` — `IBus.Bus.get_global_engine()` g_warning()s
+  on every empty answer (`ibus_bus_call_sync: … No global engine.`, four journal lines per restart
+  before #177); `grep -n "get_global_engine(" ibus_injector.py` matching only prose is the standing
+  check. `shutdown()` is idempotent for the same reason — main() reaches it from the signal
+  handler AND its `finally`, and the second run re-probed IBus and reset ydotoold again.
 - **The IBus restore target is derived once per bus and layout, not per utterance** (#136): on GNOME
   `GetGlobalEngine` answers empty on EVERY acquire (the shell owns input sources), so
   `derive_restore_target()` is the normal path, and `bus.list_engines()` inside it deserialised 974
