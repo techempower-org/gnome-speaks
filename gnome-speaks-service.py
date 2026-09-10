@@ -1196,6 +1196,44 @@ def speech_route():
     }
 
 
+# ---------------------------------------------------------------------------
+# The extension is the master switch (JP, 2026-09-10).
+#
+# Every actuator lives in THIS process -- the wake watcher, the speech queue,
+# D-Bus Speak/Talk/StartListening, loop restarts -- and none of them needed
+# the extension. So on 2026-09-10, with the extension DISABLED, the wake model
+# (streaming the room off a webcam mic) false-fired twice in 13 minutes, the
+# persisted loop flag turned each into an open mic, and a private phone call
+# was typed through ydotool for minutes with no badge, no Loop pill and no
+# tap-to-stop: disabling the extension had removed every indicator and left
+# every actuator running. Disabling the extension has to mean OFF.
+#
+# The instrument is the session-bus name the extension owns in enable() and
+# releases in disable() (it vanishes with a shell crash too), so ownership IS
+# "the extension is loaded". main() watches it; _extension_gate() is the ONE
+# verdict every seam reads. An item that arrives while off is REFUSED or
+# DROPPED, never held -- a burst of stale speech when the extension comes back
+# is the coalescing rule's exact anti-goal. REQUIRE_EXTENSION is the seam for
+# headless installs and for tests (isolation.pretend_extension()).
+# ---------------------------------------------------------------------------
+DESKTOP_BUS_NAME = "org.gnome.Speaks.Desktop"
+REQUIRE_EXTENSION = os.environ.get("GS_REQUIRE_EXTENSION", "1") != "0"
+_extension_present = False      # written by the name watch in main()
+EXTENSION_OFF = ("GNOME Speaks extension is disabled (%s has no owner) -- "
+                 "nothing listens, speaks or types while it is off"
+                 % DESKTOP_BUS_NAME)
+
+
+def _desktop_present():
+    """Is the extension loaded (or is the requirement waived)?"""
+    return (not REQUIRE_EXTENSION) or _extension_present
+
+
+def _extension_gate():
+    """None when the service may listen, speak or type; else the words."""
+    return None if _desktop_present() else EXTENSION_OFF
+
+
 def _speech_ready(need_azure=False):
     """Can the service speak or listen right now? None = yes, else the words
     for what is actually missing.
@@ -2481,6 +2519,12 @@ class GnomeSpeaksService:
         If quick=True, skip config reload and audio detection refresh.
         Used for tight loop restarts where config hasn't changed.
         """
+        # Master switch first: nothing below may run with the extension off
+        # (wake, hotkey, loop restart, D-Bus -- every caller lands here).
+        blocked = _extension_gate()
+        if blocked:
+            log.info("start_listening refused: %s", blocked)
+            return f"error: {blocked}"
         # A quick restart continues the SAME session (loop cycle, AI+Loop
         # retry), so it inherits how that session was opened; only a fresh
         # start -- the hotkey -- clears the wake mark (#55).
@@ -3892,6 +3936,15 @@ class GnomeSpeaksService:
                 item = self._tts_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
+            # Master switch: an item that reaches the head of the queue while
+            # the extension is off is dropped, not held -- holding would burst
+            # stale agent speech the moment the extension came back.
+            blocked = _extension_gate()
+            if blocked:
+                log.info("Speech queue: item %d suppressed — %s", item.id, blocked)
+                self._queue_recent.append({"id": item.id,
+                                           "outcome": "suppressed"})
+                continue
             # Issue the cancel token BEFORE publishing the claim, so the token
             # and _queue_current become visible to /skip in the same critical
             # section. Issuing does not touch the wire; a /skip landing between
@@ -3987,6 +4040,10 @@ class GnomeSpeaksService:
             _refresh_audio_detection()
             self._audio_detected = True
         if not text or not text.strip():
+            return False
+        blocked = _extension_gate()
+        if blocked:
+            log.info("speak() refused: %s", blocked)
             return False
 
         # Hold the queue dispatcher before preempting (user outranks agents).
@@ -4496,6 +4553,7 @@ class GnomeSpeaksService:
             if (not CONFIG.get("wake_word", False)
                     or not CONFIG.get("wyoming_host", "")
                     or not CONFIG.get("wake_word_model", "")
+                    or not _desktop_present()     # master switch: no mic, no LAN stream
                     or self.current_state != "idle"):
                 time.sleep(0.5)
                 continue
@@ -4518,6 +4576,7 @@ class GnomeSpeaksService:
                 def _chunks():
                     nonlocal recorder_eof
                     while (CONFIG.get("wake_word", False)
+                           and _desktop_present()
                            and self.current_state == "idle"
                            and not self._shutting_down):
                         data = proc.stdout.read(3200)  # ~100 ms @ 16 kHz s16
@@ -4527,7 +4586,7 @@ class GnomeSpeaksService:
                         yield data
 
                 name = wyoming_mod.detect_stream(host, port, model, _chunks())
-                if name and self.current_state == "idle":
+                if name and self.current_state == "idle" and _desktop_present():
                     log.info("Wake word detected (%s) — opening mic", name)
                     GLib.idle_add(lambda: (self.start_listening(quick=True,
                                                                 wake=True),
@@ -4664,6 +4723,10 @@ class GnomeSpeaksService:
                 if missing:
                     GLib.idle_add(self._emit_error, missing)
                     return "error: speech not configured"
+                blocked = _extension_gate()
+                if blocked:
+                    log.info("talk() refused: %s", blocked)
+                    return f"error: {blocked}"
 
                 self._stop_event.clear()
                 self._set_state("speaking")
@@ -5774,7 +5837,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
 
         # Reject up front rather than enqueueing items doomed to fail —
         # a service that cannot speak must not answer 200 and then say nothing.
-        missing = _speech_ready()
+        missing = _speech_ready() or _extension_gate()
         if missing:
             self._send_error_json(503, missing)
             return
@@ -6080,6 +6143,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         result = {
             "state": current, "paused": paused,
             "speech": route,
+            "extension": _desktop_present(),
             "queue_depth": svc._tts_queue.qsize()}
         if progress is not None:
             result["progress"] = progress
@@ -6483,6 +6547,35 @@ def main():
     # Set up main loop
     loop = GLib.MainLoop()
     service._main_loop = loop
+
+    # The extension is the master switch: watch the name it owns while enabled.
+    # The vanished callback also fires at install time when nobody owns it, so
+    # a service started with the extension disabled starts muted. Losing the
+    # name mid-session is the kill switch -- stop() abandons the dictation,
+    # cuts the current utterance and drains the queue; it joins worker threads
+    # (up to 3 s), so it runs off the main loop.
+    def _ext_appeared(conn, name, owner):
+        global _extension_present
+        _extension_present = True
+        log.info("Extension present (%s owned by %s): listening, speech and "
+                 "typing enabled", name, owner)
+
+    def _ext_vanished(conn, name):
+        global _extension_present
+        was = _extension_present
+        _extension_present = False
+        if REQUIRE_EXTENSION:
+            log.info("Extension absent (%s has no owner): muted -- nothing "
+                     "listens, speaks or types until it is enabled", name)
+            if was:
+                threading.Thread(target=service.stop, daemon=True,
+                                 name="extension-kill-switch").start()
+        else:
+            log.info("Extension absent (%s has no owner); GS_REQUIRE_EXTENSION=0, "
+                     "not gating", name)
+
+    Gio.bus_watch_name(Gio.BusType.SESSION, DESKTOP_BUS_NAME,
+                       Gio.BusNameWatcherFlags.NONE, _ext_appeared, _ext_vanished)
 
     # Request bus name
     flags = Gio.BusNameOwnerFlags.NONE

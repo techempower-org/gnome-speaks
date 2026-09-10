@@ -21,6 +21,7 @@ wiring in `__init__` is covered too.
   F  generic exception   detect_stream raises         -> proc.kill() + wait() in finally, ramp then 10
   G  first recorder dies, second healthy              -> armed < 2 s of fake time, NO warning   #137
   H  shutdown mid-stream shutdown() then recorder EOF -> thread exits: no sleep, no warning    #137
+  I  extension absent   armed, idle, no Desktop name -> zero Popen, zero detect (master switch)
 
 #137 in one line: every "recorder produced no audio (rc=1) (retrying every
 10s)" in three days of journal was logged by the OLD pid 0.5 s into
@@ -459,8 +460,33 @@ def case_h():
     ])
 
 
+def case_i():
+    """The extension is the master switch (JP, 2026-09-10): armed and idle but
+    with no `org.gnome.Speaks.Desktop` owner, the watcher must not even spawn a
+    recorder -- on 2026-09-10 the wake model false-fired twice in 13 minutes
+    with the extension disabled and typed a phone call through ydotool. A tree
+    without the gate spawns and streams here exactly as in case D."""
+    stop_after = 40
+    rig = Rig(KilledLiveProc)
+    rig.set_state("idle")
+    rig.mod.REQUIRE_EXTENSION = True
+    rig.mod._extension_present = False
+    rig.detect = lambda host, port, model, chunks: "test_model"
+    if not rig.arm(stop_after=stop_after):
+        return 2
+    print(f"  sleeps={len(rig.ftime.sleeps)} spawns={len(rig.procs)} "
+          f"detects={rig.detects} starts={rig.starts}")
+    return report("I extension absent -> parked, zero spawns", [
+        (len(rig.procs) == 0, f"no pw-record spawned while the extension is absent (got {len(rig.procs)})"),
+        (rig.detects == 0, f"detect_stream never called (got {rig.detects})"),
+        (rig.starts == [], f"start_listening never called (got {rig.starts})"),
+        (all(s == 0.5 for s in rig.ftime.sleeps),
+         "parked on the 0.5 s idle tick"),
+    ])
+
+
 CASES = {"A": case_a, "B": case_b, "C": case_c, "D": case_d, "E": case_e, "F": case_f,
-         "G": case_g, "H": case_h}
+         "G": case_g, "H": case_h, "I": case_i}
 
 
 def main():

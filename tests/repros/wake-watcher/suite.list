@@ -13,3 +13,5 @@ case E: repro_wake_watcher.py E
 case F: repro_wake_watcher.py F
 case G: repro_wake_watcher.py G
 case H: repro_wake_watcher.py H
+# I discriminates eb18627 (pre master-switch): the watcher spawns and streams there.
+case I: repro_wake_watcher.py I

@@ -1,0 +1,4 @@
+# extension-gate: the extension is the master switch (JP, 2026-09-10). One
+# process: the module-level flag is flipped between scenarios and every
+# scenario asserts the state it leaves behind.
+gate: repro_extension_gate.py
