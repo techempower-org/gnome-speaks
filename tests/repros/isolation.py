@@ -177,7 +177,23 @@ def isolate_config(mod, scratch, pins=None):
     mod.CONFIG.clear()
     mod.CONFIG.update(baseline)
     isolate_spellbook(mod, scratch)
+    pretend_extension(mod)
     return baseline
+
+
+def pretend_extension(mod, present=True):
+    """Declare the GNOME Speaks extension present (or absent) to the module.
+
+    The extension is the master switch (JP, 2026-09-10): the service refuses to
+    listen, speak or type while `org.gnome.Speaks.Desktop` has no owner on the
+    session bus. No harness has a session bus, so without this every suite that
+    speaks or listens would measure the gate instead of what it was written to
+    measure. Set unconditionally: on a tree that predates the gate the two
+    attributes are simply unread. extension-gate is the one suite that flips
+    them per scenario.
+    """
+    mod._extension_present = bool(present)
+    mod.REQUIRE_EXTENSION = True
 
 
 def isolate_spellbook(mod, scratch):

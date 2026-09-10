@@ -70,8 +70,9 @@ flushes; `source` + `coalesce`/`kind:"progress"` drops that source's own
 unspoken backlog so agents never narrate stale status), `/skip` (optional
 `{"id":N}` scopes it to that item), `/stop` (drains queue), `/pause`,
 `/resume`, `/cast` (text seam into the spellbook — same gates as spoken casts),
-`/respeak` (`{"id":N}`; omit id = last spoken line), `GET /status`, `/queue`
-(pending + `source` + per-item outcomes: done/canceled/interrupted/error),
+`/respeak` (`{"id":N}`; omit id = last spoken line), `GET /status` (carries
+`extension`, see the master-switch gotcha), `/queue` (pending + `source` +
+per-item outcomes: done/canceled/interrupted/error/suppressed),
 `/voices`, `/chronicle` (`?limit&q&kind=you|spoken`, oldest-first),
 `/api/version` (realm-sigil contract).
 
@@ -122,6 +123,28 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 
 ## Key Gotchas
 
+- **The extension is the MASTER SWITCH -- with it disabled, nothing listens, speaks or types**
+  (JP, 2026-09-10: *"nothing should ever talk when the extension is disabled"*). Every actuator
+  lives in the service, and none of them used to need the extension: on 2026-09-10, with the
+  extension disabled, the wake model (streaming the room off a webcam mic) false-fired twice in
+  13 minutes, the persisted `continuous_dictation` flag turned each into an open mic, and a
+  private phone call was typed through ydotool for minutes -- no badge, no Loop pill, no
+  tap-to-stop, because the extension being off had removed every indicator and left every
+  actuator running. The instrument is the session-bus name `org.gnome.Speaks.Desktop`, which
+  extension.js owns in `enable()` and releases in `disable()` (and which vanishes with a shell
+  crash): `main()` watches it (`Gio.bus_watch_name` → `_extension_present`), and
+  `_extension_gate()` is the ONE verdict read by `start_listening()` (first statement, before
+  anything can spawn a recorder), the wake watcher (parked -- no mic, no LAN stream), `speak()`,
+  `talk()`, the queue dispatcher and `POST /speak`. An item that arrives while off is REFUSED
+  (`/speak` → 503, D-Bus → `error: …`) or DROPPED (queue outcome `suppressed`), never held -- a
+  burst of stale agent speech when the extension comes back is the coalescing rule's exact
+  anti-goal. Losing the name mid-session runs `stop()` (kill switch). `GET /status` carries
+  `extension: true|false`. `REQUIRE_EXTENSION` (env `GS_REQUIRE_EXTENSION=0`) is the seam for
+  headless installs; harnesses declare the extension present via `isolation.pretend_extension()`
+  so every other suite keeps measuring what it always measured. `tests/repros/extension-gate` and
+  wake-watcher case I enforce it. **A new path that opens the mic, plays audio or types must read
+  `_extension_gate()` first.** The Spiel provider (`org.gnome.Speaks.Speech.Provider`, opt-in, an
+  a11y seam for Orca) is deliberately NOT gated.
 - **IBus crash state is "no input method", not "the wrong one"**: measured on GNOME 50.1 — if the
   service dies between `SetGlobalEngine(ours)` and the restore, the global engine is left **empty**
   and the daemon does **not** auto-revert. On a desktop where the keymap comes from an IBus engine
