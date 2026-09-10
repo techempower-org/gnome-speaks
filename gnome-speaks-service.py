@@ -2798,6 +2798,16 @@ class GnomeSpeaksService:
         # above).
         if CONFIG.get("continuous_dictation", False) and not self._stop_event.is_set():
             if not user_text:
+                if self._wake_initiated:
+                    # A hands-free session loops only while it hears words.
+                    # The wake model has a false-positive rate (2026-09-10:
+                    # two in 13 minutes, off a webcam mic), and with the loop
+                    # flag persisted each one became an open mic that typed
+                    # the room until someone found a stop. Quiet closes the
+                    # mic; the Loop flag stays on for the hotkey.
+                    log.info("Wake session: quiet cycle, closing the mic "
+                             "(Loop stays on for the hotkey)")
+                    return
                 # Quiet cycle = the natural gap for starved queue items
                 # (agent messages, spell replies) to play before the mic
                 # reopens -- the same call the streaming loop makes on its
@@ -3289,7 +3299,11 @@ class GnomeSpeaksService:
                         # Default 7s causes ~8 restarts/min of silence, each with WS
                         # session re-init overhead. 60s keeps the session alive and
                         # responsive while burning near-zero resources in silence.
-                        no_speech_sec = 60.0 if is_loop else state.NO_SPEECH_TIMEOUT
+                        # A wake-opened loop gets the single-shot quiet window:
+                        # 60 s of open hands-free mic per silent cycle is the
+                        # 2026-09-10 runaway, one cycle at a time.
+                        no_speech_sec = (60.0 if is_loop and not self._wake_initiated
+                                         else state.NO_SPEECH_TIMEOUT)
                         max_no_speech = int(no_speech_sec * 1000 / FRAME_MS)
                         min_speech = int(state.MIN_SPEECH_DURATION * 1000 / FRAME_MS)
                         max_frames = int(MAX_LISTEN_SECONDS * 1000 / FRAME_MS)
@@ -3570,6 +3584,15 @@ class GnomeSpeaksService:
                 # working backend: the error streak (#117) is over.
                 if user_text or not cycle_errors:
                     error_cycles = 0
+                if (is_loop and not user_text and not cycle_errors
+                        and self._wake_initiated):
+                    # Hands-free session, clean silence: close the mic (see
+                    # _deliver_stt_result, the batch twin). Dropping is_loop
+                    # sends this cycle down the single-shot exits below --
+                    # "No speech detected", step 10 breaks. Error cycles keep
+                    # the #117 cap: bounded, and they name the route.
+                    _log("wake session: quiet cycle, closing the mic")
+                    is_loop = False
                 if (is_loop and not user_text and not _stopping()
                         and not recorder_dead.is_set()):
                     if live_typing and typed_partial[0]:

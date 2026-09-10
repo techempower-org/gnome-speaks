@@ -13,5 +13,6 @@ repro_c9_loop_error_cap.py
 repro_c10_batch_loop_silence.py
 repro_c11_loop_gap_busy.py
 repro_c12_shutdown_once.py
+repro_c13_wake_quiet.py
 smoke_queue_ops.py
 verify_queue_invariants.py
