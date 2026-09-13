@@ -5089,11 +5089,20 @@ class GnomeSpeaksService:
         until = self._quiet_next_boundary(now) or (now + datetime.timedelta(hours=24))
         self._quiet_override = (new, until)
         log.info("Quiet hours %s by override until %s", "ON" if new else "OFF",
-                 until.strftime("%H:%M"))
+                 self._fmt_until(until, now))
         return new
 
     def get_quiet_hours(self):
         return self.quiet_hours_active()
+
+    @staticmethod
+    def _fmt_until(t, now):
+        """HH:MM, prefixed with the weekday when it is not today -- an
+        override with no schedule lasts 24 h, and "until 21:17" alone reads
+        as a few minutes from now."""
+        if t.date() == now.date():
+            return t.strftime("%H:%M")
+        return t.strftime("%a %H:%M")
 
     def quiet_hours_info(self, now=None):
         """GET /status: the verdict and how it was reached."""
@@ -5106,10 +5115,10 @@ class GnomeSpeaksService:
                                                   end_min // 60, end_min % 60),
                 "override": self._quiet_override is not None}
         if self._quiet_override is not None:
-            info["override_until"] = self._quiet_override[1].strftime("%H:%M")
+            info["override_until"] = self._fmt_until(self._quiet_override[1], now)
         if active:
             end = self._quiet_override[1] if self._quiet_override else self._quiet_next_boundary(now)
-            info["until"] = end.strftime("%H:%M") if end else None
+            info["until"] = self._fmt_until(end, now) if end else None
         return info
 
     def _quiet_hours_refusal(self, now=None):
