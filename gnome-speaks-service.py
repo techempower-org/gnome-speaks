@@ -147,6 +147,10 @@ import speech_tts  # noqa: E402
 import inspect as _inspect  # noqa: E402
 # Older speech-to-cli has no stop_when on stt(); detect once, never guess.
 _STT_HAS_STOP_WHEN = "stop_when" in _inspect.signature(stt_dispatch).parameters
+# Live partials on the batch (VAD) route -- speech-to-cli re-transcribes the
+# utterance so far against Wyoming and calls back (2026-09-12). Absent on an
+# older tree: the batch path then behaves as before (final text only).
+_STT_HAS_PARTIAL_CB = "partial_cb" in _inspect.signature(stt_dispatch).parameters
 
 if HAS_VAD:
     import webrtcvad  # noqa: E402
@@ -2683,28 +2687,82 @@ class GnomeSpeaksService:
                 GLib.idle_add(self._emit_transcription_ready, "")
                 self._idle_after_stt()
                 return
+            # Live typing on the batch route (2026-09-12). With
+            # speech_backend=local EVERY dictation lands here, and until now
+            # this path delivered one final transcript after the utterance
+            # ended -- the badge's live transcript and typing-as-you-speak,
+            # both streaming-path features, silently did not exist on the
+            # local route. speech-to-cli now re-transcribes the utterance so
+            # far (stt_vad partial_cb) and each hypothesis goes where the
+            # streaming path sends its own: the throttled PartialTranscription
+            # signal (badge/subtitles) and the pinned backend's _LiveTyper.
+            # Same rules as the streaming cycle: dictation mode, not
+            # conversation, backend available, wake gate consulted ONCE before
+            # the first partial (#55); the backend is PINNED for the utterance
+            # (#46) and handed down so the final reconciles against what THIS
+            # backend typed.
+            inj = get_injector()
+            typed_partial = [""]
+            typer = None
+            partial_cb = None
+            if _STT_HAS_PARTIAL_CB and mode == "vad":
+                live_typing = (CONFIG.get("dictation_mode", True)
+                               and not CONFIG.get("conversation_mode", False)
+                               and inj.available()
+                               and not self._wake_gate_blocks())
+                use_lexical = CONFIG.get("terminal_mode", False)
+                if live_typing:
+                    typer = _LiveTyper(typed_partial, log.debug, inj)
+
+                def partial_cb(text, _typer=typer, _lex=use_lexical):
+                    shown = _terminal_lowercase(text) if _lex else text
+                    self._throttled_partial_transcription(shown)
+                    if _typer is not None:
+                        _typer.submit(shown)
             # stop_when: the dictation hotkey / a loop-mode badge tap sets
             # _stop_event, and the batch (VAD) recorder must FINISH on it --
             # keep the words, return -- not run on until silence or 30 s. The
             # cancel wire is deliberately not used here: that abandons (#110).
-            if _STT_HAS_STOP_WHEN:
-                result = stt_dispatch(mode=mode, stop_when=self._stop_event.is_set)
-            else:
-                result = stt_dispatch(mode=mode)
-            self._deliver_stt_result(result, mode, cancel_token)
+            kwargs = dict(stop_when=self._stop_event.is_set) if _STT_HAS_STOP_WHEN else {}
+            if partial_cb is not None:
+                kwargs["partial_cb"] = partial_cb
+            try:
+                result = stt_dispatch(mode=mode, **kwargs)
+            finally:
+                if typer is not None:
+                    typer.close()      # joins: typed_partial[0] is now stable
+            self._deliver_stt_result(result, mode, cancel_token, inj=inj,
+                                     typed_partial=typed_partial[0] if typer else None)
         except Exception as exc:
             log.exception("Batch STT (%s) failed: %s", mode, exc)
             self._stt_error_exit(mode, str(exc), cancel_token)
         finally:
             self._cancels.retire(cancel_token)
 
-    def _deliver_stt_result(self, result, mode, cancel_token):
+    def _deliver_stt_result(self, result, mode, cancel_token, inj=None,
+                            typed_partial=None):
         """Route one finished batch-STT result: spellbook, LLM, cursor, or
         clipboard, then idle/loop. Shared by the batch worker and the
-        streaming path's offline fallback."""
+        streaming path's offline fallback.
+
+        `inj` is the backend the worker pinned for this utterance; `typed_partial`
+        is what its _LiveTyper left on screen. Empty/None = nothing was live-typed
+        (no partial arrived, or no typer), and the final goes through commit()
+        exactly as before the seam.
+        Every exit that does not deliver text erases it; the dictation exit
+        reconciles it (replace_text, separator in loop mode, finalize) instead
+        of committing a second copy -- the streaming cycle's rules."""
+        if inj is None:
+            inj = get_injector()
+
+        def erase_live():
+            if typed_partial:
+                inj.send_backspaces(len(typed_partial))
+
         if cancel_token.cancelled or result.get("cancelled"):
             log.info("STT cancelled — transcript discarded (%d chars)",
                      len(result.get("text") or ""))
+            erase_live()
             GLib.idle_add(self._emit_transcription_ready, "")
             self._idle_after_stt()
             _schedule_warmup()
@@ -2720,6 +2778,7 @@ class GnomeSpeaksService:
         error = result.get("error")
         if error:
             log.error("Batch STT (%s) failed: %s", mode, error)
+            erase_live()
             self._stt_error_exit(mode, str(error), cancel_token)
             return
 
@@ -2733,6 +2792,7 @@ class GnomeSpeaksService:
         # error exit: a toast at once single-shot, the #117 cap in a loop.
         if result.get("status") == "NoAudio":
             log.error("Batch STT (%s): recorder produced no audio", mode)
+            erase_live()
             self._stt_error_exit(mode, "recorder produced no audio (microphone lost?)",
                                  cancel_token)
             return
@@ -2746,6 +2806,12 @@ class GnomeSpeaksService:
 
         # Spell incantations ("cast …") short-circuit typing/LLM routing;
         # matched on the raw transcript before punctuation substitution.
+        if user_text and typed_partial and self._is_cast(user_text):
+            # A spoken incantation was live-typed while it was being said:
+            # take it back before it runs, or "cast loop" leaves "cast loop"
+            # in the field.
+            erase_live()
+            typed_partial = None
         if user_text and self._try_cast(user_text):
             GLib.idle_add(self._emit_transcription_ready, user_text)
             self._idle_after_stt()
@@ -2767,12 +2833,28 @@ class GnomeSpeaksService:
                 return
 
             if CONFIG.get("dictation_mode", True):
-                if not self._wake_gate_blocks():
-                    get_injector().commit(user_text)
+                if self._wake_gate_blocks():
+                    erase_live()   # the gate refused at session start; nothing was typed
+                elif typed_partial:
+                    # Something was live-typed: reconcile it with the final,
+                    # never type a second copy -- fix the divergent tail, then the loop's
+                    # separator (a pre-edit backend restores its own between
+                    # commits), then make the live text stick (#45 -- on IBus
+                    # it is a volatile pre-edit that end() would discard).
+                    if typed_partial != user_text:
+                        inj.replace_text(typed_partial, user_text)
+                    if (CONFIG.get("continuous_dictation", False)
+                            and not inj.supports_preedit()):
+                        inj.type_text(" ")
+                    inj.finalize(user_text)
+                else:
+                    inj.commit(user_text)
             else:
+                erase_live()
                 clipboard_write(user_text)
         else:
             log.info("No speech detected (%s)", mode)
+            erase_live()
             GLib.idle_add(self._emit_transcription_ready, "")
 
         self._idle_after_stt()
@@ -4703,6 +4785,13 @@ class GnomeSpeaksService:
         if mtimes != self._spellbook_mtimes:
             self._spellbook = spellbook.load_spellbook(*self._spellbook_paths)
             self._spellbook_mtimes = mtimes
+
+    def _is_cast(self, text):
+        """Would _try_cast consume `text`? Same matcher, no side effects --
+        the batch path asks BEFORE casting so a live-typed incantation can be
+        retracted while the field that received it still has focus."""
+        self._maybe_reload_spellbook()
+        return spellbook.match(text, self._spellbook)[0] != "miss"
 
     def _try_cast(self, text):
         """Route 'cast …' utterances to the spellbook. True = consumed
