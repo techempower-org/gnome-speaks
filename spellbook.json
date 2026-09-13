@@ -209,6 +209,19 @@
         "op": "injection_toggle"
       },
       "gate": "instant"
+    },
+    {
+      "name": "quiet-hours",
+      "patterns": [
+        "quiet hours",
+        "hush the agents",
+        "night watch"
+      ],
+      "action": {
+        "type": "dbus_self",
+        "op": "quiet_hours_toggle"
+      },
+      "gate": "instant"
     }
   ]
 }

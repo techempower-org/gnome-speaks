@@ -14,7 +14,7 @@ Two-process design connected by session D-Bus (`org.gnome.Speaks`):
 | `injector.py` | imported by the service | The `Injector` seam: the contract both injection backends implement | ~120 |
 | `ibus_injector.py` | imported by the service | `IbusInjector` — text injection as an IBus engine (D-Bus commits, preedit, crash recovery) | ~660 |
 | `spellbook.py` | imported by the service | Incantation matcher + executor ("cast …" → local actions); denylist | ~390 |
-| `spellbook.json` | data | 15 repo spells (self-control); user overlay at `~/.config/speech-to-cli/spellbook.json` (seam: `spellbook.USER_SPELLBOOK_PATH` / env `GS_SPELLBOOK_USER_PATH`) merges + hot-reloads | — |
+| `spellbook.json` | data | 16 repo spells (self-control); user overlay at `~/.config/speech-to-cli/spellbook.json` (seam: `spellbook.USER_SPELLBOOK_PATH` / env `GS_SPELLBOOK_USER_PATH`) merges + hot-reloads | — |
 | `spiel_provider.py` | imported by the service | Spiel/libspiel synthesis side (`org.gnome.Speaks.Speech.Provider`); off unless `spiel_provider` | ~120 |
 | `prefs.js` | GNOME Extensions app (GJS/Gtk4) | 6-page preferences window (task-first redesign, #5e49049) | ~1,540 |
 | `stylesheet.css` | GNOME Shell | Badge states, pills, animations, subtitle overlay, chronicle scroll | ~560 |
@@ -74,13 +74,21 @@ unspoken backlog so agents never narrate stale status), `/skip` (optional
 `extension`, see the master-switch gotcha), `/queue` (pending + `source` +
 per-item outcomes: done/canceled/interrupted/error/suppressed),
 `/voices`, `/chronicle` (`?limit&q&kind=you|spoken`, oldest-first),
-`/api/version` (realm-sigil contract).
+`/api/version` (realm-sigil contract). **Quiet hours** (2026-09-12): inside the
+configured window (`quiet_hours`, `quiet_hours_start`/`_end` HH:MM local, overnight
+allowed, off by default; prefs → Voice & Sound) `POST /speak` answers **503** naming
+the window and its end -- agent speech only; the user's own dictation, D-Bus `Speak`,
+spell replies, `/cast` and `/respeak` are exempt, and items already queued at the
+boundary are left alone (ingress gate). `GET /status` carries `quiet` {active, enabled,
+scheduled, window, override, until}. "cast quiet hours" / the panel switch /
+D-Bus `ToggleQuietHours` force the opposite verdict until the next scheduled boundary
+(24 h with no schedule); `GetQuietHours` reads it. `tests/repros/quiet-hours`.
 
 ## D-Bus Interface
 
 Bus name: `org.gnome.Speaks` | Path: `/org/gnome/Speaks`
 
-Key methods: `StartListening`, `StopListening`, `Speak(text)`, `SpeakClipboard`, `SpeakSelection`, `Talk(text)`, `Stop`, `GetState`, `GetChronicle(limit)` (`limit<=0` → 20), `Respeak(id)` (`0` → last spoken)
+Key methods: `StartListening`, `StopListening`, `Speak(text)`, `SpeakClipboard`, `SpeakSelection`, `Talk(text)`, `Stop`, `GetState`, `GetChronicle(limit)` (`limit<=0` → 20), `Respeak(id)` (`0` → last spoken), `ToggleQuietHours`/`GetQuietHours`
 
 Second bus name when `spiel_provider` is enabled: `org.gnome.Speaks.Speech.Provider` (`org.freedesktop.Speech.Provider`, see `spiel_provider.py`).
 
@@ -112,6 +120,7 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 | Speech backend | `speech_backend`: `azure` (default) or `local`. Local = the Wyoming server (Piper TTS / Parakeet STT) is PRIMARY and Azure is the fallback: a Wyoming failure trips a 60 s *local* breaker (`wyoming.mark_local_down`) and that session uses Azure; Azure failures trip the existing Azure breaker the other way. `SPEECH_FORCE_OFFLINE=1` still forces offline with NO Azure fallback -- it is an env override for tests, not a setting; a leftover drop-in forced JP offline for weeks (#104). `wyoming.skip_reason()` names the route (`forced` / `prefer_local` / `azure_down`); the service logs it and `GET /status` carries it under `speech`. **Live transcript + live typing work on the local route too** (2026-09-12): the LAN recognizer has no streaming protocol, so speech-to-cli's `stt(partial_cb=)` re-transcribes the utterance so far every 400 ms of speech (one request in flight, 2.5 s timeout; measured 0.15–0.26 s per request on Parakeet TDT 0.6B) and `_batch_stt_worker` feeds each hypothesis to the throttled PartialTranscription signal and a `_LiveTyper` on the PINNED backend; `_deliver_stt_result(inj=, typed_partial=)` reconciles the final (replace_text → loop separator → finalize) or erases on cancel/error/cast/silence. Guarded by `_STT_HAS_PARTIAL_CB` (older speech-to-cli → final text only). `service-audit/repro_c14_vad_live_partials.py` + speech-to-cli `tests/repros/vad_partials.py` |
 | Injection | How text reaches the cursor. `injection_method`: `ydotool` (default, synthesizes keys, learns nothing about the target) · `ibus` (D-Bus commits, no stuck keys, sees the content-type the app declares — so it can skip a declared password/PIN field, never an undeclared one) · `auto` (ibus when reachable). Falls back to ydotool for every failure, never to nothing |
 | Spellbook | "cast …"/"invoke …" transcripts run local spells (never typed/LLM'd); `POST /cast` is the text seam. The `assist` action's HA token comes from `HA_TOKEN` → `CONFIG["ha_token_cache"]` (file) → `CONFIG["ha_token_item"]` (`bw get password`), both empty by default (#129) — never hard-code a vault item or cache path |
+| Quiet hours | Scheduled window in which agent speech (`POST /speak`) is refused with 503; the user's own voice is never muted. Override: "cast quiet hours" / panel switch, until the next boundary. See the HTTP API paragraph above |
 | Chronicle | Not a mode -- always-on ledger of both directions; 📜 badge rune (8 lines) + panel submenu (12), click to respeak. Spells: "cast echo" / "chronicle" / "seal the chronicle" |
 
 ## Coding Conventions

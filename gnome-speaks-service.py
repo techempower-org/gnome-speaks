@@ -21,6 +21,7 @@ HTTP session pooling, VAD, energy-gated silence detection.
 
 import argparse
 import http.server
+import datetime
 import json
 import logging
 import os
@@ -251,6 +252,12 @@ INTROSPECTION_XML = """
     </method>
     <method name="GetHandsFree">
       <arg direction="out" type="b" name="enabled"/>
+    </method>
+    <method name="ToggleQuietHours">
+      <arg direction="out" type="b" name="active"/>
+    </method>
+    <method name="GetQuietHours">
+      <arg direction="out" type="b" name="active"/>
     </method>
     <method name="ToggleTerminalMode">
       <arg direction="out" type="b" name="enabled"/>
@@ -1238,6 +1245,43 @@ def _extension_gate():
     return None if _desktop_present() else EXTENSION_OFF
 
 
+# ---------------------------------------------------------------------------
+# Quiet hours (JP, 2026-09-12): a scheduled window in which AGENT speech --
+# POST /speak -- is refused at the door with 503, the same "never 200 and
+# then silence" contract as the extension gate. Everything the user does
+# themself (dictation, D-Bus Speak, spell replies, AI answers, /cast,
+# /respeak) is exempt: the user is present and asking. Items already in the
+# queue at the boundary are left alone -- the gate is ingress only. The
+# window is HH:MM local and may cross midnight; start is inclusive, end is
+# exclusive; start == end is an empty window.
+# ---------------------------------------------------------------------------
+QUIET_HOURS_DEFAULT_START = "22:00"
+QUIET_HOURS_DEFAULT_END = "08:00"
+
+
+def _parse_hhmm(value, default):
+    """'HH:MM' -> minutes since midnight; anything unparsable -> `default`
+    (itself parsed), so a typo in prefs degrades to the default window and
+    never to an exception at request time."""
+    for cand in (value, default):
+        try:
+            hh, mm = str(cand).strip().split(":")
+            hh, mm = int(hh), int(mm)
+            if 0 <= hh < 24 and 0 <= mm < 60:
+                return hh * 60 + mm
+        except (ValueError, AttributeError):
+            continue
+    return 0
+
+
+def _in_window(now_min, start_min, end_min):
+    if start_min == end_min:
+        return False
+    if start_min < end_min:
+        return start_min <= now_min < end_min
+    return now_min >= start_min or now_min < end_min       # overnight
+
+
 def _speech_ready(need_azure=False):
     """Can the service speak or listen right now? None = yes, else the words
     for what is actually missing.
@@ -2094,6 +2138,7 @@ class GnomeSpeaksService:
         self._inactivity_source_id = None
         self._inactivity_lock = threading.Lock()
         self._inactivity_gen = 0
+        self._quiet_override = None    # (forced: bool, until: datetime) or None
         self._main_loop = None
 
         # DBus connection (set after registration)
@@ -2217,6 +2262,9 @@ class GnomeSpeaksService:
         # user cannot type.
         "injection_method",
         "speed", "pitch", "volume", "chronicle", "wake_word_secure_gate",
+        # Quiet hours: a bool and two HH:MM STRINGS (applied verbatim), read
+        # at request time by quiet_hours_active(); prefs edits land live.
+        "quiet_hours", "quiet_hours_start", "quiet_hours_end",
         # Home Assistant token source for the spellbook's `assist` action
         # (#129): two STRINGS, applied verbatim, read at cast time by
         # _get_ha_token().
@@ -4561,6 +4609,14 @@ class GnomeSpeaksService:
         elif op == "wake_word_toggle":
             new = self._toggle_config_flag("wake_word")
             return "The waking watch is %s." % ("on" if new else "off")
+        elif op == "quiet_hours_toggle":
+            new = self.toggle_quiet_hours()
+            until = self.quiet_hours_info().get("override_until")
+            if new:
+                return ("Quiet hours begin — the agents hold their tongues"
+                        + (" until %s." % until if until else "."))
+            return ("Quiet hours lifted — the agents may speak"
+                    + (" until %s." % until if until else "."))
         elif op == "thinking_toggle":
             new = self._toggle_config_flag("llm_thinking")
             if new:
@@ -4981,6 +5037,91 @@ class GnomeSpeaksService:
 
     def get_conversation_mode(self):
         return CONFIG.get("conversation_mode", False)
+
+    # -- Quiet hours ---------------------------------------------------------
+
+    def _quiet_window(self):
+        """(enabled, start_min, end_min) from CONFIG, tolerant of bad input."""
+        return (bool(CONFIG.get("quiet_hours", False)),
+                _parse_hhmm(CONFIG.get("quiet_hours_start"), QUIET_HOURS_DEFAULT_START),
+                _parse_hhmm(CONFIG.get("quiet_hours_end"), QUIET_HOURS_DEFAULT_END))
+
+    def _quiet_next_boundary(self, now):
+        """The next scheduled start or end after `now` (a datetime), or None
+        when the schedule is off -- the moment a manual override expires."""
+        enabled, start_min, end_min = self._quiet_window()
+        if not enabled or start_min == end_min:
+            return None
+        base = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        cands = []
+        for day in (0, 1):
+            for m in (start_min, end_min):
+                t = base + datetime.timedelta(days=day, minutes=m)
+                if t > now:
+                    cands.append(t)
+        return min(cands)
+
+    def quiet_hours_scheduled(self, now=None):
+        """Is `now` inside the configured window? Ignores any override."""
+        now = now or datetime.datetime.now()
+        enabled, start_min, end_min = self._quiet_window()
+        return enabled and _in_window(now.hour * 60 + now.minute, start_min, end_min)
+
+    def quiet_hours_active(self, now=None):
+        """The verdict POST /speak reads: a live manual override wins until
+        the next scheduled boundary (or 24 h when there is no schedule);
+        otherwise the schedule."""
+        now = now or datetime.datetime.now()
+        ov = self._quiet_override
+        if ov is not None:
+            forced, until = ov
+            if now < until:
+                return forced
+            self._quiet_override = None
+        return self.quiet_hours_scheduled(now)
+
+    def toggle_quiet_hours(self, now=None):
+        """The 'cast quiet hours' spell and the panel switch: force the
+        opposite of the current verdict until the next boundary. Returns the
+        NEW verdict."""
+        now = now or datetime.datetime.now()
+        new = not self.quiet_hours_active(now)
+        until = self._quiet_next_boundary(now) or (now + datetime.timedelta(hours=24))
+        self._quiet_override = (new, until)
+        log.info("Quiet hours %s by override until %s", "ON" if new else "OFF",
+                 until.strftime("%H:%M"))
+        return new
+
+    def get_quiet_hours(self):
+        return self.quiet_hours_active()
+
+    def quiet_hours_info(self, now=None):
+        """GET /status: the verdict and how it was reached."""
+        now = now or datetime.datetime.now()
+        enabled, start_min, end_min = self._quiet_window()
+        active = self.quiet_hours_active(now)
+        info = {"active": active, "enabled": enabled,
+                "scheduled": self.quiet_hours_scheduled(now),
+                "window": "%02d:%02d-%02d:%02d" % (start_min // 60, start_min % 60,
+                                                  end_min // 60, end_min % 60),
+                "override": self._quiet_override is not None}
+        if self._quiet_override is not None:
+            info["override_until"] = self._quiet_override[1].strftime("%H:%M")
+        if active:
+            end = self._quiet_override[1] if self._quiet_override else self._quiet_next_boundary(now)
+            info["until"] = end.strftime("%H:%M") if end else None
+        return info
+
+    def _quiet_hours_refusal(self, now=None):
+        """None when agent speech may be enqueued, else the 503 words."""
+        now = now or datetime.datetime.now()
+        if not self.quiet_hours_active(now):
+            return None
+        info = self.quiet_hours_info(now)
+        until = info.get("until")
+        return ("quiet hours%s -- agent speech is muted%s; use a durable channel"
+                % (" (%s)" % info["window"] if info["enabled"] else " (manual)",
+                   " until %s" % until if until else ""))
 
     def get_hands_free(self):
         conv = CONFIG.get("conversation_mode", False)
@@ -5949,12 +6090,12 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
 
         # Reject up front rather than enqueueing items doomed to fail —
         # a service that cannot speak must not answer 200 and then say nothing.
-        missing = _speech_ready() or _extension_gate()
+        svc = self.service
+        missing = _speech_ready() or _extension_gate() or svc._quiet_hours_refusal()
         if missing:
             self._send_error_json(503, missing)
             return
 
-        svc = self.service
         # Per-item overrides travel inside the TTSQueueItem — no service-global
         # swaps, so overlapping requests can't race. Voice is an Azure ShortName
         # (e.g. en-US-JennyNeural), sanitized downstream in _prepare_tts.
@@ -6256,6 +6397,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             "state": current, "paused": paused,
             "speech": route,
             "extension": _desktop_present(),
+            "quiet": svc.quiet_hours_info(),
             "queue_depth": svc._tts_queue.qsize()}
         if progress is not None:
             result["progress"] = progress
@@ -6366,6 +6508,14 @@ class DBusHandler:
 
             elif method_name == "ToggleHandsFree":
                 result = self.service.toggle_hands_free()
+                invocation.return_value(GLib.Variant("(b)", (result,)))
+
+            elif method_name == "ToggleQuietHours":
+                result = self.service.toggle_quiet_hours()
+                invocation.return_value(GLib.Variant("(b)", (result,)))
+
+            elif method_name == "GetQuietHours":
+                result = self.service.get_quiet_hours()
                 invocation.return_value(GLib.Variant("(b)", (result,)))
 
             elif method_name == "GetContinuousDictation":
