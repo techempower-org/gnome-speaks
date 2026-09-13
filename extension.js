@@ -92,6 +92,12 @@ const DBUS_XML = `
     <method name="GetContinuousDictation">
       <arg direction="out" type="b" name="enabled"/>
     </method>
+    <method name="ToggleQuietHours">
+      <arg direction="out" type="b" name="active"/>
+    </method>
+    <method name="GetQuietHours">
+      <arg direction="out" type="b" name="active"/>
+    </method>
     <method name="GetConversationMode">
       <arg direction="out" type="b" name="enabled"/>
     </method>
@@ -1487,6 +1493,17 @@ export default class GnomeSpeaksExtension extends Extension {
 
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Voice & Audio'));
 
+        // Quiet hours: agent speech (POST /speak) refused; your own voice is
+        // not. The switch is the manual override -- it forces the verdict
+        // until the next scheduled boundary. Programmatic sync goes through
+        // _setSwitchQuietly (setToggleState fires `toggled` on GNOME 50, #98).
+        this._menuQuietHoursToggle = new PopupMenu.PopupSwitchMenuItem('Quiet Hours (agents muted)', false);
+        this._menuQuietHoursToggle.connect('toggled', () => {
+            if (this._quietSwitch) return;
+            this._callMethod('ToggleQuietHours');
+        });
+        menu.addMenuItem(this._menuQuietHoursToggle);
+
         this._voiceQuality = 'fast';
         this._menuVoiceQualityItem = new PopupMenu.PopupMenuItem('Voice: HD');
         this._menuVoiceQualityItem.connect('activate', () => this._toggleVoiceQuality());
@@ -1646,6 +1663,7 @@ export default class GnomeSpeaksExtension extends Extension {
             this._menuStopItem = null;
             this._menuBadgeToggle = null;
             this._menuContinuousToggle = null;
+            this._menuQuietHoursToggle = null;
             this._menuConversationToggle = null;
             this._menuVoiceQualityItem = null;
             this._menuAudioInfoItem = null;
@@ -2028,6 +2046,13 @@ export default class GnomeSpeaksExtension extends Extension {
                 this._setSwitchQuietly(this._menuContinuousToggle, this._continuousMode);
             }
         });
+        if (this._proxy.GetQuietHoursRemote) {
+            this._proxy.GetQuietHoursRemote((result, error) => {
+                if (this._destroyed || !this._proxy || !this._menuQuietHoursToggle) return;
+                if (!error && result)
+                    this._setSwitchQuietly(this._menuQuietHoursToggle, result[0]);
+            });
+        }
         this._proxy.GetTerminalModeRemote((result, error) => {
             if (this._destroyed || !this._proxy) return;
             if (!error && result) {

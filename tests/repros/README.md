@@ -143,6 +143,7 @@ The table is **generated** from `tests/repros/*/BASELINE.md` by
 | `offline-handoff` | #49 / #70 | `70ff468` | **verified** — pre-#70 *and* pre-#72 |
 | `pin-lifecycle` | #46 ×#57 | `15dd402` | compound X: X1 FAIL, X2 PASS, X3 FAIL |
 | `prefs-rig` | #82 | merge base of the branch | more warnings than baseline = fail |
+| `quiet-hours` | quiet hours feature (2026-09-12) | `c1f16f0` | **verified** — the tree has no `quiet_hours_active()`; reported as the failure without running the HTTP checks |
 | `sentence-split` | #154 | `5dde4b4` | **verified** — s1 fails (2 synthesis calls: `Beta two follows.Gamma three ends.` spoken and subtitled as one); s2 fails 7 of 13 rows — the issue's `. ` token, two boundaries in one token, `
 `, double space, `!`/`?`, an ellipsis, `e.g.` — every shape where the buffer ends in `[.!?]` + whitespace with a second boundary before it. Guards green on both sides: tokenizer-shaped tokens, `3.5`, fullwidth punctuation (not a boundary, unchanged), no terminal punctuation |
 | `service-audit` | #18–#20, #110, #124 (c8 config-watch), #130 | `7899ccb` | derived (`merge^1`), not re-run; c8 batch-error-toast verified against `025df92` (E1 fails) |

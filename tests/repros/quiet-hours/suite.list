@@ -1,0 +1,4 @@
+# quiet-hours (2026-09-12): agent speech refused inside a scheduled window;
+# one process, fixed clocks for the window/override math, a real clock window
+# for the HTTP checks.
+quiet: repro_quiet_hours.py

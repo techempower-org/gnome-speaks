@@ -437,6 +437,19 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
             ['x-loud', 'Extra Loud'],
         ], 'default');
 
+        // ── Quiet Hours ──
+        const quietGroup = new Adw.PreferencesGroup({
+            title: 'Quiet Hours',
+            description: 'Agents posting to the speech queue are refused (HTTP 503) inside this window. Your own dictation, spells and AI replies are never muted. Say "cast quiet hours" or use the panel switch to override until the next boundary.',
+        });
+        page.add(quietGroup);
+        this._addSwitchRow(quietGroup, 'Mute Agent Speech on a Schedule',
+            'Local time; the window may cross midnight', 'quiet_hours', false);
+        this._addEntryRow(quietGroup, 'Quiet From (HH:MM)', 'quiet_hours_start', '22:00',
+            'Start of the quiet window, 24-hour local time (inclusive)');
+        this._addEntryRow(quietGroup, 'Quiet Until (HH:MM)', 'quiet_hours_end', '08:00',
+            'End of the quiet window, 24-hour local time (exclusive)');
+
         // ── Subtitles — ONE switch, both layers ──
         const subGroup = new Adw.PreferencesGroup({title: 'Subtitles'});
         page.add(subGroup);
