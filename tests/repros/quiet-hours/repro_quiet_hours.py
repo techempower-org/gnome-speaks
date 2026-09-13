@@ -133,8 +133,8 @@ def main():
     new = svc.toggle_quiet_hours(now=t)
     info = svc.quiet_hours_info(t)
     check("Q3", new is False and not svc.quiet_hours_active(t) and info["override"]
-          and info["override_until"] == "08:00",
-          f"toggle inside the window -> off until the scheduled end (info={info})")
+          and info["override_until"] == "Wed 08:00",
+          f"toggle inside the window -> off until the scheduled end, next day named (info={info})")
     check("Q3", not svc.quiet_hours_active(T(7, 59, day=2)) and not svc.quiet_hours_active(T(8, 1, day=2))
           and svc._quiet_override is None,
           "override holds to 07:59, expires at 08:00, then the schedule (now outside) applies")
@@ -155,6 +155,8 @@ def main():
     window(False, "22:00", "08:00")
     t = T(12)
     new = svc.toggle_quiet_hours(now=t)
+    until = svc.quiet_hours_info(t).get("until")
+    check("Q4", until == "Wed 12:00", f"a next-day end names the weekday (until={until!r})")
     check("Q4", new is True and svc.quiet_hours_active(t + dt.timedelta(hours=23))
           and not svc.quiet_hours_active(t + dt.timedelta(hours=25)),
           "schedule off: override lasts 24 h")
