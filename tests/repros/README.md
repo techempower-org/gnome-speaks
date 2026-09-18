@@ -125,6 +125,7 @@ The table is **generated** from `tests/repros/*/BASELINE.md` by
 | suite | issue / PR | baseline | expected there |
 |---|---|---|---|
 | `begin-refused` | #79 / #84 | `15dd402`, `f290d7e` | j, k fail — **l stays green on both sides** |
+| `call-mute` | video-call mute (2026-09-18) | `fb3e2a5` | **verified** — the tree has no `_call_muted()`; reported as the failure. Wake-watcher case J fails there too (armed + idle + on a call spawns and streams) |
 | `cancel-tokens` | #21 / #33 | `66edc79` | **verified** — 4 of 5 fail |
 | `cancel-tokens` `repro_e` | #132 | `025df92` | **verified** — E1, E3 fail; E2 stays green on both sides |
 | `cancel-tokens` `repro_f` | #132 / PR #146 review | `fd5c8cd` (PR head before revision), `0e014cc` | **verified** — F1 43/126 and 51/300 dictations hit, F2 1/1; 0/101 and clean with the fix. F1 lowers `sys.setswitchinterval` (GS_RACE_SWITCH, default 1e-5) — at CPython's 5 ms default it scored 0/300 on the unfixed tree |
@@ -161,6 +162,7 @@ The table is **generated** from `tests/repros/*/BASELINE.md` by
 | `version-cache` | #53 / #85 | two-sided, below | `577a05f` passes, `7eaeb02` fails |
 | `wake-watcher` | #41, #48 / #121, #137 | `11c8f60`, `a20afea` | **verified** — pre-#41 `11c8f60`: B fails (25-spawn storm, zero sleeps). Pre-#137 `a20afea`: G fails (second recorder after 10 s of fake time, not 0.5) and H fails (a WARNING and a 10 s sleep logged *during shutdown* — the very lines #137 misread as start-time failures); B, C, F fail there too because they assert the bounded ramp before the unchanged 10 s / 60 s steady cadence. A, D, E green on every side. The fake `time.sleep` is scoped to the watcher thread by identity — the constructor also starts `tts-queue-dispatcher`, whose 0.2 s hold-polls were being recorded and stopped (A doubles as that guard: ~240 ms window, dispatcher must survive) |
 | `wake-watcher` case I | extension master switch (2026-09-10) | `eb18627` | **verified** — I fails: armed + idle + no `org.gnome.Speaks.Desktop` owner spawns a recorder and calls `detect_stream`. A–H unchanged |
+| `wake-watcher` case J | video-call mute (2026-09-18) | `fb3e2a5` | **verified** — J fails: armed + idle + `mute_on_call` + a foreign mic holder spawns a recorder and calls `detect_stream`. A–I unchanged |
 <!-- END GENERATED: baselines -->
 
 Two suites are bash and ignore `GS_SVC_PATH`, so pointing the runner at an

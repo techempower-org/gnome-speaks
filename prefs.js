@@ -450,6 +450,15 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
         this._addEntryRow(quietGroup, 'Quiet Until (HH:MM)', 'quiet_hours_end', '08:00',
             'End of the quiet window, 24-hour local time (exclusive)');
 
+        // ── Calls ──
+        const callGroup = new Adw.PreferencesGroup({
+            title: 'Video Calls',
+            description: 'A call is detected when another app holds the microphone or the camera. While it lasts nothing is spoken: agent speech waits in the queue, your own Speak, spell replies and AI answers are refused, and the wake word stays off. Hotkey dictation still types.',
+        });
+        page.add(callGroup);
+        this._addSwitchRow(callGroup, 'Mute All Speech During Video Calls',
+            'Checked every 2 seconds; GET /status shows the detected app under "call"', 'mute_on_call', true);
+
         // ── Subtitles — ONE switch, both layers ──
         const subGroup = new Adw.PreferencesGroup({title: 'Subtitles'});
         page.add(subGroup);

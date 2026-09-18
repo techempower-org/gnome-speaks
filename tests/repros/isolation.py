@@ -61,6 +61,8 @@ CONFIG_PINS = {
     "phrase_list": [],
     "wyoming_host": "",             # no LAN fallback from a test
     "chronicle": False,             # chronicle-perf overrides this to True
+    "mute_on_call": False,          # the call watcher polls the REAL desktop; a
+                                    # live call must never mute a repro's speech
 }
 
 REAL_STATE = os.path.join(os.path.expanduser("~/.local/state"), "gnome-speaks")
