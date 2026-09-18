@@ -22,6 +22,7 @@ wiring in `__init__` is covered too.
   G  first recorder dies, second healthy              -> armed < 2 s of fake time, NO warning   #137
   H  shutdown mid-stream shutdown() then recorder EOF -> thread exits: no sleep, no warning    #137
   I  extension absent   armed, idle, no Desktop name -> zero Popen, zero detect (master switch)
+  J  on a call          armed, idle, mute_on_call + a foreign mic holder -> zero Popen, zero detect
 
 #137 in one line: every "recorder produced no audio (rc=1) (retrying every
 10s)" in three days of journal was logged by the OLD pid 0.5 s into
@@ -485,8 +486,40 @@ def case_i():
     ])
 
 
+def case_j():
+    """Call mute (2026-09-18): armed and idle but another app holds the mic --
+    the watcher must not spawn: a false positive would open dictation INTO
+    the call (the 2026-09-10 runaway typed a phone call). mute_on_call is
+    pinned off by the harness; this case turns it on and plants the call."""
+    stop_after = 40
+    rig = Rig(KilledLiveProc)
+    rig.set_state("idle")
+    rig.mod.CONFIG["mute_on_call"] = True
+    if not hasattr(rig.svc, "_on_call"):
+        return report("J on a call -> parked, zero spawns",
+                      [(False, "this tree has no call mute (_on_call)")])
+    # Through the detector, not the flag: the real call-watcher thread polls
+    # every CALL_POLL_SECONDS and overwrites a planted _on_call.
+    rig.svc._probe_call = lambda: ("brave", "microphone")
+    deadline = time.monotonic() + 6.0
+    while rig.svc._on_call is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if rig.svc._on_call is None:
+        print("!! SETUP FAILURE: call watcher never saw the planted call"); return 2
+    rig.detect = lambda host, port, model, chunks: "test_model"
+    if not rig.arm(stop_after=stop_after):
+        return 2
+    print(f"  sleeps={len(rig.ftime.sleeps)} spawns={len(rig.procs)} "
+          f"detects={rig.detects} starts={rig.starts}")
+    return report("J on a call -> parked, zero spawns", [
+        (len(rig.procs) == 0, f"no pw-record spawned during a call (got {len(rig.procs)})"),
+        (rig.detects == 0, f"detect_stream never called (got {rig.detects})"),
+        (rig.starts == [], f"start_listening never called (got {rig.starts})"),
+    ])
+
+
 CASES = {"A": case_a, "B": case_b, "C": case_c, "D": case_d, "E": case_e, "F": case_f,
-         "G": case_g, "H": case_h, "I": case_i}
+         "G": case_g, "H": case_h, "I": case_i, "J": case_j}
 
 
 def main():

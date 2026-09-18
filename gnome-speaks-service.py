@@ -1282,6 +1282,80 @@ def _in_window(now_min, start_min, end_min):
     return now_min >= start_min or now_min < end_min       # overnight
 
 
+# ---------------------------------------------------------------------------
+# Call mute (JP, 2026-09-18): "nothing should ever speak when I'm on a video
+# call". A call has a footprint this desktop can see without asking any app:
+# another process holds a MICROPHONE capture stream (PipeWire, read through
+# `pactl list source-outputs`) or a CAMERA device (/dev/video*, read through
+# /proc/*/fd). Either one means speech from this service would go down the
+# call. Measured 2026-09-18: pactl answers in ~0 ms, pw-dump in 20 ms; GNOME
+# Settings' sound panel holds a "Peak detect" capture stream, so a bare
+# "someone has the mic" rule misfires -- hence the ignore list, plus the
+# service's own recorders (pw-record in this unit's cgroup). The rule fails
+# TOWARD quiet: an unknown app with the mic counts as a call. Unlike quiet
+# hours this mutes EVERYTHING that would play -- the queue is HELD (agent
+# items wait for the call to end, new POSTs get 503), the user's own Speak,
+# spell replies, Talk and AI replies are refused, the wake watcher parks --
+# because the other end of the call hears all of them. Hotkey dictation
+# still works: it types, it does not speak. Preference `mute_on_call`,
+# default ON.
+# ---------------------------------------------------------------------------
+CALL_POLL_SECONDS = 2.0
+CALL_IGNORE_BINARIES = frozenset({
+    "gnome-control-center",   # Sound panel "Peak detect" level meter
+    "pw-record", "pw-cat", "pw-play", "pw-loopback", "parecord", "parec",
+    "pactl", "pavucontrol", "pipewire", "wireplumber", "pipewire-pulse",
+    "speech-dispatcher", "gsd-media-keys",
+})
+
+
+def _parse_source_outputs(text):
+    """`pactl list source-outputs` -> [{"binary","name","pid","corked"}]."""
+    streams, cur = [], None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("Source Output #"):
+            cur = {"binary": "", "name": "", "pid": 0, "corked": False}
+            streams.append(cur)
+            continue
+        if cur is None:
+            continue
+        if line.startswith("Corked:"):
+            cur["corked"] = line.split(":", 1)[1].strip().lower() == "yes"
+        elif " = " in line:
+            key, val = line.split(" = ", 1)
+            val = val.strip().strip('"')
+            if key == "application.process.binary":
+                cur["binary"] = val
+            elif key == "application.name":
+                cur["name"] = val
+            elif key == "application.process.id":
+                try:
+                    cur["pid"] = int(val)
+                except ValueError:
+                    pass
+    return streams
+
+
+def _pid_in_own_unit(pid):
+    """Is `pid` inside THIS service's cgroup (our recorders, the wake watcher's
+    pw-record)? False on any doubt."""
+    try:
+        with open("/proc/%d/cgroup" % pid) as f:
+            return "gnome-speaks.service" in f.read()
+    except Exception:
+        return False
+
+
+def _call_ignored(binary, name, pid):
+    b = (binary or name or "").strip()
+    if not b:
+        return True
+    if b in CALL_IGNORE_BINARIES or b.startswith("pw-") or b.startswith("sd_"):
+        return True
+    return bool(pid) and (pid == os.getpid() or _pid_in_own_unit(pid))
+
+
 def _speech_ready(need_azure=False):
     """Can the service speak or listen right now? None = yes, else the words
     for what is actually missing.
@@ -2139,6 +2213,7 @@ class GnomeSpeaksService:
         self._inactivity_lock = threading.Lock()
         self._inactivity_gen = 0
         self._quiet_override = None    # (forced: bool, until: datetime) or None
+        self._on_call = None           # (binary, "microphone"|"camera", since) or None
         self._main_loop = None
 
         # DBus connection (set after registration)
@@ -2234,6 +2309,8 @@ class GnomeSpeaksService:
             ha_token=_get_ha_token)
 
         # Wake word watcher (idle-only; no-op until wake_word is enabled)
+        threading.Thread(target=self._call_watcher, daemon=True,
+                         name="call-watcher").start()
         threading.Thread(target=self._wake_watcher, daemon=True,
                          name="wake-watcher").start()
 
@@ -2265,6 +2342,9 @@ class GnomeSpeaksService:
         # Quiet hours: a bool and two HH:MM STRINGS (applied verbatim), read
         # at request time by quiet_hours_active(); prefs edits land live.
         "quiet_hours", "quiet_hours_start", "quiet_hours_end",
+        # Call mute (default ON): all speech output held while another app
+        # holds the microphone or camera (see _call_watcher).
+        "mute_on_call",
         # Home Assistant token source for the spellbook's `assist` action
         # (#129): two STRINGS, applied verbatim, read at cast time by
         # _get_ha_token().
@@ -4068,6 +4148,8 @@ class GnomeSpeaksService:
             return "user speech"
         if state._pause_event.is_set():
             return "paused"
+        if self._call_muted():
+            return "on a call"      # HELD, not dropped: it plays when the call ends
         st = self.current_state
         if st in ("listening", "processing"):
             return st
@@ -4194,7 +4276,7 @@ class GnomeSpeaksService:
             self._audio_detected = True
         if not text or not text.strip():
             return False
-        blocked = _extension_gate()
+        blocked = _extension_gate() or self._call_mute_reason()
         if blocked:
             log.info("speak() refused: %s", blocked)
             return False
@@ -4715,6 +4797,7 @@ class GnomeSpeaksService:
                     or not CONFIG.get("wyoming_host", "")
                     or not CONFIG.get("wake_word_model", "")
                     or not _desktop_present()     # master switch: no mic, no LAN stream
+                    or self._call_muted()         # a false positive would type into the call
                     or self.current_state != "idle"):
                 time.sleep(0.5)
                 continue
@@ -4738,6 +4821,7 @@ class GnomeSpeaksService:
                     nonlocal recorder_eof
                     while (CONFIG.get("wake_word", False)
                            and _desktop_present()
+                           and not self._call_muted()
                            and self.current_state == "idle"
                            and not self._shutting_down):
                         data = proc.stdout.read(3200)  # ~100 ms @ 16 kHz s16
@@ -4747,7 +4831,8 @@ class GnomeSpeaksService:
                         yield data
 
                 name = wyoming_mod.detect_stream(host, port, model, _chunks())
-                if name and self.current_state == "idle" and _desktop_present():
+                if (name and self.current_state == "idle" and _desktop_present()
+                        and not self._call_muted()):
                     log.info("Wake word detected (%s) — opening mic", name)
                     GLib.idle_add(lambda: (self.start_listening(quick=True,
                                                                 wake=True),
@@ -4891,7 +4976,7 @@ class GnomeSpeaksService:
                 if missing:
                     GLib.idle_add(self._emit_error, missing)
                     return "error: speech not configured"
-                blocked = _extension_gate()
+                blocked = _extension_gate() or self._call_mute_reason()
                 if blocked:
                     log.info("talk() refused: %s", blocked)
                     return f"error: {blocked}"
@@ -5037,6 +5122,105 @@ class GnomeSpeaksService:
 
     def get_conversation_mode(self):
         return CONFIG.get("conversation_mode", False)
+
+    # -- Call mute -----------------------------------------------------------
+
+    def _list_capture_streams(self):
+        """[{"binary","name","pid","corked"}] of live mic capture streams."""
+        try:
+            out = subprocess.run(["pactl", "list", "source-outputs"],
+                                 capture_output=True, text=True, timeout=3).stdout
+        except Exception:
+            return []
+        return _parse_source_outputs(out)
+
+    def _list_camera_holders(self):
+        """[(comm, pid)] of processes holding a /dev/video* device."""
+        holders = []
+        try:
+            for pid_s in os.listdir("/proc"):
+                if not pid_s.isdigit():
+                    continue
+                fd_dir = "/proc/%s/fd" % pid_s
+                try:
+                    fds = os.listdir(fd_dir)
+                except Exception:
+                    continue
+                for fd in fds:
+                    try:
+                        target = os.readlink("%s/%s" % (fd_dir, fd))
+                    except Exception:
+                        continue
+                    if target.startswith("/dev/video"):
+                        try:
+                            with open("/proc/%s/comm" % pid_s) as f:
+                                comm = f.read().strip()
+                        except Exception:
+                            comm = "?"
+                        holders.append((comm, int(pid_s)))
+                        break
+        except Exception:
+            pass
+        return holders
+
+    def _probe_call(self):
+        """(binary, "microphone"|"camera") of the first foreign holder, or None.
+        Corked (paused) capture streams still count: a muted Meet tab keeps
+        its stream, and the safe failure direction is quiet."""
+        for st in self._list_capture_streams():
+            if not _call_ignored(st.get("binary"), st.get("name"), st.get("pid")):
+                return (st.get("binary") or st.get("name"), "microphone")
+        for comm, pid in self._list_camera_holders():
+            if not _call_ignored(comm, comm, pid):
+                return (comm, "camera")
+        return None
+
+    def _call_watcher(self):
+        """Daemon thread: keeps self._on_call current, every CALL_POLL_SECONDS."""
+        while not self._shutting_down:
+            if not CONFIG.get("mute_on_call", True):
+                # Pref off: no probing at all (no pactl every 2 s, and a
+                # harness that counts Popen calls never sees ours -- the
+                # dead-recorder suite did, 2026-09-18).
+                if self._on_call is not None:
+                    self._on_call = None
+                    log.info("Call watch off (mute_on_call=false)")
+                time.sleep(CALL_POLL_SECONDS)
+                continue
+            try:
+                hit = self._probe_call()
+            except Exception:
+                log.exception("Call watcher probe failed")
+                hit = None
+            cur = self._on_call
+            if hit and cur is None:
+                self._on_call = (hit[0], hit[1], time.time())
+                log.info("On a call: %s holds the %s -- %s", hit[0], hit[1],
+                         "speech muted" if CONFIG.get("mute_on_call", True)
+                         else "mute_on_call is off, not muting")
+            elif hit is None and cur is not None:
+                self._on_call = None
+                log.info("Call ended (%s released the %s after %d s) -- speech resumes",
+                         cur[0], cur[1], int(time.time() - cur[2]))
+            time.sleep(CALL_POLL_SECONDS)
+
+    def _call_muted(self):
+        return bool(CONFIG.get("mute_on_call", True)) and self._on_call is not None
+
+    def _call_mute_reason(self):
+        """None when speech may play, else the words for the refusal/hold."""
+        if not self._call_muted():
+            return None
+        binary, what, _since = self._on_call
+        return "on a call (%s holds the %s) -- speech is muted" % (binary, what)
+
+    def call_info(self):
+        cur = self._on_call
+        info = {"active": cur is not None,
+                "mute_on_call": bool(CONFIG.get("mute_on_call", True))}
+        if cur is not None:
+            info.update({"by": cur[0], "what": cur[1], "since": int(cur[2])})
+        return info
 
     # -- Quiet hours ---------------------------------------------------------
 
@@ -5645,7 +5829,12 @@ class GnomeSpeaksService:
                 _ss = threading.Event()
                 subtitle_q.put((item.text, _sd, _ss, cancel_token))
                 try:
-                    item.play(audio_level_cb=self._tts_level_cb)
+                    if self._call_muted():
+                        # The other end of the call would hear the reply.
+                        _log("on a call: reply sentence not played")
+                        item.close()
+                    else:
+                        item.play(audio_level_cb=self._tts_level_cb)
                 finally:
                     _ss.set()
                 if self._stop_event.is_set() or cancel_token.cancelled:
@@ -6100,7 +6289,8 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         # Reject up front rather than enqueueing items doomed to fail —
         # a service that cannot speak must not answer 200 and then say nothing.
         svc = self.service
-        missing = _speech_ready() or _extension_gate() or svc._quiet_hours_refusal()
+        missing = (_speech_ready() or _extension_gate() or svc._call_mute_reason()
+                   or svc._quiet_hours_refusal())
         if missing:
             self._send_error_json(503, missing)
             return
@@ -6407,6 +6597,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             "speech": route,
             "extension": _desktop_present(),
             "quiet": svc.quiet_hours_info(),
+            "call": svc.call_info(),
             "queue_depth": svc._tts_queue.qsize()}
         if progress is not None:
             result["progress"] = progress

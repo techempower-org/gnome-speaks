@@ -1,0 +1,3 @@
+# call-mute (2026-09-18): nothing speaks while another app holds the mic or
+# camera. One process; the detector inputs are injected, never the live desktop.
+call: repro_call_mute.py

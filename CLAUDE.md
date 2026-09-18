@@ -83,6 +83,21 @@ boundary are left alone (ingress gate). `GET /status` carries `quiet` {active, e
 scheduled, window, override, until}. "cast quiet hours" / the panel switch /
 D-Bus `ToggleQuietHours` force the opposite verdict until the next scheduled boundary
 (24 h with no schedule); `GetQuietHours` reads it. `tests/repros/quiet-hours`.
+**Call mute** (2026-09-18, JP: *"nothing should ever speak when I'm on a video call"*):
+`_call_watcher` polls every 2 s for another process holding a MIC capture stream
+(`pactl list source-outputs`, parsed by `_parse_source_outputs`) or a CAMERA
+(`/dev/video*` via `/proc/*/fd`), ignoring this unit's own recorders (cgroup) and
+`CALL_IGNORE_BINARIES` (GNOME Settings' "Peak detect" meter, pw-*, pavucontrol…); an
+unknown holder counts -- it fails toward quiet. While `_on_call` and `mute_on_call`
+(default ON, prefs → Voice & Sound → Video Calls): the queue is **HELD** (`_queue_hold_reason`
+= "on a call"; items play when the call ends), `POST /speak` → 503 naming the app,
+`speak()`/`talk()` refused, AI-reply sentences closed unplayed, the wake watcher parked.
+Hotkey dictation still types. `GET /status.call` = {active, mute_on_call, by, what, since}.
+⚠️ Harnesses pin `mute_on_call: False` (`isolation.CONFIG_PINS`) because the watcher polls
+the REAL desktop; a repro that needs a call feeds `_probe_call`/`_list_capture_streams`
+and WAITS for the watcher -- writing `_on_call` directly races it (measured: the planted
+flag was cleared within 2 s and `talk()` reached the real full-duplex library).
+`tests/repros/call-mute`, wake-watcher case J.
 
 ## D-Bus Interface
 
@@ -120,6 +135,7 @@ Synchronous fallback: cloud-chat-assistant, Bedrock
 | Speech backend | `speech_backend`: `azure` (default) or `local`. Local = the Wyoming server (Piper TTS / Parakeet STT) is PRIMARY and Azure is the fallback: a Wyoming failure trips a 60 s *local* breaker (`wyoming.mark_local_down`) and that session uses Azure; Azure failures trip the existing Azure breaker the other way. `SPEECH_FORCE_OFFLINE=1` still forces offline with NO Azure fallback -- it is an env override for tests, not a setting; a leftover drop-in forced JP offline for weeks (#104). `wyoming.skip_reason()` names the route (`forced` / `prefer_local` / `azure_down`); the service logs it and `GET /status` carries it under `speech`. **Live transcript + live typing work on the local route too** (2026-09-12): the LAN recognizer has no streaming protocol, so speech-to-cli's `stt(partial_cb=)` re-transcribes the utterance so far every 400 ms of speech (one request in flight, 2.5 s timeout; measured 0.15–0.26 s per request on Parakeet TDT 0.6B) and `_batch_stt_worker` feeds each hypothesis to the throttled PartialTranscription signal and a `_LiveTyper` on the PINNED backend; `_deliver_stt_result(inj=, typed_partial=)` reconciles the final (replace_text → loop separator → finalize) or erases on cancel/error/cast/silence. Guarded by `_STT_HAS_PARTIAL_CB` (older speech-to-cli → final text only). `service-audit/repro_c14_vad_live_partials.py` + speech-to-cli `tests/repros/vad_partials.py` |
 | Injection | How text reaches the cursor. `injection_method`: `ydotool` (default, synthesizes keys, learns nothing about the target) · `ibus` (D-Bus commits, no stuck keys, sees the content-type the app declares — so it can skip a declared password/PIN field, never an undeclared one) · `auto` (ibus when reachable). Falls back to ydotool for every failure, never to nothing |
 | Spellbook | "cast …"/"invoke …" transcripts run local spells (never typed/LLM'd); `POST /cast` is the text seam. The `assist` action's HA token comes from `HA_TOKEN` → `CONFIG["ha_token_cache"]` (file) → `CONFIG["ha_token_item"]` (`bw get password`), both empty by default (#129) — never hard-code a vault item or cache path |
+| Call mute | Another app holds the mic or camera → nothing plays (queue held, `/speak` 503, Speak/Talk/AI replies refused, wake word parked) until it lets go. Pref `mute_on_call`, default on. See the HTTP API paragraph above |
 | Quiet hours | Scheduled window in which agent speech (`POST /speak`) is refused with 503; the user's own voice is never muted. Override: "cast quiet hours" / panel switch, until the next boundary. See the HTTP API paragraph above |
 | Chronicle | Not a mode -- always-on ledger of both directions; 📜 badge rune (8 lines) + panel submenu (12), click to respeak. Spells: "cast echo" / "chronicle" / "seal the chronicle" |
 
