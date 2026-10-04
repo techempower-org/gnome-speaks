@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1247,11 +1248,12 @@ def _extension_gate():
 
 # ---------------------------------------------------------------------------
 # Quiet hours (JP, 2026-09-12): a scheduled window in which AGENT speech --
-# POST /speak -- is refused at the door with 503, the same "never 200 and
-# then silence" contract as the extension gate. Everything the user does
-# themself (dictation, D-Bus Speak, spell replies, AI answers, /cast,
-# /respeak) is exempt: the user is present and asking. Items already in the
-# queue at the boundary are left alone -- the gate is ingress only. The
+# POST /speak and POST /cast (#186; JP, 2026-10-04) -- is refused at the
+# door with 503, the same "never 200 and then silence" contract as the
+# extension gate. Everything the user does themself (dictation and spoken
+# casts, D-Bus Speak, spell replies, AI answers, /respeak) is exempt: the
+# user is present and asking. Items already in the queue at the boundary
+# are left alone -- the gate is ingress only. The
 # window is HH:MM local and may cross midnight; start is inclusive, end is
 # exclusive; start == end is an empty window.
 # ---------------------------------------------------------------------------
@@ -5305,6 +5307,13 @@ class GnomeSpeaksService:
             info["until"] = self._fmt_until(end, now) if end else None
         return info
 
+    def _agent_seam_refusal(self):
+        """The ONE admission verdict for agent seams (POST /speak, POST
+        /cast): None when an agent may act, else the 503 words. Master
+        switch first, then call mute, then quiet hours."""
+        return (_extension_gate() or self._call_mute_reason()
+                or self._quiet_hours_refusal())
+
     def _quiet_hours_refusal(self, now=None):
         """None when agent speech may be enqueued, else the 503 words."""
         now = now or datetime.datetime.now()
@@ -6143,9 +6152,25 @@ class GnomeSpeaksService:
 # untouched; a browser always sends Origin, and only origins listed here get
 # an answer (and CORS headers). Empty by default.
 #   GS_HTTP_ALLOWED_ORIGINS="https://app.example, http://localhost:3000"
+# Two spellings are never accepted as entries, whatever their case, spacing
+# or trailing slash: "null" (the Origin of sandboxed iframes and file:// pages)
+# and "*" (this is an exact-match list, not a pattern). A bad entry is DROPPED
+# with a warning, never fatal: the rest of the list still applies.
+_REFUSED_ORIGIN_ENTRIES = frozenset({"null", "*"})
+
+
 def _parse_origin_allowlist(raw):
-    return frozenset(o.rstrip("/").lower()
-                     for o in re.split(r"[,\s]+", raw or "") if o.strip())
+    allowed = set()
+    for entry in re.split(r"[,\s]+", raw or ""):
+        norm = entry.strip().rstrip("/").lower()
+        if not norm:
+            continue
+        if norm in _REFUSED_ORIGIN_ENTRIES:
+            log.warning("GS_HTTP_ALLOWED_ORIGINS: ignoring %r -- not an "
+                        "allowable origin", entry)
+            continue
+        allowed.add(norm)
+    return frozenset(allowed)
 
 
 HTTP_ALLOWED_ORIGINS = _parse_origin_allowlist(
@@ -6161,22 +6186,64 @@ def _output_dir():
     return os.path.join(base, "gnome-speaks", "out")
 
 
+def _prepare_output_dir():
+    """Create or tighten _output_dir(); returns (realpath, None) or (None, words).
+
+    makedirs(mode=0o700) only applies to a directory it CREATES, so an out/
+    that already exists is checked on every use: it must be a real directory
+    (lstat -- never followed) owned by this uid, and it is tightened to 0700
+    through an O_NOFOLLOW descriptor, so the chmod can never follow a link
+    swapped in after the check. A symlinked or foreign-owned out/ is refused.
+    A symlinked PARENT (e.g. $XDG_CACHE_HOME itself a link) is allowed: it
+    is the user's own layout, and confinement is judged on the resolved path.
+    """
+    d = _output_dir()
+    os.makedirs(os.path.dirname(d), exist_ok=True)
+    try:
+        os.mkdir(d, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(d)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        log.warning("output_file refused: %s is not a real directory", d)
+        return None, "output directory is a symlink or not a directory"
+    if st.st_uid != os.getuid():
+        log.warning("output_file refused: %s is owned by uid %d", d, st.st_uid)
+        return None, "output directory is owned by another user"
+    fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fst = os.fstat(fd)
+        if fst.st_uid != os.getuid():
+            return None, "output directory is owned by another user"
+        if stat.S_IMODE(fst.st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+    return os.path.realpath(d), None
+
+
 def _confine_output_file(requested):
     """Resolve a caller's output_file inside _output_dir().
 
-    Returns (path, None) or (None, words for a 400). Relative names land in
-    the directory; an absolute path is accepted only when it already lies in
-    it. realpath() resolves `..` and every symlink on the way, so a name that
-    escapes by either route is refused before anything is written.
+    Returns (path, None, None) or (None, status, words). Relative names land
+    in the directory; an absolute path is accepted only when it already lies
+    in it. realpath() resolves `..` and every symlink on the way, so a name
+    that escapes by either route is refused (400) before anything is
+    written. An unusable directory (see _prepare_output_dir) is a 503.
     """
     if not isinstance(requested, str) or not requested.strip() or "\0" in requested:
-        return None, "'output_file' must be a non-empty file name"
-    root = os.path.realpath(_output_dir())
-    os.makedirs(root, mode=0o700, exist_ok=True)
+        return None, 400, "'output_file' must be a non-empty file name"
+    try:
+        root, bad = _prepare_output_dir()
+    except OSError as exc:
+        log.warning("output_file refused: %s", exc)
+        return None, 503, "output directory unusable: %s" % exc.strerror
+    if bad:
+        return None, 503, bad
     resolved = os.path.realpath(os.path.join(root, requested))
     if os.path.commonpath([root, resolved]) != root or resolved == root:
-        return None, ("'output_file' must name a file inside %s" % root)
-    return resolved, None
+        return None, 400, ("'output_file' must name a file inside %s" % root)
+    return resolved, None, None
 
 
 class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
@@ -6392,8 +6459,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         # Reject up front rather than enqueueing items doomed to fail —
         # a service that cannot speak must not answer 200 and then say nothing.
         svc = self.service
-        missing = (_speech_ready() or _extension_gate() or svc._call_mute_reason()
-                   or svc._quiet_hours_refusal())
+        missing = _speech_ready() or svc._agent_seam_refusal()
         if missing:
             self._send_error_json(503, missing)
             return
@@ -6407,9 +6473,9 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         if output_file is not None:
             # Confined to one cache directory (#186): a caller names a file,
             # never a place on disk.
-            output_file, bad = _confine_output_file(output_file)
+            output_file, status, bad = _confine_output_file(output_file)
             if bad:
-                self._send_error_json(400, bad)
+                self._send_error_json(status, bad)
                 return
 
         # Per-source coalescing: "only my latest status matters". With N agents
@@ -6533,10 +6599,10 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         """Text seam for the spellbook: same matcher and executor as spoken
         casts. Lets agents cast spells and makes every spell curl-testable.
 
-        The master switch applies here exactly as it does to a spoken cast
-        (#186): a spoken cast can only exist once start_listening() has read
-        _extension_gate(), and this seam reads the same verdict. Quiet hours
-        and call mute stay exempt, as for spoken casts (2026-09-12).
+        It is an AGENT seam, so it is admitted by the same verdict as
+        POST /speak (#186; JP, 2026-10-04): the master switch, call mute and
+        quiet hours. A spoken cast is not -- the user is present, and
+        start_listening() has already read the master switch.
         """
         body = self._read_json_body()
         if body is None:
@@ -6545,7 +6611,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         if not isinstance(text, str) or not text.strip():
             self._send_error_json(400, "Missing or empty 'text' field")
             return
-        refused = _extension_gate()
+        refused = self.service._agent_seam_refusal()
         if refused:
             self._send_error_json(503, refused)
             return

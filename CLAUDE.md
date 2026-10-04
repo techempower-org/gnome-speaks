@@ -69,8 +69,9 @@ HTTP REST API on `localhost:7710`: `POST /speak` (queues FIFO; `interrupt:true`
 flushes; `source` + `coalesce`/`kind:"progress"` drops that source's own
 unspoken backlog so agents never narrate stale status), `/skip` (optional
 `{"id":N}` scopes it to that item), `/stop` (drains queue), `/pause`,
-`/resume`, `/cast` (text seam into the spellbook — same gates as spoken casts:
-the master switch → 503 via `_extension_gate()`; quiet hours and call mute exempt),
+`/resume`, `/cast` (text seam into the spellbook — same matcher/executor as spoken
+casts, but admitted like `/speak` (JP, 2026-10-04): master switch, call mute, quiet
+hours → 503 via `_agent_seam_refusal()`, the one verdict both seams read),
 `/respeak` (`{"id":N}`; omit id = last spoken line), `GET /status` (carries
 `extension`, see the master-switch gotcha), `/queue` (pending + `source` +
 per-item outcomes: done/canceled/interrupted/error/suppressed),
@@ -78,15 +79,19 @@ per-item outcomes: done/canceled/interrupted/error/suppressed),
 `/api/version` (realm-sigil contract, no `host`). **Admission** (#186 phase 1,
 `_admission_refusal()`, before every handler incl. OPTIONS): Host must be a loopback
 name (+ the service port) → else 403; an `Origin` not in `GS_HTTP_ALLOWED_ORIGINS`
-(env, comma/space list, empty default) → 403; CORS headers only for allowlisted origins,
+(env, comma/space list, empty default; `null`/`*` entries dropped with a warning) → 403;
+duplicate Origin or Host headers → 403; CORS headers only for allowlisted origins,
 never `*`; a POST that carries an `Origin` and a body must be `application/json` → else
 415. Origin-less callers (agents, `curl -d`, speak.sh) are never Content-Type-checked. `output_file` is confined to
 `$XDG_CACHE_HOME/gnome-speaks/out/` by `_confine_output_file()` (realpath; escapes →
-400). `tests/repros/http-admission`. **Quiet hours** (2026-09-12): inside the
+400); `_prepare_output_dir()` lstat()s `out/` (symlink or foreign uid → 503) and tightens it
+to 0700 through an `O_NOFOLLOW` fd -- a symlinked PARENT is allowed by design. `tests/repros/http-admission`. **Quiet hours** (2026-09-12): inside the
 configured window (`quiet_hours`, `quiet_hours_start`/`_end` HH:MM local, overnight
 allowed, off by default; prefs → Voice & Sound) `POST /speak` answers **503** naming
-the window and its end -- agent speech only; the user's own dictation, D-Bus `Speak`,
-spell replies, `/cast` and `/respeak` are exempt, and items already queued at the
+the window and its end, and so does `POST /cast` (JP, 2026-10-04, #186) -- agent seams
+only; the user's own dictation and spoken casts, D-Bus `Speak`, spell replies and
+`/respeak` are exempt (so "cast quiet hours" via `/cast` is refused inside the window;
+voice, panel and D-Bus still toggle it), and items already queued at the
 boundary are left alone (ingress gate). `GET /status` carries `quiet` {active, enabled,
 scheduled, window, override, until}. "cast quiet hours" / the panel switch /
 D-Bus `ToggleQuietHours` force the opposite verdict until the next scheduled boundary
