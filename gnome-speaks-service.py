@@ -1247,12 +1247,11 @@ def _extension_gate():
 
 # ---------------------------------------------------------------------------
 # Quiet hours (JP, 2026-09-12): a scheduled window in which AGENT speech --
-# POST /speak and POST /cast (#186) -- is refused at the door with 503, the
-# same "never 200 and then silence" contract as the extension gate.
-# Everything the user does themself (dictation and spoken casts, D-Bus
-# Speak, spell replies, AI answers, /respeak) is exempt: the user is present
-# and asking. Items already in the queue at the boundary are left alone --
-# the gate is ingress only. The
+# POST /speak -- is refused at the door with 503, the same "never 200 and
+# then silence" contract as the extension gate. Everything the user does
+# themself (dictation, D-Bus Speak, spell replies, AI answers, /cast,
+# /respeak) is exempt: the user is present and asking. Items already in the
+# queue at the boundary are left alone -- the gate is ingress only. The
 # window is HH:MM local and may cross midnight; start is inclusive, end is
 # exclusive; start == end is an empty window.
 # ---------------------------------------------------------------------------
@@ -5306,13 +5305,6 @@ class GnomeSpeaksService:
             info["until"] = self._fmt_until(end, now) if end else None
         return info
 
-    def _agent_seam_refusal(self):
-        """The ONE admission verdict for agent seams (POST /speak, POST
-        /cast): None when an agent may act, else the 503 words. Master
-        switch first, then call mute, then quiet hours."""
-        return (_extension_gate() or self._call_mute_reason()
-                or self._quiet_hours_refusal())
-
     def _quiet_hours_refusal(self, now=None):
         """None when agent speech may be enqueued, else the 503 words."""
         now = now or datetime.datetime.now()
@@ -6248,10 +6240,12 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         if len(origins) > 1 or (origins and not self._origin_allowed(origins[0])):
             return 403, ("Origin not allowed (set GS_HTTP_ALLOWED_ORIGINS to "
                          "permit a browser origin)")
-        if self.command == "POST":
-            # JSON only, so a browser cannot send a no-preflight "simple
-            # request". A bodyless POST with no Content-Type (curl -X POST
-            # .../stop) is not a form submission and stays accepted.
+        if self.command == "POST" and origins:
+            # Browser requests (they carry an Origin) must be JSON, so even an
+            # allowlisted page cannot send a no-preflight "simple request"
+            # with a body. Origin-less callers -- agents, curl -d (form-encoded
+            # by default), speak.sh -- are not browsers and are not checked.
+            # A bodyless POST with no Content-Type is not a form submission.
             ctype = self.headers.get("Content-Type")
             has_body = (self.headers.get("Content-Length", "0").strip() not in ("", "0")
                         or "Transfer-Encoding" in self.headers)
@@ -6398,7 +6392,8 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         # Reject up front rather than enqueueing items doomed to fail —
         # a service that cannot speak must not answer 200 and then say nothing.
         svc = self.service
-        missing = _speech_ready() or svc._agent_seam_refusal()
+        missing = (_speech_ready() or _extension_gate() or svc._call_mute_reason()
+                   or svc._quiet_hours_refusal())
         if missing:
             self._send_error_json(503, missing)
             return
@@ -6538,10 +6533,10 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         """Text seam for the spellbook: same matcher and executor as spoken
         casts. Lets agents cast spells and makes every spell curl-testable.
 
-        It is an AGENT seam, so it is admitted by the same verdict as
-        POST /speak (#186): the master switch, call mute and quiet hours.
-        A spoken cast needs none of that here -- the user is present, and
-        start_listening() has already read the master switch.
+        The master switch applies here exactly as it does to a spoken cast
+        (#186): a spoken cast can only exist once start_listening() has read
+        _extension_gate(), and this seam reads the same verdict. Quiet hours
+        and call mute stay exempt, as for spoken casts (2026-09-12).
         """
         body = self._read_json_body()
         if body is None:
@@ -6550,7 +6545,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         if not isinstance(text, str) or not text.strip():
             self._send_error_json(400, "Missing or empty 'text' field")
             return
-        refused = self.service._agent_seam_refusal()
+        refused = _extension_gate()
         if refused:
             self._send_error_json(503, refused)
             return

@@ -11,15 +11,18 @@ send.
   A2  Host: a forged Host name, or a loopback name on the wrong port -> 403;
       127.0.0.1:<port>, localhost:<port>, [::1]:<port> and bare 127.0.0.1
       are admitted
-  A3  Content-Type: text/plain and form-urlencoded POSTs -> 415 with nothing
-      enqueued; application/json with a charset -> 200; a bodyless POST with
-      no Content-Type (curl -X POST /stop) -> 200
+  A3  Content-Type is a BROWSER rule: with no Origin (agents, `curl -d`,
+      speak.sh) a JSON body sent as text/plain, form-urlencoded or with no
+      Content-Type -> 200; with an allowlisted Origin the same requests ->
+      415 with nothing enqueued, application/json with a charset -> 200, a
+      bodyless POST -> 200; a foreign Origin with text/plain -> 403 (the
+      Origin check answers first)
   A4  output_file: '../', an absolute path outside, and a symlink inside the
       directory pointing outside -> 400 and nothing written anywhere; a plain
       name -> 200 and the file is written inside the confined directory
-  A5  POST /cast is an agent seam: master switch off -> 503, quiet hours ->
-      503, call mute -> 503, and the spellbook is never consulted; with all
-      three open it casts (positive control)
+  A5  POST /cast honours the master switch like a spoken cast: off -> 503
+      and the spellbook is never consulted; quiet hours and call mute stay
+      exempt (2026-09-12 status quo) -> 200, it casts
   A6  GET /api/version carries no hostname
 
 Hermetic: an ephemeral port (asserted != 7710), no live service, scratch in
@@ -190,22 +193,37 @@ def main():
         check("A2", st == 200, f"Host {good!r} -> {st}")
 
     # ---- A3 Content-Type ----------------------------------------------------
-    n = len(enq)
     body = json.dumps({"text": "Plain hello"}).encode()
-    for ctype in ("text/plain", "application/x-www-form-urlencoded",
-                  "multipart/form-data; boundary=x"):
-        st, out, _ = raw("POST", "/speak", body, {"Content-Type": ctype})
-        check("A3", st == 415 and envelope(out) and len(enq) == n,
-              f"{ctype} -> {st}")
-    st, out, _ = raw("POST", "/speak", body, {})
-    check("A3", st == 415 and len(enq) == n, f"body with no Content-Type -> {st}")
-    st, out, _ = raw("POST", "/speak", body,
-                     {"Content-Type": "application/json; charset=utf-8"})
-    check("A3", st == 200, f"application/json; charset=utf-8 -> {st}")
-    settle()
+    # No Origin: never Content-Type-checked (`curl -d` is form-urlencoded).
+    for ctype in ("text/plain", "application/x-www-form-urlencoded", None):
+        n = len(enq)
+        st, out, _ = raw("POST", "/speak", body, {"Content-Type": ctype} if ctype else {})
+        check("A3", st == 200 and out.get("ok") is True and len(enq) == n + 1,
+              f"no Origin, {ctype or 'no Content-Type'} JSON body -> {st}")
+        settle()
     st, out, _ = raw("POST", "/stop")
     check("A3", st == 200 and out.get("ok") is True,
-          f"bodyless POST /stop, no Content-Type -> {st} {out}")
+          f"no Origin, bodyless POST /stop -> {st} {out}")
+    # Allowlisted Origin: a body must be application/json.
+    n = len(enq)
+    for ctype in ("text/plain", "application/x-www-form-urlencoded",
+                  "multipart/form-data; boundary=x", None):
+        hdrs = {"Origin": ALLOWED}
+        if ctype:
+            hdrs["Content-Type"] = ctype
+        st, out, _ = raw("POST", "/speak", body, hdrs)
+        check("A3", st == 415 and envelope(out) and len(enq) == n,
+              f"allowlisted Origin, {ctype or 'no Content-Type'} -> {st}")
+    st, out, _ = raw("POST", "/speak", body,
+                     {"Origin": ALLOWED, "Content-Type": "application/json; charset=utf-8"})
+    check("A3", st == 200, f"allowlisted Origin, application/json; charset=utf-8 -> {st}")
+    settle()
+    st, out, _ = raw("POST", "/stop", headers={"Origin": ALLOWED})
+    check("A3", st == 200, f"allowlisted Origin, bodyless POST /stop -> {st}")
+    n = len(enq)
+    st, out, _ = raw("POST", "/speak", body, {"Origin": FOREIGN, "Content-Type": "text/plain"})
+    check("A3", st == 403 and envelope(out) and "Origin" in out["error"] and len(enq) == n,
+          f"foreign Origin, text/plain -> {st} (Origin check first)")
 
     # ---- A4 output_file ------------------------------------------------------
     os.makedirs(out_dir, exist_ok=True)
@@ -242,27 +260,32 @@ def main():
           f"master switch off -> {st} {out}, spellbook consulted={len(casts)}")
     harness.isolation.pretend_extension(mod, present=True)
 
+    st, out, _ = post("/cast", {"text": "cast echo"})
+    check("A5", st == 200 and out.get("ok") is True and casts == ["cast echo"],
+          f"master switch on -> {st} {out} (positive control)")
+    settle()
+
+    # Status quo (2026-09-12, pending JP): quiet hours and call mute do not
+    # refuse /cast, exactly as they do not refuse a spoken cast.
     now = dt.datetime.now()
     mod.CONFIG.update({"quiet_hours": True,
                        "quiet_hours_start": (now - dt.timedelta(hours=1)).strftime("%H:%M"),
                        "quiet_hours_end": (now + dt.timedelta(hours=1)).strftime("%H:%M")})
     svc._quiet_override = None
+    assert svc.quiet_hours_active()
     st, out, _ = post("/cast", {"text": "cast echo"})
-    check("A5", st == 503 and "quiet hours" in out.get("error", "") and not casts,
-          f"quiet hours -> {st} {out}")
+    check("A5", st == 200 and len(casts) == 2,
+          f"quiet hours stay exempt -> {st} {out}")
     mod.CONFIG["quiet_hours"] = False
+    settle()
 
-    # Call mute: _call_mute_reason() is the verdict the watcher feeds; the
-    # call-mute suite measures the watcher itself.
+    # _call_mute_reason() is the verdict the watcher feeds (the call-mute
+    # suite measures the watcher itself); /cast must not read it.
     svc._call_mute_reason = lambda: "on a call (repro holds the microphone) -- speech is muted"
     st, out, _ = post("/cast", {"text": "cast echo"})
-    check("A5", st == 503 and "on a call" in out.get("error", "") and not casts,
-          f"call mute -> {st} {out}")
+    check("A5", st == 200 and len(casts) == 3,
+          f"call mute stays exempt -> {st} {out}")
     del svc._call_mute_reason
-
-    st, out, _ = post("/cast", {"text": "cast echo"})
-    check("A5", st == 200 and out.get("ok") is True and casts == ["cast echo"],
-          f"all gates open -> {st} {out} (positive control)")
     settle()
 
     # ---- A6 version ----------------------------------------------------------
@@ -277,7 +300,8 @@ def main():
         print(f"FAIL: {len(FAILS)} check(s): {sorted(set(FAILS))}")
         return 1
     print("PASS: loopback agents admitted unchanged; foreign origins, forged hosts, "
-          "non-JSON POSTs and escaping output files refused; /cast gated; no hostname")
+          "non-JSON browser POSTs and escaping output files refused; /cast behind "
+          "the master switch; no hostname")
     return 0
 
 

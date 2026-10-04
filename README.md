@@ -464,9 +464,9 @@ agents, scripts, `curl` — work unchanged. A request whose `Host` is not
 as is any request carrying an `Origin` that is not allowlisted; CORS headers are
 sent only to allowlisted origins (none by default). To let a browser page use the
 API, list its origin: `GS_HTTP_ALLOWED_ORIGINS="https://app.example,
-http://localhost:3000"` in the unit's environment. A `POST` with a body must be
-`Content-Type: application/json` (`415` otherwise); a bodyless `POST` such as
-`curl -X POST localhost:7710/stop` needs no header.
+http://localhost:3000"` in the unit's environment. A browser `POST` with a body
+(one carrying an `Origin`) must be `Content-Type: application/json` (`415`
+otherwise); requests without an `Origin` are not Content-Type-checked.
 
 | Endpoint | Description |
 |----------|-------------|
@@ -701,8 +701,8 @@ Safety: spells are gated `instant` (read-only/reversible) or `confirm` (the serv
 speaks a challenge and requires a spoken "confirm"); a hardcoded executor denylist
 refuses to load any spell touching destructive surfaces (grid transfer, locks,
 valves, safety automations, remote exec) regardless of config. Test or script
-spells without a microphone via `POST /cast` (an agent seam: like `POST /speak` it
-answers `503` while the extension is disabled, during quiet hours, or on a call):
+spells without a microphone via `POST /cast` (`503` while the extension is
+disabled, exactly as a spoken cast cannot happen then):
 
 ```bash
 curl -X POST localhost:7710/cast -H 'Content-Type: application/json' \

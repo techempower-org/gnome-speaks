@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Quiet hours (JP, 2026-09-12): a scheduled window in which AGENT speech --
 POST /speak -- is refused with 503, while everything the user does themself
-(dictation, D-Bus Speak, spell replies, /respeak) is untouched; POST /cast is
-an agent seam and is refused too (#186, tests/repros/http-admission).
+(dictation, D-Bus Speak, spell replies, /cast, /respeak) is untouched.
 
   Q1  window math: overnight 22:00-08:00 (23:00 and 03:00 in, 12:00 out,
       22:00 in, 08:00 out), same-day 13:00-15:00, start==end never, schedule
