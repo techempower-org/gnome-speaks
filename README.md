@@ -458,9 +458,20 @@ requests **queue FIFO** — concurrent callers never cut each other off — whil
 speech you trigger yourself (keyboard shortcut, D-Bus, AI replies) preempts the
 current utterance immediately and holds the queue until you finish.
 
+**Who it answers** (#186): loopback callers that send no `Origin` header —
+agents, scripts, `curl` — work unchanged. A request whose `Host` is not
+`127.0.0.1`, `localhost` or `[::1]` (on the service port) is refused with `403`,
+as is any request carrying an `Origin` that is not allowlisted; CORS headers are
+sent only to allowlisted origins (none by default). To let a browser page use the
+API, list its origin: `GS_HTTP_ALLOWED_ORIGINS="https://app.example,
+http://localhost:3000"` in the unit's environment (exact origins only; `null`
+and `*` are ignored with a warning). A browser `POST` with a body
+(one carrying an `Origin`) must be `Content-Type: application/json` (`415`
+otherwise); requests without an `Origin` are not Content-Type-checked.
+
 | Endpoint | Description |
 |----------|-------------|
-| `POST /speak` | Queue text for speech. Body: `text` (required), `voice` (Azure ShortName), `quality` (`fast`/`hd`), `output_file` (save WAV instead of playing), `interrupt` (`true` = flush the agent backlog, cut off the playing agent item and speak now — agents only; it can never reach the *user*: it cancels only the queue's current item, never the dictation or a user-speech call, so while those are busy the item is held and the response carries `held`), `source` + `coalesce`/`kind` (see [coalescing](#coalescing-only-my-latest-matters)). Returns `{ok, id, position, state}` — plus `flushed` (how many queued items an interrupt deleted), `held` (why an interrupt did not stop the current activity: `listening`/`processing`/`user speech`) and `coalesced` (ids your own coalesce dropped); `429` when the queue (depth 32) is full. |
+| `POST /speak` | Queue text for speech. Body: `text` (required), `voice` (Azure ShortName), `quality` (`fast`/`hd`), `output_file` (save WAV instead of playing — a file name inside `$XDG_CACHE_HOME/gnome-speaks/out/`; anything resolving outside it is a `400`, and the response echoes the resolved path. `out/` itself must be a real directory owned by you — it is tightened to `0700` on use, and a symlinked or foreign-owned `out/` is refused with `503`; a symlinked `$XDG_CACHE_HOME` is fine), `interrupt` (`true` = flush the agent backlog, cut off the playing agent item and speak now — agents only; it can never reach the *user*: it cancels only the queue's current item, never the dictation or a user-speech call, so while those are busy the item is held and the response carries `held`), `source` + `coalesce`/`kind` (see [coalescing](#coalescing-only-my-latest-matters)). Returns `{ok, id, position, state}` — plus `flushed` (how many queued items an interrupt deleted), `held` (why an interrupt did not stop the current activity: `listening`/`processing`/`user speech`) and `coalesced` (ids your own coalesce dropped); `429` when the queue (depth 32) is full. |
 | `POST /skip` | Cancel the current utterance; the next queued one plays. Returns `{ok, skipped}` — the id that was skipped, or `null`. Optional body `{"id": N}` skips **only if** item `N` is the one playing, so a late "skip mine" can't kill somebody else's utterance. (SSIP calls this `STOP`.) |
 | `POST /stop` | Panic button: stop playback and drain the queue. Returns `{ok, cleared}`. (SSIP calls this `CANCEL` — note the inverted verbs if you have speech-dispatcher reflexes.) |
 | `POST /pause` / `POST /resume` | Pause/resume. Queue-level: while paused, the next queued item won't start either. |
@@ -469,7 +480,7 @@ current utterance immediately and holds the queue until you finish.
 | `GET /voices` | Available Azure voices (cached 5 min). |
 | `GET /chronicle` | Read the [Chronicle](#the-chronicle). Query params: `limit` (default 20, capped at 500), `q` (case-insensitive substring), `kind` (`you` / `spoken`). Returns `{entries, enabled}`, oldest-first — ready to display. |
 | `POST /respeak` | Play a Chronicle line again. Body `{"id": N}`; omit `id` to replay the last thing spoken. Returns `{ok, respeaking}`, or `404` on a bad id, an empty chronicle, or a full queue. |
-| `GET /api/version` | [realm-sigil](https://github.com/jphein/realm-sigil) version contract (git-derived, with a minimal fallback when realm-sigil isn't installed). |
+| `GET /api/version` | [realm-sigil](https://github.com/jphein/realm-sigil) version contract (git-derived, with a minimal fallback when realm-sigil isn't installed). The optional `host` field is not served. |
 
 ```bash
 curl -X POST localhost:7710/speak -H 'Content-Type: application/json' \
@@ -691,7 +702,10 @@ Safety: spells are gated `instant` (read-only/reversible) or `confirm` (the serv
 speaks a challenge and requires a spoken "confirm"); a hardcoded executor denylist
 refuses to load any spell touching destructive surfaces (grid transfer, locks,
 valves, safety automations, remote exec) regardless of config. Test or script
-spells without a microphone via `POST /cast`:
+spells without a microphone via `POST /cast` (an agent seam: like `POST /speak` it
+answers `503` while the extension is disabled, during quiet hours, or on a call —
+so "cast quiet hours" cannot be sent through it inside the window; say it, or use
+the panel switch):
 
 ```bash
 curl -X POST localhost:7710/cast -H 'Content-Type: application/json' \

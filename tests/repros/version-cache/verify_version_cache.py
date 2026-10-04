@@ -66,6 +66,10 @@ from harness import SCRATCH  # noqa: E402  (per-PID; see the harness isolation n
 
 BASELINE_DIR = os.path.join(SCRATCH, "baseline")
 PER_PROCESS = {"uptime", "pid", "built", "started"}
+# Removed on purpose after the baselines were pinned (#186: the optional
+# `host` field is no longer served). Excluded from the identity checks only;
+# tests/repros/http-admission asserts it stays gone.
+DROPPED = {"host"}
 
 FAILURES = []
 
@@ -139,12 +143,13 @@ def main():
     # -- 2. contract identity vs origin/main --------------------------------
     mine = dump(SVC_PATH)
     theirs = dump(snapshot(BASELINE_REF))
-    check("key order identical to baseline (%s)" % BASELINE_REF,
-          list(mine.keys()) == list(theirs.keys()),
-          "%s vs %s" % (list(mine.keys()), list(theirs.keys())))
+    mine_keys = [k for k in mine if k not in DROPPED]
+    theirs_keys = [k for k in theirs if k not in DROPPED]
+    check("key order identical to baseline (%s), minus %s" % (BASELINE_REF, sorted(DROPPED)),
+          mine_keys == theirs_keys, "%s vs %s" % (mine_keys, theirs_keys))
     diff = {k: (theirs.get(k), mine.get(k))
             for k in set(mine) | set(theirs)
-            if k not in PER_PROCESS and mine.get(k) != theirs.get(k)}
+            if k not in PER_PROCESS | DROPPED and mine.get(k) != theirs.get(k)}
     check("every stable field identical to baseline (%s)" % BASELINE_REF,
           not diff, repr(diff))
     check("the per-process fields are all still present",
