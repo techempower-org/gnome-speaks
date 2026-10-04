@@ -65,10 +65,13 @@ def main():
     check("uptime is still present and live (int, recomputed per request)",
           isinstance(last.get("uptime"), int))
 
-    # realm-sigil contract keys (import succeeds on this host)
+    # realm-sigil contract keys (import succeeds on this host). `host` is
+    # optional in the contract and no longer served (#186); its absence is
+    # asserted by tests/repros/http-admission, not here, so the #53 controls
+    # (577a05f good / 7eaeb02 bad) keep measuring forks only.
     expected = {"name", "description", "version", "hash", "branch", "dirty",
                 "built", "realm", "repo", "commit_url", "started", "uptime",
-                "runtime", "host", "pid"}
+                "runtime", "pid"}
     missing = expected - set(last.keys())
     check("realm-sigil contract keys all present",
           not missing, "missing %s" % sorted(missing) if missing else "")
