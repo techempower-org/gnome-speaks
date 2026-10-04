@@ -69,16 +69,25 @@ HTTP REST API on `localhost:7710`: `POST /speak` (queues FIFO; `interrupt:true`
 flushes; `source` + `coalesce`/`kind:"progress"` drops that source's own
 unspoken backlog so agents never narrate stale status), `/skip` (optional
 `{"id":N}` scopes it to that item), `/stop` (drains queue), `/pause`,
-`/resume`, `/cast` (text seam into the spellbook — same gates as spoken casts),
+`/resume`, `/cast` (text seam into the spellbook — same matcher/executor as spoken
+casts, admitted like `/speak`: master switch, call mute, quiet hours → 503 via
+`_agent_seam_refusal()`, the one verdict both seams read),
 `/respeak` (`{"id":N}`; omit id = last spoken line), `GET /status` (carries
 `extension`, see the master-switch gotcha), `/queue` (pending + `source` +
 per-item outcomes: done/canceled/interrupted/error/suppressed),
 `/voices`, `/chronicle` (`?limit&q&kind=you|spoken`, oldest-first),
-`/api/version` (realm-sigil contract). **Quiet hours** (2026-09-12): inside the
+`/api/version` (realm-sigil contract, no `host`). **Admission** (#186 phase 1,
+`_admission_refusal()`, before every handler incl. OPTIONS): Host must be a loopback
+name (+ the service port) → else 403; an `Origin` not in `GS_HTTP_ALLOWED_ORIGINS`
+(env, comma/space list, empty default) → 403; CORS headers only for allowlisted origins,
+never `*`; a POST with a body must be `application/json` → else 415 (bodyless POST
+without Content-Type stays OK). `output_file` is confined to
+`$XDG_CACHE_HOME/gnome-speaks/out/` by `_confine_output_file()` (realpath; escapes →
+400). `tests/repros/http-admission`. **Quiet hours** (2026-09-12): inside the
 configured window (`quiet_hours`, `quiet_hours_start`/`_end` HH:MM local, overnight
 allowed, off by default; prefs → Voice & Sound) `POST /speak` answers **503** naming
-the window and its end -- agent speech only; the user's own dictation, D-Bus `Speak`,
-spell replies, `/cast` and `/respeak` are exempt, and items already queued at the
+the window and its end, and so does `POST /cast` (#186) -- agent seams only; the user's
+own dictation and spoken casts, D-Bus `Speak`, spell replies and `/respeak` are exempt, and items already queued at the
 boundary are left alone (ingress gate). `GET /status` carries `quiet` {active, enabled,
 scheduled, window, override, until}. "cast quiet hours" / the panel switch /
 D-Bus `ToggleQuietHours` force the opposite verdict until the next scheduled boundary
