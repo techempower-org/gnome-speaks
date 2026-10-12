@@ -22,6 +22,7 @@ HTTP session pooling, VAD, energy-gated silence detection.
 import argparse
 import http.server
 import datetime
+import errno
 import json
 import logging
 import math
@@ -380,12 +381,17 @@ _chronicle_archive_retry_after = 0.0
 # would otherwise raise OverflowError on the append path.
 
 
+_CHRONICLE_RETENTION_MAX_DAYS = 36500.0
+
+
 def _parse_retention_days(raw):
     try:
         days = float(raw or 0)
     except ValueError:
         return 0.0
-    return days if math.isfinite(days) and days > 0 else 0.0
+    # Over a century is "forever" too -- and keeps the cutoff arithmetic
+    # (days * 86400 * 1000) far from float overflow (1e308 would overflow).
+    return days if math.isfinite(days) and 0 < days <= _CHRONICLE_RETENTION_MAX_DAYS else 0.0
 
 
 _CHRONICLE_RETENTION_DAYS = _parse_retention_days(
@@ -495,13 +501,20 @@ def _chronicle_prune_file(path, cutoff_id, count_only=False):
     file, leaving the real archive unpruned and splitting the history.
     """
     try:
-        if stat.S_ISLNK(os.lstat(path).st_mode):
-            log.warning("Chronicle retention: %s is a symlink -- not pruned", path)
-            return 0
-        fin = open(path, "rb")
+        # O_NOFOLLOW on the open itself: no window between a link check and
+        # the open (ELOOP = a symlink, skipped).
+        fin = os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW
+                                | getattr(os, "O_CLOEXEC", 0)), "rb")
     except FileNotFoundError:
         return 0
-    tmp = path + ".prune-tmp"
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            log.warning("Chronicle retention: %s is a symlink -- not pruned", path)
+            return 0
+        raise
+    # Per-process temp name: a second process (there should never be one --
+    # the D-Bus name is single-owner) can never unlink or publish ours.
+    tmp = "%s.prune-%d.tmp" % (path, os.getpid())
     dropped = 0
     keep = []
     with fin:
@@ -519,7 +532,7 @@ def _chronicle_prune_file(path, cutoff_id, count_only=False):
     if not dropped or count_only:
         return dropped
     try:
-        os.unlink(tmp)   # a stale temp from a crashed prune
+        os.unlink(tmp)   # stale: an earlier crash of THIS pid's prune
     except FileNotFoundError:
         pass
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
@@ -597,7 +610,9 @@ def _chronicle_prune_due_locked():
     try:
         cutoff_id = int((time.time() - _CHRONICLE_RETENTION_DAYS * 86400) * 1000)
     except (OverflowError, ValueError):
-        return False   # unreachable after _parse_retention_days; never raise here
+        # _parse_retention_days caps the value, so this is a backstop only:
+        # never raise into the append path.
+        return False
     _chronicle_archiving.set()
     try:
         threading.Thread(target=_chronicle_prune_worker, args=(cutoff_id,),

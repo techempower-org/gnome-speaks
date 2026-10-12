@@ -180,7 +180,7 @@ check("R2 active: old dropped, new + the trigger kept",
 check("R2 rewritten files stay 0600",
       all(mode(p) == 0o600 for p in (ACTIVE, GEN1, ARCHIVE)))
 check("R2 no temp file left behind",
-      not [n for n in os.listdir(os.path.dirname(ACTIVE)) if n.endswith(".prune-tmp")])
+      not [n for n in os.listdir(os.path.dirname(ACTIVE)) if ".prune-" in n and n.endswith(".tmp")])
 entries = svc._chronicle_read(limit=50, q="mid", include_archive=True)
 check("R2 a search no longer finds pruned text", not entries, f"{entries}")
 
@@ -197,7 +197,8 @@ check("R3 once the interval passes, the next append prunes", OLD not in ids(ARCH
 
 # ---- R5 retention values: only a finite positive number prunes --------------
 for raw, want in (("30", 30.0), ("inf", 0.0), ("1e400", 0.0), ("nan", 0.0),
-                  ("-3", 0.0), ("x", 0.0), ("", 0.0), ("0.5", 0.5)):
+                  ("-3", 0.0), ("x", 0.0), ("", 0.0), ("0.5", 0.5),
+                  ("1e308", 0.0), ("36500", 36500.0), ("36501", 0.0)):
     got = svc._parse_retention_days(raw)
     check(f"R5 {raw!r} -> {want}", got == want, f"got {got}")
 saved_days = svc._CHRONICLE_RETENTION_DAYS
@@ -247,7 +248,7 @@ racer = {}
 
 
 def racing_replace(src, dst, *a, **k):
-    if dst == ACTIVE and str(src).endswith(".prune-tmp") and "t" not in racer:
+    if dst == ACTIVE and ".prune-" in str(src) and "t" not in racer:
         racer["t"] = threading.Thread(target=svc._chronicle_append, args=("you", "R8 racer"))
         racer["t"].start()
         time.sleep(0.3)   # give an UNLOCKED append every chance to land first
