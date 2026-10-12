@@ -92,7 +92,18 @@ never `*`; a POST that carries an `Origin` and a body must be `application/json`
 415. Origin-less callers (agents, `curl -d`, speak.sh) are never Content-Type-checked. `output_file` is confined to
 `$XDG_CACHE_HOME/gnome-speaks/out/` by `_confine_output_file()` (realpath; escapes →
 400); `_prepare_output_dir()` lstat()s `out/` (symlink or foreign uid → 503) and tightens it
-to 0700 through an `O_NOFOLLOW` fd -- a symlinked PARENT is allowed by design. `tests/repros/http-admission`. **Quiet hours** (2026-09-12): inside the
+to 0700 through an `O_NOFOLLOW` fd -- a symlinked PARENT is allowed by design. `tests/repros/http-admission`.
+**Token** (#186 phase 2, `_auth_refusal()`, runs right AFTER admission): `main()` calls
+`_load_or_create_token()` → `$XDG_CONFIG_HOME/gnome-speaks/token` (0600, dir 0700, created via
+O_EXCL temp + `link()`, read `O_NOFOLLOW` + owner check, a corrupt file is replaced, a symlinked
+one is refused → `HTTP_TOKEN=None`) and `curl.conf` beside it (`header = "X-Speaks-Token: …"`,
+so shell callers use `curl -K` and the token never hits argv). Exactly one credential:
+`Authorization: Bearer` or `X-Speaks-Token`; wrong/malformed/two → 401 (+`WWW-Authenticate`)
+ALWAYS. Absent → admitted and counted (`GET /status.auth.tokenless`) unless
+`GNOME_SPEAKS_REQUIRE_TOKEN=1` (default OFF = grace) → 401; with the flag on and no server token,
+everything but `GET /health` is 401 (fails closed). Exempt: `GET /health` (`{"ok": true}` only)
+and OPTIONS. `hmac.compare_digest`; the token is never logged. Harnesses never call `main()`
+except `deprecations`, which points `XDG_CONFIG_HOME` into scratch. `tests/repros/http-token`. **Quiet hours** (2026-09-12): inside the
 configured window (`quiet_hours`, `quiet_hours_start`/`_end` HH:MM local, overnight
 allowed, off by default; prefs → Voice & Sound) `POST /speak` answers **503** naming
 the window and its end, and so does `POST /cast` (JP, 2026-10-04, #186) -- agent seams

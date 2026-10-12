@@ -32,6 +32,10 @@ PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR PULSE_SERVER
 Environment=SPEECH_ENGINE_PATH=%h/Projects/speech-to-cli
 Environment=CLOUD_CHAT_PATH=%h/Projects/cloud-chat-assistant
 Environment=GNOME_SPEAKS_INACTIVITY_TIMEOUT_SEC=0
+# HTTP token (#186 phase 2). Grace by default: requests WITHOUT the token are
+# still admitted and counted in GET /status auth.tokenless. Once that stops
+# growing, require it (a drop-in via `systemctl --user edit` survives reinstalls):
+#Environment=GNOME_SPEAKS_REQUIRE_TOKEN=1
 
 [Install]
 WantedBy=graphical-session.target

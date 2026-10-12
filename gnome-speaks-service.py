@@ -23,11 +23,13 @@ import argparse
 import http.server
 import datetime
 import errno
+import hmac
 import json
 import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -6420,6 +6422,198 @@ HTTP_ALLOWED_ORIGINS = _parse_origin_allowlist(
 # request naming any other host (with or without the port) is refused.
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 
+# ---------------------------------------------------------------------------
+# Per-install token (#186 phase 2). Phase 1 keeps web pages out; the token
+# keeps out what phase 1 cannot see: OTHER LOCAL ACCOUNTS and processes that
+# send no Origin. The service writes a random token to
+# $XDG_CONFIG_HOME/gnome-speaks/token (0600, dir 0700) on first run; a
+# same-user caller reads it, so no secret is ever distributed. It is accepted
+# as `Authorization: Bearer <token>` or `X-Speaks-Token: <token>` on every
+# endpoint except GET /health (and CORS preflights, which browsers send
+# without credentials and which have no side effect).
+#
+# Beside it, curl.conf (0600) holds the same token as a curl config line, so a
+# shell caller can authenticate with `curl -K ~/.config/gnome-speaks/curl.conf`
+# and the token never appears in argv (/proc/<pid>/cmdline is world-readable).
+#
+# GNOME_SPEAKS_REQUIRE_TOKEN is the migration flag. Default OFF (grace): a
+# request with NO token is still admitted (and counted under GET /status
+# `auth.tokenless`) so existing agents keep working; a WRONG or malformed
+# token is refused either way. Set it to 1 once `tokenless` stops growing.
+# With it on and no usable token file, every gated endpoint answers 401 --
+# it fails closed.
+# ---------------------------------------------------------------------------
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,256}")
+_TOKEN_BYTES = 32          # secrets.token_urlsafe(32) -> 43 characters
+_TOKEN_EXEMPT = frozenset({("GET", "/health")})
+
+
+def _env_truthy(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+HTTP_REQUIRE_TOKEN = _env_truthy("GNOME_SPEAKS_REQUIRE_TOKEN", False)
+HTTP_TOKEN = None   # set by main() through _load_or_create_token()
+
+
+def _token_dir():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "gnome-speaks")
+
+
+def _token_path():
+    return os.path.join(_token_dir(), "token")
+
+
+def _curl_conf_path():
+    return os.path.join(_token_dir(), "curl.conf")
+
+
+def _read_private_file(path):
+    """Read a small secret file that must be OURS: a regular file owned by
+    this uid, opened O_NOFOLLOW (a symlink raises ELOOP, never read through).
+
+    Returns (bytes, exposed). `exposed` is True when the file carried any
+    group/other permission bit: whatever it holds may already have been
+    copied, so a caller ROTATES such a secret rather than just chmod'ing it.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise PermissionError("%s is not a regular file owned by this user" % path)
+        return os.read(fd, 4096), bool(stat.S_IMODE(st.st_mode) & 0o077)
+    finally:
+        os.close(fd)
+
+
+def _write_all(fd, data):
+    """os.write() may write less than asked; a short token must never be
+    published (a 32+ character prefix would still pass validation)."""
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError("short write")
+        view = view[n:]
+
+
+def _write_private_file(path, data, exclusive=False):
+    """Write `data` to `path` as a 0600 file, atomically.
+
+    The bytes go to a fresh O_EXCL temp file first and are fsynced, so no
+    reader ever sees a partial token. exclusive=True publishes with link(),
+    which fails if `path` exists (two first-runs racing: the loser adopts the
+    winner's token); otherwise os.replace() overwrites.
+    """
+    d = os.path.dirname(path)
+    tmp = os.path.join(d, ".%s.%d.%s.tmp" % (os.path.basename(path), os.getpid(),
+                                             secrets.token_hex(4)))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                 | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        try:
+            _write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if exclusive:
+            os.link(tmp, path)
+        else:
+            os.replace(tmp, path)
+            tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+    _fsync_dir(d)
+
+
+def _prepare_token_dir():
+    """Create $XDG_CONFIG_HOME/gnome-speaks 0700, or tighten it. It must be a
+    directory owned by this uid (a symlinked dir is the user's own layout and
+    is judged on its target, like the output dir's parent)."""
+    d = _token_dir()
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    st = os.stat(d)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise PermissionError("%s is not a directory owned by this user" % d)
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        os.chmod(d, 0o700)
+
+
+def _sync_curl_conf(token):
+    """Keep curl.conf (0600) holding exactly this token. A convenience for
+    shell callers: a failure is a warning, never a reason to drop the token.
+    A curl.conf that is not ours (symlink, foreign owner) is replaced by
+    rename, which never writes through the link."""
+    want = ('header = "X-Speaks-Token: %s"\n' % token).encode()
+    try:
+        try:
+            have, exposed = _read_private_file(_curl_conf_path())
+            if exposed:
+                have = None   # rewrite it 0600 (the token itself was rotated)
+        except OSError:
+            have = None   # missing, a symlink (ELOOP) or foreign: replace it
+        if have != want:
+            _write_private_file(_curl_conf_path(), want)
+    except OSError as exc:
+        log.warning("HTTP token: could not write %s: %s", _curl_conf_path(), exc)
+
+
+def _load_or_create_token():
+    """Return this install's token, creating it on first run; None if unusable.
+
+    A token file that is not a valid token (empty, truncated, hand-edited)
+    or that was readable by group/other (it may already have been copied) is
+    ROTATED: unlinked and re-created exclusively, so two services racing the
+    same repair converge on one token. A token file that is a symlink or
+    owned by someone else is NOT replaced and NOT read: that is somebody
+    else's layout, and the HTTP API then has no token (it fails closed when
+    GNOME_SPEAKS_REQUIRE_TOKEN is on). Never logs the token.
+    """
+    path = _token_path()
+    try:
+        _prepare_token_dir()
+        token = None
+        try:
+            raw, exposed = _read_private_file(path)
+            cand = raw.decode("ascii", "replace").strip()
+            if _TOKEN_RE.fullmatch(cand) and not exposed:
+                token = cand
+            else:
+                log.warning("HTTP token file %s is %s -- rotating it", path,
+                            "readable by other users" if exposed else "not a valid token")
+                os.unlink(path)
+                raise FileNotFoundError(path)
+        except FileNotFoundError:
+            try:
+                _write_private_file(path, (secrets.token_urlsafe(_TOKEN_BYTES) + "\n").encode(),
+                                    exclusive=True)
+                log.info("HTTP token created at %s (0600)", path)
+            except FileExistsError:
+                pass   # a concurrent run won: adopt its token below
+        if token is None:
+            raw, exposed = _read_private_file(path)
+            if exposed:
+                raise PermissionError("token file is readable by other users")
+            cand = raw.decode("ascii", "replace").strip()
+            if not _TOKEN_RE.fullmatch(cand):
+                raise ValueError("token file still invalid after rewrite")
+            token = cand
+        _sync_curl_conf(token)
+        return token
+    except (OSError, ValueError) as exc:
+        log.error("HTTP token unavailable (%s): %s -- %s", path, exc,
+                  "every gated endpoint will answer 401" if HTTP_REQUIRE_TOKEN
+                  else "tokenless callers are still admitted (grace)")
+        return None
+
 
 def _output_dir():
     """The ONE directory `POST /speak {output_file}` may write into."""
@@ -6519,7 +6713,8 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, Authorization, X-Speaks-Token")
 
     # -- Admission (#186) ----------------------------------------------------
 
@@ -6564,11 +6759,105 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
                 return 415, "Content-Type must be application/json"
         return None
 
+    # -- Token (#186 phase 2) ------------------------------------------------
+
+    # Grace-mode bookkeeping: how many requests arrived WITHOUT a token, and
+    # the last one -- the instrument for "is it safe to require the token
+    # yet?" (GET /status `auth`). Paths only, never bodies or headers.
+    _auth_lock = threading.Lock()
+    _tokenless_count = 0
+    _tokenless_last = None
+    _tokenless_seen = set()
+
+    def _presented_token(self):
+        """("absent"|"token"|"malformed", token-or-None) from the headers.
+
+        Exactly one credential is accepted: one `Authorization: Bearer <t>`
+        OR one `X-Speaks-Token: <t>`. Two credentials (even equal ones), a
+        non-Bearer Authorization, or an empty value is malformed -- a client
+        that sends ambiguous credentials is refused, never guessed at.
+        """
+        creds = []
+        for value in self.headers.get_all("Authorization") or []:
+            scheme, _, cred = value.strip().partition(" ")
+            if scheme.lower() != "bearer" or not cred.strip():
+                return "malformed", None
+            creds.append(cred.strip())
+        for value in self.headers.get_all("X-Speaks-Token") or []:
+            if not value.strip():
+                return "malformed", None
+            creds.append(value.strip())
+        if not creds:
+            return "absent", None
+        if len(creds) > 1:
+            return "malformed", None
+        return "token", creds[0]
+
+    @staticmethod
+    def _token_matches(presented):
+        expected = HTTP_TOKEN
+        if not expected or not isinstance(presented, str):
+            return False
+        # Constant-time: the comparison must not leak how many leading
+        # characters matched.
+        return hmac.compare_digest(presented.encode("utf-8", "replace"),
+                                   expected.encode("utf-8"))
+
+    def _auth_refusal(self):
+        """None when the request may proceed, else (401, words).
+
+        Runs after _admission_refusal (Host/Origin first: a browser page gets
+        its 403 before it learns anything about tokens). Never echoes or logs
+        a presented token.
+        """
+        path = self.path.split("?")[0]
+        if self.command == "OPTIONS" or (self.command, path) in _TOKEN_EXEMPT:
+            return None
+        kind, presented = self._presented_token()
+        if kind == "malformed":
+            return 401, ("Malformed credentials: send exactly one "
+                         "'Authorization: Bearer <token>' or 'X-Speaks-Token: <token>'")
+        if kind == "token":
+            if self._token_matches(presented):
+                return None
+            if HTTP_TOKEN is None:
+                return 401, "This service has no usable token (see its journal)"
+            return 401, "Wrong token"
+        # absent
+        if HTTP_REQUIRE_TOKEN:
+            if HTTP_TOKEN is None:
+                return 401, "Token required, and this service has no usable token (see its journal)"
+            return 401, ("Token required: send the contents of %s as "
+                         "'X-Speaks-Token' or 'Authorization: Bearer'" % _token_path())
+        cls = SpeechHTTPHandler
+        key = "%s %s" % (self.command, path[:80])
+        with cls._auth_lock:
+            cls._tokenless_count += 1
+            cls._tokenless_last = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                                   "request": key}
+            first = key not in cls._tokenless_seen and len(cls._tokenless_seen) < 64
+            if first:
+                cls._tokenless_seen.add(key)
+        if first:
+            log.info("HTTP %s admitted without a token (grace; set "
+                     "GNOME_SPEAKS_REQUIRE_TOKEN=1 to refuse)", key)
+        return None
+
+    @classmethod
+    def auth_info(cls):
+        with cls._auth_lock:
+            return {"token": HTTP_TOKEN is not None,
+                    "required": HTTP_REQUIRE_TOKEN,
+                    "tokenless": cls._tokenless_count,
+                    "tokenless_last": cls._tokenless_last}
+
     def _send_json(self, data, status=200):
         body = json.dumps(data).encode("utf-8")
         self._replied = True   # headers go out below; _dispatch must not add a 500
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        if status == 401:
+            self.send_header("WWW-Authenticate", 'Bearer realm="gnome-speaks"')
         self._set_cors_headers()
         self.end_headers()
         self.wfile.write(body)
@@ -6607,6 +6896,12 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
                          self.path.split("?")[0][:80], refusal[1])
                 self._send_error_json(*refusal)
                 return
+            refusal = self._auth_refusal()
+            if refusal is not None:
+                log.info("HTTP %s %s refused: %s", self.command,
+                         self.path.split("?")[0][:80], refusal[1])
+                self._send_error_json(*refusal)
+                return
             handler()
         except Exception as exc:  # noqa: BLE001 -- the envelope IS the point
             log.exception("HTTP %s %s failed", self.command, self.path)
@@ -6626,7 +6921,10 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def _route_get(self):
         path = self.path.split("?")[0]
-        if path == "/api/version":
+        if path == "/health":
+            # Token-exempt (#186 phase 2): liveness only, no state, no facts.
+            self._send_json({"ok": True})
+        elif path == "/api/version":
             self._handle_version()
         elif path == "/status":
             self._handle_status()
@@ -7027,6 +7325,7 @@ class SpeechHTTPHandler(http.server.BaseHTTPRequestHandler):
             "extension": _desktop_present(),
             "quiet": svc.quiet_hours_info(),
             "call": svc.call_info(),
+            "auth": SpeechHTTPHandler.auth_info(),
             "queue_depth": svc._tts_queue.qsize()}
         if progress is not None:
             result["progress"] = progress
@@ -7501,6 +7800,12 @@ def main():
     # Start HTTP REST API server (optional — gracefully skip if port in use)
     http_server = None
     SpeechHTTPHandler.service = service
+    global HTTP_TOKEN
+    HTTP_TOKEN = _load_or_create_token()   # before the first request can land
+    log.info("HTTP token %s; GNOME_SPEAKS_REQUIRE_TOKEN=%s",
+             "loaded" if HTTP_TOKEN else "UNAVAILABLE",
+             "1 (tokenless requests refused)" if HTTP_REQUIRE_TOKEN
+             else "0 (grace: tokenless requests admitted and counted)")
     try:
         http_server = http.server.ThreadingHTTPServer(
             ("127.0.0.1", args.http_port), SpeechHTTPHandler,
