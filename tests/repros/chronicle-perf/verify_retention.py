@@ -22,6 +22,16 @@ import shutil
 import stat
 import sys
 import time
+import traceback
+
+# The runner discards stderr, so a crash would show only the last "ok" line.
+# Put the traceback on stdout, where the runner's summary can see it.
+def _crash_to_stdout(t, v, tb):
+    traceback.print_exception(t, v, tb, file=sys.stdout)
+    print(f"CRASH: {t.__name__}: {v}", flush=True)
+
+
+sys.excepthook = _crash_to_stdout
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
@@ -81,7 +91,10 @@ def plant(path, entries, file_mode=0o664):
 def fresh_ledger():
     d = os.path.dirname(svc.CHRONICLE_PATH)
     shutil.rmtree(d, ignore_errors=True)
-    os.makedirs(d)
+    os.makedirs(d, exist_ok=True)
+    for name in os.listdir(d):   # anything a straggler wrote after the rmtree
+        p_ = os.path.join(d, name)
+        os.remove(p_) if not os.path.isdir(p_) or os.path.islink(p_) else shutil.rmtree(p_)
     os.chmod(d, 0o775)
     svc._chronicle_id_seeded = False
     svc._chronicle_last_id = 0
