@@ -12,6 +12,7 @@
   R7  the cutoff boundary (== kept)
   R8  an append landing mid-rewrite of the active file survives it
   R9  no prune in the startup grace (a wrong-forward boot clock)
+  R10 a crashed process's prune temp is swept, a live one's is not
   R4  PRIVATE MODES      -- a ledger dir left 0775 and files left 0664 by an
                             older build are tightened to 0700 / 0600 at the
                             first append; files created fresh are 0600; a
@@ -284,6 +285,23 @@ svc._chronicle_append("you", "R9 early")
 settle()
 check("R9 inside the startup grace nothing is pruned", OLD in ids(ARCHIVE) and MID + 2 in ids(ACTIVE))
 check("R9 the grace is at least 5 minutes", svc._CHRONICLE_PRUNE_GRACE >= 300)
+
+# ---- R10 a crashed process's prune temp is swept; a live one is not ------------------
+import subprocess as _sp
+_child = _sp.Popen(["true"])
+_child.wait()
+dead_pid = _child.pid           # reaped: no such process now
+fresh_ledger()
+plant_history()
+stale = "%s.prune-%d.tmp" % (ACTIVE, dead_pid)
+live = "%s.prune-%d.tmp" % (ARCHIVE, os.getppid())
+for p_ in (stale, live):
+    plant(p_, [{"id": OLD, "kind": "you", "text": "partial copy"}], 0o600)
+svc._chronicle_append("you", "R10 trigger")
+settle()
+check("R10 a dead pid's prune temp is removed", not os.path.exists(stale))
+check("R10 a live pid's prune temp is left alone", os.path.exists(live))
+os.remove(live)
 
 print()
 print("RESULT: " + ("RETENTION + MODES HOLD" if FAIL == 0 else f"{FAIL} FAILURES"))

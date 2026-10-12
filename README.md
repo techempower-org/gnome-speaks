@@ -469,6 +469,28 @@ and `*` are ignored with a warning). A browser `POST` with a body
 (one carrying an `Origin`) must be `Content-Type: application/json` (`415`
 otherwise); requests without an `Origin` are not Content-Type-checked.
 
+**The token** (#186 phase 2): on first start the service writes a random
+per-install token to `$XDG_CONFIG_HOME/gnome-speaks/token` (`~/.config/…`, mode
+`0600` in a `0700` directory), plus `curl.conf` beside it carrying the same token
+as a curl header line. Send it as `X-Speaks-Token: <token>` or
+`Authorization: Bearer <token>`; any process running as **you** can read the file,
+while other local accounts and web pages can't. Use `curl -K
+~/.config/gnome-speaks/curl.conf …` (or pipe a config to `curl -K -`). Never put
+the token itself in a `-H` argument: every local user can read a command line
+(`ps`, `/proc/<pid>/cmdline`). `tests/repros/http-token/lint_token_argv.sh` fails
+on that pattern anywhere in the repo.
+`GET /health` (`{"ok": true}`, nothing else) and CORS preflights need no token.
+
+A wrong or malformed token (two credentials, a non-Bearer `Authorization`) is
+always `401`. A request with **no** token is admitted during the migration and
+counted in `GET /status` → `auth` (`tokenless`, `tokenless_last`). Once that
+count stops growing, set `GNOME_SPEAKS_REQUIRE_TOKEN=1` in the unit's environment
+(`systemctl --user edit gnome-speaks.service`) and tokenless requests get `401`
+too. With the flag on and no usable token file (for example a symlinked one,
+which is never read), every endpoint but `/health` answers `401`: it fails
+closed. A browser page can never read the token file, so with the flag on a
+page needs a server of its own that adds the header.
+
 | Endpoint | Description |
 |----------|-------------|
 | `POST /speak` | Queue text for speech. Body: `text` (required), `voice` (Azure ShortName), `quality` (`fast`/`hd`), `output_file` (save WAV instead of playing — a file name inside `$XDG_CACHE_HOME/gnome-speaks/out/`; anything resolving outside it is a `400`, and the response echoes the resolved path. `out/` itself must be a real directory owned by you — it is tightened to `0700` on use, and a symlinked or foreign-owned `out/` is refused with `503`; a symlinked `$XDG_CACHE_HOME` is fine), `interrupt` (`true` = flush the agent backlog, cut off the playing agent item and speak now — agents only; it can never reach the *user*: it cancels only the queue's current item, never the dictation or a user-speech call, so while those are busy the item is held and the response carries `held`), `source` + `coalesce`/`kind` (see [coalescing](#coalescing-only-my-latest-matters)). Returns `{ok, id, position, state}` — plus `flushed` (how many queued items an interrupt deleted), `held` (why an interrupt did not stop the current activity: `listening`/`processing`/`user speech`) and `coalesced` (ids your own coalesce dropped); `429` when the queue (depth 32) is full. |
@@ -476,14 +498,16 @@ otherwise); requests without an `Origin` are not Content-Type-checked.
 | `POST /stop` | Panic button: stop playback and drain the queue. Returns `{ok, cleared}`. (SSIP calls this `CANCEL` — note the inverted verbs if you have speech-dispatcher reflexes.) |
 | `POST /pause` / `POST /resume` | Pause/resume. Queue-level: while paused, the next queued item won't start either. |
 | `GET /queue` | Queue introspection: `{current, pending, depth, recent}`. Each entry carries its `source` (`null` when unset). `recent` holds the last 16 terminal outcomes — `done`, `canceled` (dropped before starting), `interrupted` (cut off mid-play), or `error` — so callers can learn the fate of a submitted `id`. |
-| `GET /status` | Service state, pause flag, `call` (video-call mute: `active`, `by`, `what`, `mute_on_call` — while another app holds the microphone or camera nothing is spoken: `POST /speak` answers 503 and queued speech waits; preference *Mute All Speech During Video Calls*, on by default), `quiet` (quiet hours: `active`, `enabled`, `scheduled`, `window`, `override`, `until` — while active, `POST /speak` answers 503; your own speech is never muted; override with "cast quiet hours" or the panel switch), `extension` (`false` while the GNOME Shell extension is disabled — the service then refuses to listen, speak or type: `POST /speak` answers 503, queued items end `suppressed`), `queue_depth`, playback progress, and `speech` — the live provider route (`backend`, `offline_reason`, `local_down`, `forced_offline`, `wyoming_configured`; see [Speech backend](#speech-backend)). |
+| `GET /status` | Service state, pause flag, `call` (video-call mute: `active`, `by`, `what`, `mute_on_call` — while another app holds the microphone or camera nothing is spoken: `POST /speak` answers 503 and queued speech waits; preference *Mute All Speech During Video Calls*, on by default), `quiet` (quiet hours: `active`, `enabled`, `scheduled`, `window`, `override`, `until` — while active, `POST /speak` answers 503; your own speech is never muted; override with "cast quiet hours" or the panel switch), `extension` (`false` while the GNOME Shell extension is disabled — the service then refuses to listen, speak or type: `POST /speak` answers 503, queued items end `suppressed`), `queue_depth`, `auth` (token state: `token` — the service has one; `required` — `GNOME_SPEAKS_REQUIRE_TOKEN`; `tokenless` — requests admitted without a token since start; `tokenless_last`), playback progress, and `speech` — the live provider route (`backend`, `offline_reason`, `local_down`, `forced_offline`, `wyoming_configured`; see [Speech backend](#speech-backend)). |
 | `GET /voices` | Available Azure voices (cached 5 min). |
 | `GET /chronicle` | Read the [Chronicle](#the-chronicle). Query params: `limit` (default 20, capped at 500), `q` (case-insensitive substring), `kind` (`you` / `spoken`). Returns `{entries, enabled}`, oldest-first — ready to display. |
 | `POST /respeak` | Play a Chronicle line again. Body `{"id": N}`; omit `id` to replay the last thing spoken. Returns `{ok, respeaking}`, or `404` on a bad id, an empty chronicle, or a full queue. |
+| `GET /health` | Liveness only: `{"ok": true}`. The one endpoint that never needs the token. |
 | `GET /api/version` | [realm-sigil](https://github.com/jphein/realm-sigil) version contract (git-derived, with a minimal fallback when realm-sigil isn't installed). The optional `host` field is not served. |
 
 ```bash
-curl -X POST localhost:7710/speak -H 'Content-Type: application/json' \
+curl -K ~/.config/gnome-speaks/curl.conf -X POST localhost:7710/speak \
+  -H 'Content-Type: application/json' \
   -d '{"text": "Hello from the queue", "voice": "en-US-JennyNeural"}'
 ```
 
@@ -495,7 +519,8 @@ Tag your requests with a `source` and set `coalesce: true`, and each new request
 drops that source's own **unspoken** backlog:
 
 ```bash
-curl -X POST localhost:7710/speak -H 'Content-Type: application/json' \
+curl -K ~/.config/gnome-speaks/curl.conf -X POST localhost:7710/speak \
+  -H 'Content-Type: application/json' \
   -d '{"text": "Build 80 percent", "source": "ci", "coalesce": true}'
 # -> {"ok":true,"id":7,"position":0,"state":"queued","coalesced":[5,6]}
 ```
@@ -720,8 +745,8 @@ so "cast quiet hours" cannot be sent through it inside the window; say it, or us
 the panel switch):
 
 ```bash
-curl -X POST localhost:7710/cast -H 'Content-Type: application/json' \
-  -d '{"text": "cast defense report"}'
+curl -K ~/.config/gnome-speaks/curl.conf -X POST localhost:7710/cast \
+  -H 'Content-Type: application/json' -d '{"text": "cast defense report"}'
 ```
 
 ## License

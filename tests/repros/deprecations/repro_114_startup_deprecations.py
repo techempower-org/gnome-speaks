@@ -77,6 +77,9 @@ import harness  # noqa: E402
 os.environ["XDG_RUNTIME_DIR"] = os.path.join(harness.SCRATCH, "runtime")
 os.makedirs(os.environ["XDG_RUNTIME_DIR"], exist_ok=True)
 os.environ["GNOME_SPEAKS_HTTP_PORT"] = "0"     # ephemeral, never 7710
+# main() creates the HTTP token (#186 phase 2) under $XDG_CONFIG_HOME: never
+# the real ~/.config/gnome-speaks/token.
+os.environ["XDG_CONFIG_HOME"] = os.path.join(harness.SCRATCH, "config")
 
 import gi  # noqa: E402
 gi.require_version("Gio", "2.0")

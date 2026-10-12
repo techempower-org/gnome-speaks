@@ -249,8 +249,9 @@ git clone https://github.com/techempower-org/speech-to-cli
 cd gnome-speaks &amp;&amp; ./install.sh
 
 <span class="c"># talk to it</span>
-curl -X POST localhost:7710/speak -H 'Content-Type: application/json' \
-  -d '{"text": "The realm endures."}'</pre>
+<span class="c"># (the token in curl.conf is written on first start; see the HTTP API docs)</span>
+curl -K ~/.config/gnome-speaks/curl.conf -X POST localhost:7710/speak \
+  -H 'Content-Type: application/json' -d '{"text": "The realm endures."}'</pre>
 </section>
 
 <section class="wrap" id="learn">

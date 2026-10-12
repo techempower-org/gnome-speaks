@@ -7,6 +7,15 @@ annotated tags (`git tag -n5`).
 
 ### Security
 
+- **Per-install HTTP token** ([#186](https://github.com/techempower-org/gnome-speaks/issues/186)
+  phase 2). On first start the service writes a random token to
+  `$XDG_CONFIG_HOME/gnome-speaks/token` (0600) and a matching `curl.conf`. Send it as
+  `X-Speaks-Token` or `Authorization: Bearer`. A wrong token is always refused (401).
+  Requests with no token are still admitted and counted (`GET /status` → `auth`) until
+  `GNOME_SPEAKS_REQUIRE_TOKEN=1` is set; `GET /health` never needs it. This keeps
+  other local accounts out, which phase 1's Origin checks could not.
+  Reported by [@TheHolm](https://github.com/TheHolm) (Paul Holm).
+
 - **Local HTTP API admission** ([#186](https://github.com/techempower-org/gnome-speaks/issues/186)
   phase 1, [#187](https://github.com/techempower-org/gnome-speaks/pull/187)).
   The loopback API on `:7710` now answers browser requests only from origins

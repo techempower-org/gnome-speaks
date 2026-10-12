@@ -1,0 +1,8 @@
+# http-token (#186 phase 2): the per-install token file (private, stable,
+# symlink-refusing), grace vs required admission on every endpoint, /health
+# exempt, malformed credentials refused, nothing logged, and the documented
+# `curl -K curl.conf` recipe against a real curl. One process, ephemeral port.
+token: repro_http_token.py
+# A static guard: no tracked file (docs included) may pass the token in a
+# command line -- curl -H with the token header, or $(cat …/token).
+lint: lint_token_argv.sh
