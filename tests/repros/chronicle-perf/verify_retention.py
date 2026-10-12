@@ -7,6 +7,11 @@
                             the cold archive after the next append; newer
                             entries and an id-less line (cannot be dated) stay
   R3  THROTTLED          -- a second append inside the interval starts no prune
+  R5  only a finite positive retention prunes; "inf" never raises
+  R6  a symlinked ledger file is skipped, never replaced by a local copy
+  R7  the cutoff boundary (== kept)
+  R8  an append landing mid-rewrite of the active file survives it
+  R9  no prune in the startup grace (a wrong-forward boot clock)
   R4  PRIVATE MODES      -- a ledger dir left 0775 and files left 0664 by an
                             older build are tightened to 0700 / 0600 at the
                             first append; files created fresh are 0600; a
@@ -21,6 +26,7 @@ import os
 import shutil
 import stat
 import sys
+import threading
 import time
 import traceback
 
@@ -188,6 +194,92 @@ svc._chronicle_append("you", "R3 after interval")
 settle()
 check("R3 once the interval passes, the next append prunes", OLD not in ids(ARCHIVE),
       f"{ids(ARCHIVE)}")
+
+# ---- R5 retention values: only a finite positive number prunes --------------
+for raw, want in (("30", 30.0), ("inf", 0.0), ("1e400", 0.0), ("nan", 0.0),
+                  ("-3", 0.0), ("x", 0.0), ("", 0.0), ("0.5", 0.5)):
+    got = svc._parse_retention_days(raw)
+    check(f"R5 {raw!r} -> {want}", got == want, f"got {got}")
+saved_days = svc._CHRONICLE_RETENTION_DAYS
+svc._CHRONICLE_RETENTION_DAYS = float("inf")   # even if one slipped through
+fresh_ledger()
+try:
+    svc._chronicle_append("you", "R5 infinite")
+    settle()
+    ok_inf = svc._chronicle_find(svc._chronicle_last_id) is not None
+except Exception as exc:   # noqa: BLE001 -- the crash IS the failure
+    ok_inf = False
+    print(f"    (append raised {type(exc).__name__}: {exc})")
+check("R5 an infinite retention never raises into the append path", ok_inf)
+svc._CHRONICLE_RETENTION_DAYS = saved_days
+
+# ---- R6 a symlinked ledger file is skipped, not replaced ---------------------
+fresh_ledger()
+plant_history()
+elsewhere = os.path.join(harness.SCRATCH, "archive-elsewhere.jsonl")
+shutil.move(ARCHIVE, elsewhere)
+os.symlink(elsewhere, ARCHIVE)
+before = open(elsewhere, encoding="utf-8").read()
+svc._chronicle_append("you", "R6 trigger")
+settle()
+check("R6 a symlinked archive is left a symlink (not replaced by a local file)",
+      os.path.islink(ARCHIVE))
+check("R6 ... and its target is not rewritten", open(elsewhere, encoding="utf-8").read() == before)
+check("R6 the hot files are still pruned", MID + 1 not in ids(GEN1) and MID + 2 not in ids(ACTIVE),
+      f"gen1={ids(GEN1)} active={ids(ACTIVE)}")
+os.remove(ARCHIVE)
+os.remove(elsewhere)
+
+# ---- R7 the cutoff boundary ------------------------------------------------------
+fresh_ledger()
+cut = now_ms - 30 * DAY
+plant(ACTIVE, [{"id": cut - 1, "kind": "you", "text": "just older"},
+               {"id": cut, "kind": "you", "text": "exactly at"}], 0o600)
+with svc._chronicle_lock:
+    n = svc._chronicle_prune_file(ACTIVE, cut)
+check("R7 id == cutoff is kept, id == cutoff-1 dropped", n == 1 and ids(ACTIVE) == [cut], f"{ids(ACTIVE)}")
+
+# ---- R8 an append that lands mid-prune is not lost ---------------------------------
+fresh_ledger()
+plant_history()
+real_replace = os.replace
+racer = {}
+
+
+def racing_replace(src, dst, *a, **k):
+    if dst == ACTIVE and str(src).endswith(".prune-tmp") and "t" not in racer:
+        racer["t"] = threading.Thread(target=svc._chronicle_append, args=("you", "R8 racer"))
+        racer["t"].start()
+        time.sleep(0.3)   # give an UNLOCKED append every chance to land first
+    return real_replace(src, dst, *a, **k)
+
+
+os.replace = racing_replace
+try:
+    svc._chronicle_append("you", "R8 trigger")
+    settle()
+    if "t" in racer:
+        racer["t"].join(5)
+finally:
+    os.replace = real_replace
+texts = []
+with open(ACTIVE, encoding="utf-8") as f:
+    for line in f:
+        try:
+            texts.append(json.loads(line).get("text"))
+        except ValueError:
+            pass
+check("R8 the race was exercised", "t" in racer)
+check("R8 an append during the hot-file rewrite survives it", "R8 racer" in texts, f"{texts}")
+
+# ---- R9 no prune in a process's first minutes (clock may still be wrong) -------------
+fresh_ledger()
+plant_history()
+svc._chronicle_prune_after = time.monotonic() + svc._CHRONICLE_PRUNE_GRACE
+svc._chronicle_append("you", "R9 early")
+settle()
+check("R9 inside the startup grace nothing is pruned", OLD in ids(ARCHIVE) and MID + 2 in ids(ACTIVE))
+check("R9 the grace is at least 5 minutes", svc._CHRONICLE_PRUNE_GRACE >= 300)
 
 print()
 print("RESULT: " + ("RETENTION + MODES HOLD" if FAIL == 0 else f"{FAIL} FAILURES"))

@@ -24,6 +24,7 @@ import http.server
 import datetime
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -374,13 +375,28 @@ _chronicle_archive_retry_after = 0.0
 # _CHRONICLE_PRUNE_INTERVAL, and is kicked by an append (an idle service
 # writes nothing new, so it waits for the next utterance).
 #   GNOME_SPEAKS_CHRONICLE_RETENTION_DAYS=30
-try:
-    _CHRONICLE_RETENTION_DAYS = max(0.0, float(
-        os.environ.get("GNOME_SPEAKS_CHRONICLE_RETENTION_DAYS", "0") or 0))
-except ValueError:
-    _CHRONICLE_RETENTION_DAYS = 0.0
+# Anything that is not a finite positive number ("inf", "nan", "-3", "x")
+# means keep everything: "inf" reads as "forever", and an infinite cutoff
+# would otherwise raise OverflowError on the append path.
+
+
+def _parse_retention_days(raw):
+    try:
+        days = float(raw or 0)
+    except ValueError:
+        return 0.0
+    return days if math.isfinite(days) and days > 0 else 0.0
+
+
+_CHRONICLE_RETENTION_DAYS = _parse_retention_days(
+    os.environ.get("GNOME_SPEAKS_CHRONICLE_RETENTION_DAYS", "0"))
 _CHRONICLE_PRUNE_INTERVAL = 3600.0
-_chronicle_prune_after = 0.0  # time.monotonic() deadline for the next prune
+# No prune in a process's first minutes: a wall clock that is wrong FORWARD
+# at boot (bad RTC before NTP syncs) would otherwise date the whole ledger
+# as expired and delete it, irreversibly. Ids are wall-clock ms, so nothing
+# inside the ledger can vouch for the clock; time is the only fix.
+_CHRONICLE_PRUNE_GRACE = 600.0
+_chronicle_prune_after = time.monotonic() + _CHRONICLE_PRUNE_GRACE
 # The ledger is a transcript of the user's dictation: private to this uid.
 # Files are created 0600 and the directory is held at 0700; files that an
 # older build created under the umask (0664) are tightened at the first append.
@@ -463,17 +479,25 @@ def _chronicle_tighten_locked():
                             exc_info=True)
 
 
-def _chronicle_prune_file(path, cutoff_id):
+def _chronicle_prune_file(path, cutoff_id, count_only=False):
     """Drop entries whose id is below `cutoff_id` from one ledger file.
 
-    Returns the number of lines dropped. Rewrites through a 0600 temp file in
-    the same directory and os.replace()s it in, so a crash mid-prune leaves
-    either the old file or the new one, never a half-written ledger. A file
-    with nothing to drop is not rewritten. Lines that carry no integer id
-    (corrupt or foreign) are kept: they cannot be dated, and retention must
-    never delete what it cannot judge.
+    Returns the number of lines dropped (with count_only: that would be).
+    Rewrites through a fresh 0600 temp file (O_EXCL|O_NOFOLLOW) in the same
+    directory and os.replace()s it in, so a crash mid-prune leaves either the
+    old file or the new one, never a half-written ledger; a failed write
+    removes the temp. A file with nothing to drop is not rewritten. Lines
+    that carry no integer id (corrupt or foreign) are kept: they cannot be
+    dated, and retention must never delete what it cannot judge.
+
+    A ledger file that is a SYMLINK (say, an archive moved to another disk)
+    is skipped with a warning: os.replace() would swap the link for a local
+    file, leaving the real archive unpruned and splitting the history.
     """
     try:
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            log.warning("Chronicle retention: %s is a symlink -- not pruned", path)
+            return 0
         fin = open(path, "rb")
     except FileNotFoundError:
         return 0
@@ -492,13 +516,26 @@ def _chronicle_prune_file(path, cutoff_id):
                 dropped += 1
                 continue
             keep.append(raw if raw.endswith(b"\n") else raw + b"\n")
-    if not dropped:
-        return 0
-    with _chronicle_open_private(tmp, "wb") as fout:
-        fout.writelines(keep)
-        fout.flush()
-        os.fsync(fout.fileno())
-    os.replace(tmp, path)
+    if not dropped or count_only:
+        return dropped
+    try:
+        os.unlink(tmp)   # a stale temp from a crashed prune
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                 | getattr(os, "O_CLOEXEC", 0), _CHRONICLE_FILE_MODE)
+    try:
+        with os.fdopen(fd, "wb") as fout:
+            fout.writelines(keep)
+            fout.flush()
+            os.fsync(fout.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)   # never leave a partial copy of the dictation
+        except OSError:
+            pass
+        raise
     _fsync_dir(os.path.dirname(path))
     return dropped
 
@@ -530,9 +567,13 @@ def _chronicle_prune_worker(cutoff_id):
     global _chronicle_prune_after
     try:
         dropped = _chronicle_prune_file(_chronicle_archive_path(), cutoff_id)
-        with _chronicle_lock:
-            for path in reversed(_chronicle_files()):
-                dropped += _chronicle_prune_file(path, cutoff_id)
+        for path in reversed(_chronicle_files()):
+            # Parse once WITHOUT the lock (the lock fronts every append on
+            # the main loop); only a file that has something to drop is
+            # re-read and rewritten under it, where no append can be lost.
+            if _chronicle_prune_file(path, cutoff_id, count_only=True):
+                with _chronicle_lock:
+                    dropped += _chronicle_prune_file(path, cutoff_id)
         if dropped:
             log.info("Chronicle retention: dropped %d entr%s older than %g day(s)",
                      dropped, "y" if dropped == 1 else "ies",
@@ -553,7 +594,10 @@ def _chronicle_prune_due_locked():
         return False
     if _chronicle_archiving.is_set():
         return False   # a rotation is running; the next append retries
-    cutoff_id = int((time.time() - _CHRONICLE_RETENTION_DAYS * 86400) * 1000)
+    try:
+        cutoff_id = int((time.time() - _CHRONICLE_RETENTION_DAYS * 86400) * 1000)
+    except (OverflowError, ValueError):
+        return False   # unreachable after _parse_retention_days; never raise here
     _chronicle_archiving.set()
     try:
         threading.Thread(target=_chronicle_prune_worker, args=(cutoff_id,),
