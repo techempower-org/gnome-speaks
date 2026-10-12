@@ -10,3 +10,4 @@ never branch names (see README, "Baselines are pinned SHAs").
 |---|---|---|---|
 | `chronicle-perf` | #22 / #27 | `6a1ecae` | derived (`merge^1`), not re-run |
 | `chronicle-perf/repro_audio_info_stall` | #135 | `025df92` | **verified** — 319 ms stall, probe on MainThread |
+| `chronicle-perf/verify_retention` | #186 (phase 1, item 7) | `535250c` | **verified** — no `_CHRONICLE_RETENTION_DAYS`; the planted 0664 ledger stays 0664 |

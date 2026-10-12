@@ -132,6 +132,7 @@ The table is **generated** from `tests/repros/*/BASELINE.md` by
 | `cancel-tokens` `repro_g` | #167 | `99e0214` | **verified** — G1 fails (3 checks: state idle with the STT thread alive, agent item spoken over the mic, item 'done'); G2, G3 green on both sides. This is repro_f's residual `state 'idle'` red made deterministic — no interrupt involved |
 | `chronicle-perf` | #22 / #27 | `6a1ecae` | derived (`merge^1`), not re-run |
 | `chronicle-perf/repro_audio_info_stall` | #135 | `025df92` | **verified** — 319 ms stall, probe on MainThread |
+| `chronicle-perf/verify_retention` | #186 (phase 1, item 7) | `535250c` | **verified** — no `_CHRONICLE_RETENTION_DAYS`; the planted 0664 ledger stays 0664 |
 | `config-keys` | #120 #127 | `025df92` | **verified** — B fails: 8 keys against speech-to-cli before its #21 (`language`, `voice_commands` + 6 shell-only `show_*`), 6 after; D fails: the same 6 `show_*` (no Python reader); A, C pass |
 | `dead-recorder` | #57, #48 / #72 | `e863b2c` | **verified** — e, f, h fail; g, i pass |
 | `deprecations` | #114 | `a20afea` | **verified** — 3 deprecation lines at service start (`GLib.unix_signal_add` ×2, `Gio.DBusConnection.register_object` ×1 — PyGObject warns once per deprecated GI function per process, so two register sites make one line); `GetState` and the Spiel `Name` property answer on both sides. Runs the real `main()` on a private `dbus-run-session` bus the suite re-execs itself under; `register_object` also leaked ~1.5 kB per D-Bus method call (measured; flat through `register_object_with_closures2`) |

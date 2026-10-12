@@ -23,7 +23,11 @@ The extension touches **no** network or audio -- all I/O is in the Python servic
 Spoken output serializes through a FIFO **speech queue** (HTTP callers never stomp
 each other; user speech preempts). Transcripts hit the **spellbook** before mode
 routing. Everything said in either direction appends to the **chronicle**
-(`$XDG_STATE_HOME/gnome-speaks/chronicle.jsonl`) and is respeakable. A **wake
+(`$XDG_STATE_HOME/gnome-speaks/chronicle.jsonl`) and is respeakable. Its dir is 0700 and
+its files 0600 (`_chronicle_open_private`, `_chronicle_tighten_locked` at the first append);
+retention is opt-in, `GNOME_SPEAKS_CHRONICLE_RETENTION_DAYS` (default 0 = keep everything),
+pruned by id (= ms age) from hot files and the archive on the rotation thread, single-flight,
+hourly (`chronicle-perf/verify_retention.py`). A **wake
 watcher** thread streams mic audio to a LAN Wyoming openwakeword server while idle.
 
 ## External Dependencies
