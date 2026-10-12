@@ -414,7 +414,8 @@ def _chronicle_archive_path():
 
 
 def _chronicle_open_private(path, mode):
-    """open() for a ledger file that is created 0600, never under the umask.
+    """open() for a ledger file that is created 0600 (the umask can only
+    narrow that, never widen it to the old 0664).
 
     `mode` is "ab" or "a" (append) or "wb" (a fresh prune output). An
     existing file keeps its mode here; _chronicle_tighten_locked() fixes
@@ -498,7 +499,22 @@ def _chronicle_prune_file(path, cutoff_id):
         fout.flush()
         os.fsync(fout.fileno())
     os.replace(tmp, path)
+    _fsync_dir(os.path.dirname(path))
     return dropped
+
+
+def _fsync_dir(d):
+    """Persist a rename in `d` (best-effort: some filesystems refuse it)."""
+    try:
+        fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _chronicle_prune_worker(cutoff_id):
@@ -539,8 +555,15 @@ def _chronicle_prune_due_locked():
         return False   # a rotation is running; the next append retries
     cutoff_id = int((time.time() - _CHRONICLE_RETENTION_DAYS * 86400) * 1000)
     _chronicle_archiving.set()
-    threading.Thread(target=_chronicle_prune_worker, args=(cutoff_id,),
-                     daemon=True, name="chronicle-prune").start()
+    try:
+        threading.Thread(target=_chronicle_prune_worker, args=(cutoff_id,),
+                         daemon=True, name="chronicle-prune").start()
+    except RuntimeError:
+        # Could not start a thread: release the flag, or rotation and every
+        # later prune would wait on a worker that never existed.
+        _chronicle_archiving.clear()
+        log.warning("Chronicle retention: could not start the prune thread")
+        return False
     return True
 
 
@@ -749,8 +772,12 @@ def _chronicle_rotate_locked():
     if _chronicle_archiving.is_set():
         return  # single-flight: one rotation at a time, by design
     _chronicle_archiving.set()
-    threading.Thread(target=_chronicle_rotate_worker, daemon=True,
-                     name="chronicle-rotate").start()
+    try:
+        threading.Thread(target=_chronicle_rotate_worker, daemon=True,
+                         name="chronicle-rotate").start()
+    except RuntimeError:
+        _chronicle_archiving.clear()   # see _chronicle_prune_due_locked
+        log.warning("Chronicle rotation: could not start the rotate thread")
 
 
 def _chronicle_seed_id_locked():
