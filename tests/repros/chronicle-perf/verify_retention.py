@@ -63,7 +63,10 @@ def check(name, ok, detail=""):
 
 
 def settle():
-    deadline = time.time() + 10
+    # 60 s, not 10: a prune fsyncs every rewritten file and its directory, and
+    # on a busy spinning disk (two run_all.sh at once) that went past 10 s --
+    # twice the only red in a full run, never once in 17 standalone runs.
+    deadline = time.time() + 60
     while svc._chronicle_archiving.is_set() and time.time() < deadline:
         time.sleep(0.02)
     assert not svc._chronicle_archiving.is_set(), "background chronicle work never settled"
