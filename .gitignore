@@ -19,3 +19,6 @@ dist/
 # contains a slash, so it is anchored to the repo root and never matches the
 # one compiled at tests/repros/*/run-*/fakeext/schemas/.
 tests/repros/*/run-*/
+
+# Agent scratch notes (per-task findings; never committed)
+scratch/
