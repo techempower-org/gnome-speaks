@@ -22,8 +22,10 @@ HTTP session pooling, VAD, energy-gated silence detection.
 import argparse
 import http.server
 import datetime
+import errno
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -365,6 +367,47 @@ _chronicle_id_seeded = False
 # per utterance.
 _chronicle_archiving = threading.Event()
 _chronicle_archive_retry_after = 0.0
+# Optional retention (#186 phase 1, item 7). The Chronicle's promise is
+# "everything that was ever said", so the default (0) keeps it: nothing is
+# ever pruned. A positive number of days drops every entry older than that
+# from the hot generations AND the cold archive. Ids are wall-clock ms (see
+# _chronicle_append), so an entry's id is its age. The prune runs on the
+# rotation thread, under the same single-flight flag, at most once per
+# _CHRONICLE_PRUNE_INTERVAL, and is kicked by an append (an idle service
+# writes nothing new, so it waits for the next utterance).
+#   GNOME_SPEAKS_CHRONICLE_RETENTION_DAYS=30
+# Anything that is not a finite positive number ("inf", "nan", "-3", "x")
+# means keep everything: "inf" reads as "forever", and an infinite cutoff
+# would otherwise raise OverflowError on the append path.
+
+
+_CHRONICLE_RETENTION_MAX_DAYS = 36500.0
+
+
+def _parse_retention_days(raw):
+    try:
+        days = float(raw or 0)
+    except ValueError:
+        return 0.0
+    # Over a century is "forever" too -- and keeps the cutoff arithmetic
+    # (days * 86400 * 1000) far from float overflow (1e308 would overflow).
+    return days if math.isfinite(days) and 0 < days <= _CHRONICLE_RETENTION_MAX_DAYS else 0.0
+
+
+_CHRONICLE_RETENTION_DAYS = _parse_retention_days(
+    os.environ.get("GNOME_SPEAKS_CHRONICLE_RETENTION_DAYS", "0"))
+_CHRONICLE_PRUNE_INTERVAL = 3600.0
+# No prune in a process's first minutes: a wall clock that is wrong FORWARD
+# at boot (bad RTC before NTP syncs) would otherwise date the whole ledger
+# as expired and delete it, irreversibly. Ids are wall-clock ms, so nothing
+# inside the ledger can vouch for the clock; time is the only fix.
+_CHRONICLE_PRUNE_GRACE = 600.0
+_chronicle_prune_after = time.monotonic() + _CHRONICLE_PRUNE_GRACE
+# The ledger is a transcript of the user's dictation: private to this uid.
+# Files are created 0600 and the directory is held at 0700; files that an
+# older build created under the umask (0664) are tightened at the first append.
+_CHRONICLE_FILE_MODE = 0o600
+_CHRONICLE_DIR_MODE = 0o700
 
 
 def _chronicle_files():
@@ -390,6 +433,197 @@ def _chronicle_archive_path():
     """
     return os.path.join(os.path.dirname(CHRONICLE_PATH),
                         "chronicle-archive.jsonl")
+
+
+def _chronicle_open_private(path, mode):
+    """open() for a ledger file that is created 0600 (the umask can only
+    narrow that, never widen it to the old 0664).
+
+    `mode` is "ab" or "a" (append) or "wb" (a fresh prune output). An
+    existing file keeps its mode here; _chronicle_tighten_locked() fixes
+    files an older build left group/world-readable.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= os.O_TRUNC if mode.startswith("w") else os.O_APPEND
+    fd = os.open(path, flags, _CHRONICLE_FILE_MODE)
+    try:
+        if "b" in mode:
+            return os.fdopen(fd, mode)
+        return os.fdopen(fd, mode, encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _chronicle_tighten_locked():
+    """Make the ledger directory 0700 and its files 0600. Caller holds the lock.
+
+    Only touches what this uid owns and what is not a symlink (lstat, never
+    followed): a link planted in place of a ledger file is left alone rather
+    than chmod'ing whatever it points at. Best-effort, like every chronicle
+    write: a failure is logged, never raised into the speech path.
+    """
+    d = os.path.dirname(CHRONICLE_PATH)
+    uid = os.getuid()
+    for path, want in ([(d, _CHRONICLE_DIR_MODE)]
+                       + [(p, _CHRONICLE_FILE_MODE)
+                          for p in _chronicle_files() + [_chronicle_archive_path()]]):
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            log.debug("Chronicle tighten: lstat %s failed", path, exc_info=True)
+            continue
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != uid:
+            continue
+        if stat.S_IMODE(st.st_mode) & ~want:
+            try:
+                os.chmod(path, want)
+            except OSError:
+                log.warning("Chronicle tighten: chmod %s failed", path,
+                            exc_info=True)
+
+
+def _chronicle_prune_file(path, cutoff_id, count_only=False):
+    """Drop entries whose id is below `cutoff_id` from one ledger file.
+
+    Returns the number of lines dropped (with count_only: that would be).
+    Rewrites through a fresh 0600 temp file (O_EXCL|O_NOFOLLOW) in the same
+    directory and os.replace()s it in, so a crash mid-prune leaves either the
+    old file or the new one, never a half-written ledger; a failed write
+    removes the temp. A file with nothing to drop is not rewritten. Lines
+    that carry no integer id (corrupt or foreign) are kept: they cannot be
+    dated, and retention must never delete what it cannot judge.
+
+    A ledger file that is a SYMLINK (say, an archive moved to another disk)
+    is skipped with a warning: os.replace() would swap the link for a local
+    file, leaving the real archive unpruned and splitting the history.
+    """
+    try:
+        # O_NOFOLLOW on the open itself: no window between a link check and
+        # the open (ELOOP = a symlink, skipped).
+        fin = os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW
+                                | getattr(os, "O_CLOEXEC", 0)), "rb")
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            log.warning("Chronicle retention: %s is a symlink -- not pruned", path)
+            return 0
+        raise
+    # Per-process temp name: a second process (there should never be one --
+    # the D-Bus name is single-owner) can never unlink or publish ours.
+    tmp = "%s.prune-%d.tmp" % (path, os.getpid())
+    dropped = 0
+    keep = []
+    with fin:
+        for raw in fin:
+            if not raw.strip():
+                continue
+            try:
+                eid = json.loads(raw).get("id")
+            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+                eid = None
+            if isinstance(eid, int) and not isinstance(eid, bool) and eid < cutoff_id:
+                dropped += 1
+                continue
+            keep.append(raw if raw.endswith(b"\n") else raw + b"\n")
+    if not dropped or count_only:
+        return dropped
+    try:
+        os.unlink(tmp)   # stale: an earlier crash of THIS pid's prune
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                 | getattr(os, "O_CLOEXEC", 0), _CHRONICLE_FILE_MODE)
+    try:
+        with os.fdopen(fd, "wb") as fout:
+            fout.writelines(keep)
+            fout.flush()
+            os.fsync(fout.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)   # never leave a partial copy of the dictation
+        except OSError:
+            pass
+        raise
+    _fsync_dir(os.path.dirname(path))
+    return dropped
+
+
+def _fsync_dir(d):
+    """Persist a rename in `d` (best-effort: some filesystems refuse it)."""
+    try:
+        fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _chronicle_prune_worker(cutoff_id):
+    """Apply retention to every ledger file. Runs single-flight (the caller
+    set _chronicle_archiving), like the rotation worker.
+
+    The archive is rewritten WITHOUT _chronicle_lock (it can be large, and
+    the lock fronts every append on the main loop); single-flight is what
+    keeps rotation from appending to it meanwhile. The hot files are bounded
+    by the rotation cap and are rewritten under the lock, because appends and
+    renames touch them.
+    """
+    global _chronicle_prune_after
+    try:
+        dropped = _chronicle_prune_file(_chronicle_archive_path(), cutoff_id)
+        for path in reversed(_chronicle_files()):
+            # Parse once WITHOUT the lock (the lock fronts every append on
+            # the main loop); only a file that has something to drop is
+            # re-read and rewritten under it, where no append can be lost.
+            if _chronicle_prune_file(path, cutoff_id, count_only=True):
+                with _chronicle_lock:
+                    dropped += _chronicle_prune_file(path, cutoff_id)
+        if dropped:
+            log.info("Chronicle retention: dropped %d entr%s older than %g day(s)",
+                     dropped, "y" if dropped == 1 else "ies",
+                     _CHRONICLE_RETENTION_DAYS)
+    except Exception:
+        log.warning("Chronicle retention prune failed", exc_info=True)
+    finally:
+        _chronicle_prune_after = time.monotonic() + _CHRONICLE_PRUNE_INTERVAL
+        _chronicle_archiving.clear()
+
+
+def _chronicle_prune_due_locked():
+    """Kick a retention prune when one is configured and due. Caller holds
+    _chronicle_lock. Returns True when a prune thread was started."""
+    if _CHRONICLE_RETENTION_DAYS <= 0:
+        return False
+    if time.monotonic() < _chronicle_prune_after:
+        return False
+    if _chronicle_archiving.is_set():
+        return False   # a rotation is running; the next append retries
+    try:
+        cutoff_id = int((time.time() - _CHRONICLE_RETENTION_DAYS * 86400) * 1000)
+    except (OverflowError, ValueError):
+        # _parse_retention_days caps the value, so this is a backstop only:
+        # never raise into the append path.
+        return False
+    _chronicle_archiving.set()
+    try:
+        threading.Thread(target=_chronicle_prune_worker, args=(cutoff_id,),
+                         daemon=True, name="chronicle-prune").start()
+    except RuntimeError:
+        # Could not start a thread: release the flag, or rotation and every
+        # later prune would wait on a worker that never existed.
+        _chronicle_archiving.clear()
+        log.warning("Chronicle retention: could not start the prune thread")
+        return False
+    return True
 
 
 def _iter_lines_reverse(path, block=None):
@@ -506,7 +740,7 @@ def _chronicle_archive_generation(src):
     archive = _chronicle_archive_path()
     kept = skipped = 0
     try:
-        with open(src, "rb") as fin, open(archive, "ab") as fout:
+        with open(src, "rb") as fin, _chronicle_open_private(archive, "ab") as fout:
             for raw in fin:
                 if not raw.strip():
                     continue
@@ -588,6 +822,7 @@ def _chronicle_rotate_locked():
     """
     try:
         if os.path.getsize(CHRONICLE_PATH) < _CHRONICLE_MAX_BYTES:
+            _chronicle_prune_due_locked()
             return
     except OSError:
         return
@@ -596,8 +831,12 @@ def _chronicle_rotate_locked():
     if _chronicle_archiving.is_set():
         return  # single-flight: one rotation at a time, by design
     _chronicle_archiving.set()
-    threading.Thread(target=_chronicle_rotate_worker, daemon=True,
-                     name="chronicle-rotate").start()
+    try:
+        threading.Thread(target=_chronicle_rotate_worker, daemon=True,
+                         name="chronicle-rotate").start()
+    except RuntimeError:
+        _chronicle_archiving.clear()   # see _chronicle_prune_due_locked
+        log.warning("Chronicle rotation: could not start the rotate thread")
 
 
 def _chronicle_seed_id_locked():
@@ -642,8 +881,10 @@ def _chronicle_append(kind, text, voice=None, source=None):
         entry["source"] = source
     try:
         with _chronicle_lock:
-            os.makedirs(os.path.dirname(CHRONICLE_PATH), exist_ok=True)
+            os.makedirs(os.path.dirname(CHRONICLE_PATH), mode=_CHRONICLE_DIR_MODE,
+                        exist_ok=True)
             if not _chronicle_id_seeded:
+                _chronicle_tighten_locked()
                 _chronicle_seed_id_locked()
             # ms timestamp as id; bump on same-ms collisions so ids stay
             # unique without a persistent counter.
@@ -652,7 +893,7 @@ def _chronicle_append(kind, text, voice=None, source=None):
                 eid = _chronicle_last_id + 1
             _chronicle_last_id = eid
             entry["id"] = eid
-            with open(CHRONICLE_PATH, "a", encoding="utf-8") as f:
+            with _chronicle_open_private(CHRONICLE_PATH, "a") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             _chronicle_rotate_locked()
     except OSError:

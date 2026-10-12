@@ -1,0 +1,290 @@
+"""Chronicle retention and file modes (#186 phase 1, item 7).
+
+  R1  DEFAULT KEEPS ALL  -- with no GNOME_SPEAKS_CHRONICLE_RETENTION_DAYS, an
+                            entry a year old survives appends in every file
+  R2  RETENTION PRUNES   -- with 30 days set, entries older than that are gone
+                            from the active file, the rotated generation AND
+                            the cold archive after the next append; newer
+                            entries and an id-less line (cannot be dated) stay
+  R3  THROTTLED          -- a second append inside the interval starts no prune
+  R5  only a finite positive retention prunes; "inf" never raises
+  R6  a symlinked ledger file is skipped, never replaced by a local copy
+  R7  the cutoff boundary (== kept)
+  R8  an append landing mid-rewrite of the active file survives it
+  R9  no prune in the startup grace (a wrong-forward boot clock)
+  R4  PRIVATE MODES      -- a ledger dir left 0775 and files left 0664 by an
+                            older build are tightened to 0700 / 0600 at the
+                            first append; files created fresh are 0600; a
+                            symlink in place of the archive is NOT chmod'ed
+                            through
+
+Hermetic: scratch in the repo's gitignored tmp/ keyed by PID, never
+~/.local/state. exit 0 = all hold; 1 = a violation.
+"""
+import json
+import os
+import shutil
+import stat
+import sys
+import threading
+import time
+import traceback
+
+# The runner discards stderr, so a crash would show only the last "ok" line.
+# Put the traceback on stdout, where the runner's summary can see it.
+def _crash_to_stdout(t, v, tb):
+    traceback.print_exception(t, v, tb, file=sys.stdout)
+    print(f"CRASH: {t.__name__}: {v}", flush=True)
+
+
+sys.excepthook = _crash_to_stdout
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
+os.environ.setdefault("GS_SVC_PATH", os.path.join(REPO_ROOT, "gnome-speaks-service.py"))
+os.environ.pop("GNOME_SPEAKS_CHRONICLE_RETENTION_DAYS", None)   # R1 is the default
+
+import harness  # noqa: E402
+
+STATE_DIR = os.path.join(harness.SCRATCH, "retention-state")
+shutil.rmtree(STATE_DIR, ignore_errors=True)
+os.environ["XDG_STATE_HOME"] = STATE_DIR
+os.makedirs(STATE_DIR, exist_ok=True)
+
+svc, _events = harness.load()
+FAIL = 0
+
+
+def check(name, ok, detail=""):
+    global FAIL
+    print(("  ok   " if ok else "  FAIL ") + name + (f"  ({detail})" if detail else ""))
+    if not ok:
+        FAIL += 1
+
+
+def settle():
+    # 60 s, not 10: a prune fsyncs every rewritten file and its directory, and
+    # on a busy spinning disk (two run_all.sh at once) that went past 10 s --
+    # twice the only red in a full run, never once in 17 standalone runs.
+    deadline = time.time() + 60
+    while svc._chronicle_archiving.is_set() and time.time() < deadline:
+        time.sleep(0.02)
+    assert not svc._chronicle_archiving.is_set(), "background chronicle work never settled"
+
+
+def mode(path):
+    return stat.S_IMODE(os.lstat(path).st_mode)
+
+
+def ids(path):
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    out.append(json.loads(line).get("id"))
+                except ValueError:
+                    continue   # the planted undatable line
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def plant(path, entries, file_mode=0o664):
+    with open(path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write((e if isinstance(e, str) else json.dumps(e)) + "\n")
+    os.chmod(path, file_mode)
+
+
+def fresh_ledger():
+    d = os.path.dirname(svc.CHRONICLE_PATH)
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d, exist_ok=True)
+    for name in os.listdir(d):   # anything a straggler wrote after the rmtree
+        p_ = os.path.join(d, name)
+        os.remove(p_) if not os.path.isdir(p_) or os.path.islink(p_) else shutil.rmtree(p_)
+    os.chmod(d, 0o775)
+    svc._chronicle_id_seeded = False
+    svc._chronicle_last_id = 0
+    svc._chronicle_prune_after = 0.0
+    return d
+
+
+assert svc.CHRONICLE_PATH.startswith(STATE_DIR), svc.CHRONICLE_PATH
+now_ms = int(time.time() * 1000)
+DAY = 86400 * 1000
+OLD = now_ms - 365 * DAY          # a year ago
+MID = now_ms - 40 * DAY           # older than a 30-day window
+NEW = now_ms - 2 * DAY            # inside it
+ACTIVE = svc.CHRONICLE_PATH
+GEN1 = ACTIVE + ".1"
+ARCHIVE = svc._chronicle_archive_path()
+
+
+def plant_history():
+    plant(ARCHIVE, [{"id": OLD, "kind": "you", "text": "archived old"},
+                    {"id": MID, "kind": "you", "text": "archived mid"},
+                    "not json at all"])
+    plant(GEN1, [{"id": MID + 1, "kind": "spoken", "text": "gen1 mid"},
+                 {"id": NEW, "kind": "spoken", "text": "gen1 new"}])
+    plant(ACTIVE, [{"id": MID + 2, "kind": "you", "text": "active mid"},
+                   {"id": NEW + 1, "kind": "you", "text": "active new"}])
+
+
+# ---- R1 default: keep everything -------------------------------------------
+check("R1 default retention is off", svc._CHRONICLE_RETENTION_DAYS == 0,
+      f"_CHRONICLE_RETENTION_DAYS={svc._CHRONICLE_RETENTION_DAYS}")
+fresh_ledger()
+plant_history()
+svc._chronicle_append("you", "R1 append")
+settle()
+check("R1 nothing pruned with retention off",
+      OLD in ids(ARCHIVE) and MID + 1 in ids(GEN1) and MID + 2 in ids(ACTIVE),
+      f"archive={ids(ARCHIVE)} gen1={ids(GEN1)}")
+
+# ---- R4 modes (on the R1 ledger: planted 0664 files, 0775 dir) --------------
+d = os.path.dirname(ACTIVE)
+check("R4 ledger dir tightened to 0700", mode(d) == 0o700, oct(mode(d)))
+for p in (ACTIVE, GEN1, ARCHIVE):
+    check(f"R4 {os.path.basename(p)} tightened to 0600", mode(p) == 0o600, oct(mode(p)))
+
+d = fresh_ledger()
+os.chmod(d, 0o700)
+os.umask(0o002)
+svc._chronicle_append("you", "R4 fresh")
+settle()
+check("R4 a freshly created active file is 0600 under umask 002",
+      mode(ACTIVE) == 0o600, oct(mode(ACTIVE)))
+
+d = fresh_ledger()
+victim = os.path.join(harness.SCRATCH, "retention-victim")
+plant(victim, ["{}"], 0o644)
+os.symlink(victim, ARCHIVE)
+svc._chronicle_append("you", "R4 symlink")
+settle()
+check("R4 a symlinked archive is not chmod'ed through", mode(victim) == 0o644,
+      oct(mode(victim)))
+os.remove(ARCHIVE)
+
+# ---- R2 retention on --------------------------------------------------------
+svc._CHRONICLE_RETENTION_DAYS = 30.0
+fresh_ledger()
+plant_history()
+svc._chronicle_append("you", "R2 trigger")
+settle()
+a, g, act = ids(ARCHIVE), ids(GEN1), ids(ACTIVE)
+check("R2 archive: entries older than 30 days dropped", OLD not in a and MID not in a, f"{a}")
+check("R2 archive: the undatable line is kept",
+      "not json at all" in open(ARCHIVE, encoding="utf-8").read())
+check("R2 gen .1: old dropped, new kept", MID + 1 not in g and NEW in g, f"{g}")
+check("R2 active: old dropped, new + the trigger kept",
+      MID + 2 not in act and NEW + 1 in act and len(act) == 2, f"{act}")
+check("R2 rewritten files stay 0600",
+      all(mode(p) == 0o600 for p in (ACTIVE, GEN1, ARCHIVE)))
+check("R2 no temp file left behind",
+      not [n for n in os.listdir(os.path.dirname(ACTIVE)) if ".prune-" in n and n.endswith(".tmp")])
+entries = svc._chronicle_read(limit=50, q="mid", include_archive=True)
+check("R2 a search no longer finds pruned text", not entries, f"{entries}")
+
+# ---- R3 throttle ------------------------------------------------------------
+plant(ARCHIVE, [{"id": OLD, "kind": "you", "text": "late old"}], 0o600)
+started = svc._chronicle_prune_due_locked()
+check("R3 a second prune inside the interval is not started", started is False)
+check("R3 the planted old line is still there (no prune ran)", OLD in ids(ARCHIVE))
+svc._chronicle_prune_after = 0.0
+svc._chronicle_append("you", "R3 after interval")
+settle()
+check("R3 once the interval passes, the next append prunes", OLD not in ids(ARCHIVE),
+      f"{ids(ARCHIVE)}")
+
+# ---- R5 retention values: only a finite positive number prunes --------------
+for raw, want in (("30", 30.0), ("inf", 0.0), ("1e400", 0.0), ("nan", 0.0),
+                  ("-3", 0.0), ("x", 0.0), ("", 0.0), ("0.5", 0.5),
+                  ("1e308", 0.0), ("36500", 36500.0), ("36501", 0.0)):
+    got = svc._parse_retention_days(raw)
+    check(f"R5 {raw!r} -> {want}", got == want, f"got {got}")
+saved_days = svc._CHRONICLE_RETENTION_DAYS
+svc._CHRONICLE_RETENTION_DAYS = float("inf")   # even if one slipped through
+fresh_ledger()
+try:
+    svc._chronicle_append("you", "R5 infinite")
+    settle()
+    ok_inf = svc._chronicle_find(svc._chronicle_last_id) is not None
+except Exception as exc:   # noqa: BLE001 -- the crash IS the failure
+    ok_inf = False
+    print(f"    (append raised {type(exc).__name__}: {exc})")
+check("R5 an infinite retention never raises into the append path", ok_inf)
+svc._CHRONICLE_RETENTION_DAYS = saved_days
+
+# ---- R6 a symlinked ledger file is skipped, not replaced ---------------------
+fresh_ledger()
+plant_history()
+elsewhere = os.path.join(harness.SCRATCH, "archive-elsewhere.jsonl")
+shutil.move(ARCHIVE, elsewhere)
+os.symlink(elsewhere, ARCHIVE)
+before = open(elsewhere, encoding="utf-8").read()
+svc._chronicle_append("you", "R6 trigger")
+settle()
+check("R6 a symlinked archive is left a symlink (not replaced by a local file)",
+      os.path.islink(ARCHIVE))
+check("R6 ... and its target is not rewritten", open(elsewhere, encoding="utf-8").read() == before)
+check("R6 the hot files are still pruned", MID + 1 not in ids(GEN1) and MID + 2 not in ids(ACTIVE),
+      f"gen1={ids(GEN1)} active={ids(ACTIVE)}")
+os.remove(ARCHIVE)
+os.remove(elsewhere)
+
+# ---- R7 the cutoff boundary ------------------------------------------------------
+fresh_ledger()
+cut = now_ms - 30 * DAY
+plant(ACTIVE, [{"id": cut - 1, "kind": "you", "text": "just older"},
+               {"id": cut, "kind": "you", "text": "exactly at"}], 0o600)
+with svc._chronicle_lock:
+    n = svc._chronicle_prune_file(ACTIVE, cut)
+check("R7 id == cutoff is kept, id == cutoff-1 dropped", n == 1 and ids(ACTIVE) == [cut], f"{ids(ACTIVE)}")
+
+# ---- R8 an append that lands mid-prune is not lost ---------------------------------
+fresh_ledger()
+plant_history()
+real_replace = os.replace
+racer = {}
+
+
+def racing_replace(src, dst, *a, **k):
+    if dst == ACTIVE and ".prune-" in str(src) and "t" not in racer:
+        racer["t"] = threading.Thread(target=svc._chronicle_append, args=("you", "R8 racer"))
+        racer["t"].start()
+        time.sleep(0.3)   # give an UNLOCKED append every chance to land first
+    return real_replace(src, dst, *a, **k)
+
+
+os.replace = racing_replace
+try:
+    svc._chronicle_append("you", "R8 trigger")
+    settle()
+    if "t" in racer:
+        racer["t"].join(5)
+finally:
+    os.replace = real_replace
+texts = []
+with open(ACTIVE, encoding="utf-8") as f:
+    for line in f:
+        try:
+            texts.append(json.loads(line).get("text"))
+        except ValueError:
+            pass
+check("R8 the race was exercised", "t" in racer)
+check("R8 an append during the hot-file rewrite survives it", "R8 racer" in texts, f"{texts}")
+
+# ---- R9 no prune in a process's first minutes (clock may still be wrong) -------------
+fresh_ledger()
+plant_history()
+svc._chronicle_prune_after = time.monotonic() + svc._CHRONICLE_PRUNE_GRACE
+svc._chronicle_append("you", "R9 early")
+settle()
+check("R9 inside the startup grace nothing is pruned", OLD in ids(ARCHIVE) and MID + 2 in ids(ACTIVE))
+check("R9 the grace is at least 5 minutes", svc._CHRONICLE_PRUNE_GRACE >= 300)
+
+print()
+print("RESULT: " + ("RETENTION + MODES HOLD" if FAIL == 0 else f"{FAIL} FAILURES"))
+sys.exit(1 if FAIL else 0)

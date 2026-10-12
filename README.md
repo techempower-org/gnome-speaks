@@ -555,6 +555,18 @@ in its **original** voice, while a `you` line is read back in the current defaul
 Recording is on by default and switchable in preferences ("Keep the Chronicle") or by
 voice; while sealed, nothing is written at all.
 
+The ledger is private to your account: its directory is kept at `0700` and its files at
+`0600` (files an older version created under the umask are tightened at the next write).
+It keeps everything by default, rotating the active file past 2 MB into a cold
+`chronicle-archive.jsonl`. To keep only recent history, set a retention window in the
+service environment, e.g. `GNOME_SPEAKS_CHRONICLE_RETENTION_DAYS=30` in a
+`systemctl --user edit gnome-speaks.service` drop-in. Entries older than that are dropped
+from every file (the active one, its rotated generation and the archive) at most once an
+hour, on the next write, and never in the service's first 10 minutes (a clock that is
+wrong at boot must not expire the whole ledger). A ledger file that is a symlink, such as
+an archive moved to another disk, is left alone with a warning. Only a finite positive
+number enables it; `inf` means keep everything.
+
 ## Spiel provider
 
 gnome-speaks can register as a [Spiel](https://github.com/project-spiel) speech
