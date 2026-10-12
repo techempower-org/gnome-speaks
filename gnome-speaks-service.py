@@ -569,6 +569,42 @@ def _fsync_dir(d):
         os.close(fd)
 
 
+def _chronicle_sweep_prune_temps():
+    """Remove prune temps an earlier, crashed process left behind.
+
+    Temps are named per pid (see _chronicle_prune_file), so a process killed
+    mid-write leaves a 0600 partial copy of the dictation that no later
+    prune would overwrite. Runs single-flight on the prune thread, so this
+    process has no temp of its own in flight; a temp of a pid that is still
+    alive is left alone (it is not ours to judge). Regular files only.
+    """
+    d = os.path.dirname(CHRONICLE_PATH)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for name in names:
+        m = re.fullmatch(r"chronicle(?:-archive)?\.jsonl(?:\.\d+)?\.prune-(\d+)\.tmp", name)
+        if not m:
+            continue
+        pid = int(m.group(1))
+        if pid != os.getpid():
+            try:
+                os.kill(pid, 0)
+                continue          # alive: someone else's, leave it
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                continue          # alive, another user's
+        path = os.path.join(d, name)
+        try:
+            if stat.S_ISREG(os.lstat(path).st_mode):
+                os.unlink(path)
+                log.info("Chronicle retention: removed a stale prune temp (%s)", name)
+        except OSError:
+            pass
+
+
 def _chronicle_prune_worker(cutoff_id):
     """Apply retention to every ledger file. Runs single-flight (the caller
     set _chronicle_archiving), like the rotation worker.
@@ -581,6 +617,7 @@ def _chronicle_prune_worker(cutoff_id):
     """
     global _chronicle_prune_after
     try:
+        _chronicle_sweep_prune_temps()
         dropped = _chronicle_prune_file(_chronicle_archive_path(), cutoff_id)
         for path in reversed(_chronicle_files()):
             # Parse once WITHOUT the lock (the lock fronts every append on
