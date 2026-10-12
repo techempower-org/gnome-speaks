@@ -475,8 +475,10 @@ per-install token to `$XDG_CONFIG_HOME/gnome-speaks/token` (`~/.config/…`, mod
 as a curl header line. Send it as `X-Speaks-Token: <token>` or
 `Authorization: Bearer <token>`; any process running as **you** can read the file,
 while other local accounts and web pages can't. Use `curl -K
-~/.config/gnome-speaks/curl.conf …` (or pipe a config to `curl -K -`) rather than
-`-H "X-Speaks-Token: $(cat …)"`: a command line is visible to every local user.
+~/.config/gnome-speaks/curl.conf …` (or pipe a config to `curl -K -`). Never put
+the token itself in a `-H` argument: every local user can read a command line
+(`ps`, `/proc/<pid>/cmdline`). `tests/repros/http-token/lint_token_argv.sh` fails
+on that pattern anywhere in the repo.
 `GET /health` (`{"ok": true}`, nothing else) and CORS preflights need no token.
 
 A wrong or malformed token (two credentials, a non-Bearer `Authorization`) is
