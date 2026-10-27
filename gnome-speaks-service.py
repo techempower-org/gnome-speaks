@@ -2455,6 +2455,45 @@ class _RecorderTap:
         return self._dropped
 
 
+
+def _route_type_tokens(pending, in_type_tag, carry):
+    """Split one streamed token into speakable text and <type> holdout.
+
+    Returns (speak, in_type_tag, carry). `carry` is a partial "<type" / "</type"
+    fragment that must be prepended to the NEXT token; it never reaches the
+    speaker (2026-10-27: it used to be appended to the speech buffer, so a tag
+    split across tokens was read aloud as "type" / "slash type" and its content
+    was both spoken and typed).
+    """
+    pending = carry + pending
+    speak = ""
+    while pending:
+        if in_type_tag:
+            close_idx = pending.find("</type>")
+            if close_idx >= 0:
+                in_type_tag = False
+                pending = pending[close_idx + 7:]
+            else:
+                # keep a trailing partial "</type" so the close is seen next token
+                for i in range(1, min(7, len(pending) + 1)):
+                    if "</type>"[:i] == pending[-i:]:
+                        return speak, in_type_tag, pending[-i:]
+                return speak, in_type_tag, ""
+        else:
+            open_idx = pending.find("<type>")
+            if open_idx >= 0:
+                speak += pending[:open_idx]
+                in_type_tag = True
+                pending = pending[open_idx + 6:]
+            else:
+                for i in range(1, min(6, len(pending) + 1)):
+                    if "<type>"[:i] == pending[-i:]:
+                        speak += pending[:-i]
+                        return speak, in_type_tag, pending[-i:]
+                speak += pending
+                pending = ""
+    return speak, in_type_tag, ""
+
 class GnomeSpeaksService:
     """Core service logic using speech-to-cli building blocks."""
 
@@ -6032,6 +6071,7 @@ class GnomeSpeaksService:
             full_reply = []     # all tokens for conversation history
             buffer = ""         # accumulates tokens until sentence boundary
             in_type_tag = False # True while inside <type>...</type>
+            type_carry = ""
             first_sentence = True
             spoke_anything = False
             aborted = False     # begin() refused: a stop beat the first note
@@ -6162,6 +6202,9 @@ class GnomeSpeaksService:
                 """
                 if playback_over or self._stop_event.is_set():
                     return False
+                text = re.sub(r'</?type>', '', text).strip()
+                if not text:
+                    return not playback_over
                 item = _PreparedSentence(text, dict(
                     quality=self._voice_quality,
                     speed=CONFIG.get("speed", 1.0),
@@ -6180,40 +6223,11 @@ class GnomeSpeaksService:
                     break
                 full_reply.append(token)
 
-                # Track <type> tag state so we don't speak tagged content.
-                # Accumulate tagged content silently; it gets pasted at the end.
-                pending = token
-                while pending:
-                    if in_type_tag:
-                        close_idx = pending.find("</type>")
-                        if close_idx >= 0:
-                            # End of type tag — skip content, resume after
-                            in_type_tag = False
-                            pending = pending[close_idx + 7:]
-                        else:
-                            # Still inside type tag — consume entirely
-                            pending = ""
-                    else:
-                        open_idx = pending.find("<type>")
-                        if open_idx >= 0:
-                            # Text before the tag is speakable
-                            buffer += pending[:open_idx]
-                            in_type_tag = True
-                            pending = pending[open_idx + 6:]
-                        else:
-                            # Check for partial "<type" at end of pending
-                            # to avoid speaking an incomplete tag opener
-                            partial = ""
-                            for i in range(1, min(6, len(pending) + 1)):
-                                if "<type>"[:i] == pending[-i:]:
-                                    partial = pending[-i:]
-                                    pending = pending[:-i]
-                                    break
-                            buffer += pending
-                            # Put partial back — next token will complete it
-                            # or it will be flushed as text
-                            buffer += partial
-                            pending = ""
+                # Track <type> tag state so we don't speak tagged content; a tag split
+                # across tokens rides in `type_carry`, never in the speech buffer.
+                spoken_part, in_type_tag, type_carry = _route_type_tokens(
+                    token, in_type_tag, type_carry)
+                buffer += spoken_part
 
                 # Check for complete sentences in the buffer
                 sentences, buffer = self._split_sentences(buffer)
@@ -6235,6 +6249,17 @@ class GnomeSpeaksService:
                     and not self._stop_event.is_set()):
                 log.info("Streaming TTS remainder: %s", remainder[:80])
                 _enqueue_sentence(remainder)
+            # A reply wrapped in <type> without being asked to type (coder models do
+            # this to whole answers) is an answer, not a paste: speak it.
+            _typed_wanted = bool(CONFIG.get("terminal_mode", False)) or bool(
+                re.search(r'\b(type|write|draft|paste|dictate)\b', user_text or "", re.I))
+            _early_type, _ = self._parse_type_tags("".join(full_reply))
+            if (_early_type and not _typed_wanted and not aborted and not playback_over
+                    and not self._stop_event.is_set()):
+                log.info("<type> block not requested: speaking it (%d chars)", len(_early_type))
+                for _sent in self._split_sentences(_early_type + " ")[0] or [_early_type]:
+                    if not _enqueue_sentence(_sent.strip()):
+                        break
 
             # Let the speaker finish the sentence it holds, then stop it. The
             # old code blocked in tts() on this very thread for the same span.
@@ -6261,6 +6286,8 @@ class GnomeSpeaksService:
 
                 # Handle <type> tags from accumulated reply (terminal mode)
                 type_text, _speak_text = self._parse_type_tags(reply)
+                if type_text and not _typed_wanted:
+                    type_text = ""  # spoken above instead
                 if type_text and not (cancel_token is not None
                                       and cancel_token.cancelled):
                     log.info("Typing %d chars at cursor (from streamed reply)", len(type_text))
