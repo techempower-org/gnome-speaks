@@ -5311,6 +5311,9 @@ class GnomeSpeaksService:
             )
             sub_thread.start()
 
+            # The Talk() path bypasses the queue, so log the spoken side here too
+            # (JP 2026-11-11 10:38: his replies were in the chronicle, the questions were not).
+            _chronicle_append("spoken", text, voice=self._voice_quality, source="talk")
             result = speech_tts.talk_fullduplex(
                 text, quality=self._voice_quality,
                 audio_level_cb=self._tts_level_cb,
