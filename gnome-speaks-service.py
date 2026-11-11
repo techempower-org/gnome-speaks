@@ -5316,6 +5316,10 @@ class GnomeSpeaksService:
             _chronicle_append("spoken", text, voice=self._voice_quality, source="talk")
             result = speech_tts.talk_fullduplex(
                 text, quality=self._voice_quality,
+                # The library default of 30 s counts from the start of the question, so a
+                # 15 s question + an 8 s pause left JP cut off mid-sentence (2026-11-11 10:41,
+                # 'gnome should listen for longer if i am in the middle of talking').
+                seconds=int(CONFIG.get("talk_max_seconds", 120)),
                 audio_level_cb=self._tts_level_cb,
                 partial_cb=lambda t: GLib.idle_add(self._emit_partial_transcription, t),
             )
