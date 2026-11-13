@@ -2695,7 +2695,7 @@ class GnomeSpeaksService:
         # STT / timing
         "language", "end_word", "voice_commands",
         "silence_timeout", "no_speech_timeout", "loop_silence_timeout",
-        "conversation_silence_timeout", "talk_silence_timeout",
+        "conversation_silence_timeout", "talk_silence_timeout", "talk_max_seconds",
         "max_record_seconds",
         # Barge-in
         "enable_barge_in", "barge_in_frames", "barge_in_silence",
