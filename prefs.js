@@ -840,6 +840,10 @@ export default class GnomeSpeaksPreferences extends ExtensionPreferences {
             0.5, 10.0, 0.5, 1, 4.0,
             'Silence timeout for external apps using the Talk D-Bus call. Default: 4');
 
+        this._addSpinRow(devGroup, 'Talk Mode Limit', 'talk_max_seconds',
+            10, 600, 10, 0, 120,
+            'Longest a Talk D-Bus call records, counted from the start of the question. Default: 120');
+
         // ── Corrections ──
         const correctGroup = new Adw.PreferencesGroup({title: 'Auto-Corrections'});
         page.add(correctGroup);
