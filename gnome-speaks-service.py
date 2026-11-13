@@ -577,32 +577,47 @@ def _chronicle_sweep_prune_temps():
     prune would overwrite. Runs single-flight on the prune thread, so this
     process has no temp of its own in flight; a temp of a pid that is still
     alive is left alone (it is not ours to judge). Regular files only.
+
+    Anchored to one directory fd (#191): listing, lstat and unlink all
+    resolve against the directory that was checked, never a re-walked path,
+    and the sweep is skipped unless that directory is ours and 0700.
     """
     d = os.path.dirname(CHRONICLE_PATH)
     try:
-        names = os.listdir(d)
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError:
         return
-    for name in names:
-        m = re.fullmatch(r"chronicle(?:-archive)?\.jsonl(?:\.\d+)?\.prune-(\d+)\.tmp", name)
-        if not m:
-            continue
-        pid = int(m.group(1))
-        if pid != os.getpid():
+    try:
+        st = os.fstat(dfd)
+        if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o700:
+            log.warning("Chronicle retention: temp sweep skipped, the chronicle "
+                        "directory is not ours with mode 0700 (uid %d, mode %o)",
+                        st.st_uid, stat.S_IMODE(st.st_mode))
+            return
+        names = os.listdir(dfd)
+        for name in names:
+            m = re.fullmatch(r"chronicle(?:-archive)?\.jsonl(?:\.\d+)?\.prune-(\d+)\.tmp", name)
+            if not m:
+                continue
+            pid = int(m.group(1))
+            if pid != os.getpid():
+                try:
+                    os.kill(pid, 0)
+                    continue          # alive: someone else's, leave it
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    continue          # alive, another user's
             try:
-                os.kill(pid, 0)
-                continue          # alive: someone else's, leave it
-            except ProcessLookupError:
+                if stat.S_ISREG(os.lstat(name, dir_fd=dfd).st_mode):
+                    os.unlink(name, dir_fd=dfd)
+                    log.info("Chronicle retention: removed a stale prune temp (%s)", name)
+            except OSError:
                 pass
-            except PermissionError:
-                continue          # alive, another user's
-        path = os.path.join(d, name)
-        try:
-            if stat.S_ISREG(os.lstat(path).st_mode):
-                os.unlink(path)
-                log.info("Chronicle retention: removed a stale prune temp (%s)", name)
-        except OSError:
-            pass
+    except OSError:
+        return
+    finally:
+        os.close(dfd)
 
 
 def _chronicle_prune_worker(cutoff_id):

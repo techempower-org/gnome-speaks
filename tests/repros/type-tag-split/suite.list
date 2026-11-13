@@ -1,0 +1,3 @@
+# type-tag-split (#193): a <type> tag split across streamed tokens never reaches the
+# speaker. Static: execs only the pure _route_type_tokens router, no GLib.
+repro.py

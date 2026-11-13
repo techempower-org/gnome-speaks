@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """A <type> tag split across streamed tokens must never reach the speaker (2026-10-27)."""
-import importlib.util, pathlib, sys
-src = pathlib.Path(__file__).resolve().parents[3] / "gnome-speaks-service.py"
+import importlib.util, os, pathlib, sys
+# run_all.sh passes the service under test; standalone, the one in this checkout
+src = pathlib.Path(os.environ.get("GS_SVC_PATH") or pathlib.Path(__file__).resolve().parents[3] / "gnome-speaks-service.py")
 code = src.read_text()
 # load only the pure router to avoid the service's GLib imports
 ns = {}
