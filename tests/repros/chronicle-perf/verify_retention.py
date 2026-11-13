@@ -303,6 +303,47 @@ check("R10 a dead pid's prune temp is removed", not os.path.exists(stale))
 check("R10 a live pid's prune temp is left alone", os.path.exists(live))
 os.remove(live)
 
+# ---- R11 the sweep is anchored to the directory it checked (#191) ---------------------
+# Swap the chronicle directory for another between the listing and the unlink. A
+# path-based sweep then unlinks inside the swapped-in directory; an fd-anchored one
+# removes only the temp in the directory it fstat-checked.
+settle()
+D = os.path.dirname(ACTIVE)
+moved = D + ".r11-moved"
+shutil.rmtree(moved, ignore_errors=True)
+tname = os.path.basename(stale)
+plant(stale, [{"id": OLD, "kind": "you", "text": "partial copy"}], 0o600)
+_real_listdir, _swapped = os.listdir, []
+def _swapping_listdir(arg="."):
+    names = _real_listdir(arg)
+    if not _swapped:
+        _swapped.append(1)
+        os.rename(D, moved)
+        os.makedirs(D, mode=0o700)
+        plant(os.path.join(D, tname), [{"id": OLD, "kind": "you", "text": "decoy"}], 0o600)
+    return names
+os.listdir = _swapping_listdir
+try:
+    svc._chronicle_sweep_prune_temps()
+finally:
+    os.listdir = _real_listdir
+check("R11 the swap really happened", bool(_swapped))
+check("R11 the temp in the checked directory is removed", not os.path.exists(os.path.join(moved, tname)))
+check("R11 the directory swapped in afterwards is untouched", os.path.exists(os.path.join(D, tname)))
+shutil.rmtree(D)
+os.rename(moved, D)
+
+# ---- R12 no sweep unless the directory is ours and 0700 (#191) -----------------------
+plant(stale, [{"id": OLD, "kind": "you", "text": "partial copy"}], 0o600)
+os.chmod(D, 0o755)
+try:
+    svc._chronicle_sweep_prune_temps()
+finally:
+    os.chmod(D, 0o700)
+check("R12 a 0755 chronicle directory is not swept", os.path.exists(stale))
+svc._chronicle_sweep_prune_temps()
+check("R12 control: back at 0700 the same temp is swept", not os.path.exists(stale))
+
 print()
 print("RESULT: " + ("RETENTION + MODES HOLD" if FAIL == 0 else f"{FAIL} FAILURES"))
 sys.exit(1 if FAIL else 0)
