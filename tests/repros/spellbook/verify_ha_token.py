@@ -17,6 +17,9 @@ without that item (i.e. every extensions.gnome.org user). Contract:
   H7  both keys are in _SYNC_FLAGS, so a prefs edit applies without a restart
   H8  no personal literal survives in the function: neither the old path nor
       the old item name appears in _get_ha_token's source
+  H9  a boot-time unit's PATH has no ~/.local/bin: with bw only there, it is
+      still found and run (a bare "bw" was FileNotFoundError, silently None)
+  H10 no bw on PATH or in ~/.local/bin: None, no exception, nothing run
 
 The fake `bw` is a per-run script placed FIRST on PATH; it appends its argv to
 a log file in the per-PID scratch dir, so "bw was not called" is a measured
@@ -201,6 +204,41 @@ def main():
     old_item = "ha-" + "llat"
     check("H8", old_path not in src and old_item not in src,
           f"old path present={old_path in src} old item present={old_item in src}")
+
+    # H9 / H10 -- a PATH without the fake's dir; the fake only in $HOME/.local/bin
+    saved_path, saved_home = os.environ["PATH"], os.environ.get("HOME")
+    home = os.path.join(SCRATCH, "home")
+    local_bin = os.path.join(home, ".local", "bin")
+    os.makedirs(local_bin, exist_ok=True)
+    try:
+        os.environ["PATH"] = "/usr/bin:/bin"
+        os.environ["HOME"] = home
+        if shutil.which("bw"):
+            print(f"!! SETUP FAILURE: a system bw is on /usr/bin:/bin: {shutil.which('bw')}")
+            return 2
+        install_fake_bw(rc=0)            # rewrite the fake to succeed ...
+        os.environ["PATH"] = "/usr/bin:/bin"   # ... but keep its dir off PATH
+        shutil.copy2(os.path.join(BW_DIR, "bw"), os.path.join(local_bin, "bw"))
+        reset_bw_log()
+        with isolation.config_scope(mod, ha_token_item="my-own-item-name"):
+            tok = fn()
+        check("H9", tok == "vault-token-value" and bw_calls() == ["get password my-own-item-name"],
+              f"bw only in ~/.local/bin: token={redact(tok, 'vault-token-value')} bw_calls={bw_calls()}")
+        os.remove(os.path.join(local_bin, "bw"))
+        reset_bw_log()
+        try:
+            with isolation.config_scope(mod, ha_token_item="my-own-item-name"):
+                tok = fn()
+            ok, detail = tok is None and bw_calls() == [], f"no bw: token={redact(tok)} bw_calls={bw_calls()}"
+        except Exception as exc:  # noqa: BLE001
+            ok, detail = False, f"raised {exc!r}"
+        check("H10", ok, detail)
+    finally:
+        os.environ["PATH"] = saved_path
+        if saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = saved_home
 
     if FAILS:
         print(f"FAIL: {len(FAILS)} verdict(s) -- {FAILS}")

@@ -2056,6 +2056,21 @@ _SERVICE_START_TIME = time.time()
 _SERVICE_START_ISO = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
+def _bw_path():
+    """The ``bw`` CLI to run, or None. A user unit started at boot, before any
+    desktop login, has no ~/.local/bin on PATH (the GNOME session imports it
+    later), so a bare "bw" was a FileNotFoundError there and the vault step
+    failed silently (wakizashi, 2026-11-14). PATH first, then ~/.local/bin,
+    where the vault-gate wrapper lives."""
+    found = shutil.which("bw")
+    if found:
+        return found
+    local = os.path.expanduser("~/.local/bin/bw")
+    if os.path.isfile(local) and os.access(local, os.X_OK):
+        return local
+    return None
+
+
 def _get_ha_token():
     """Home Assistant long-lived token for the spellbook's `assist` action.
 
@@ -2083,9 +2098,10 @@ def _get_ha_token():
         except OSError:
             pass
     item = str(CONFIG.get("ha_token_item") or "").strip()
-    if item:
+    bw = _bw_path() if item else None
+    if bw:
         try:
-            proc = subprocess.run(["bw", "get", "password", item],
+            proc = subprocess.run([bw, "get", "password", item],
                                   capture_output=True, text=True, timeout=10)
             if proc.returncode == 0 and proc.stdout.strip():
                 return proc.stdout.strip()
