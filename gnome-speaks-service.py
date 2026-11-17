@@ -177,18 +177,20 @@ log = logging.getLogger("gnome-speaks")
 
 
 # speech-to-cli's state.llm_policy (2026-11-17); the same rule inline when an
-# older speech-to-cli lacks it, so the guard never depends on the version.
-_MARKETPLACE = frozenset({"bedrock", "vertex", "azure", "foundry"})
-_CLAUDE_MODEL = re.compile(r"claude|anthropic|opus|sonnet|haiku|fable|mythos", re.I)
+# older speech-to-cli lacks it, so the guard never depends on the version:
+# Bedrock and Vertex refused outright, Azure/Foundry only for first-party
+# OpenAI deployments (a name cannot prove what a marketplace serves).
+_FIRST_PARTY_AZURE = re.compile(r"^(gpt-|o[0-9])", re.I)
+_CLAUDE_WORD = re.compile(r"claude|anthropic", re.I)
 
 
 def _llm_policy(provider, model, api_key=""):
     policy = getattr(state, "llm_policy", None)
     if policy is not None:
         return policy(provider, model, api_key)
-    if str(provider or "").strip().lower() in _MARKETPLACE and _CLAUDE_MODEL.search(str(model or "")):
-        return "local", "qwen36-coder", "", True
-    return provider, model, api_key, False
+    p, m = str(provider or "").strip().lower(), str(model or "").strip()
+    refused = p in ("bedrock", "vertex") or (p in ("azure", "foundry") and (not _FIRST_PARTY_AZURE.match(m) or bool(_CLAUDE_WORD.search(m))))
+    return ("local", "qwen36-coder", "", True) if refused else (provider, model, api_key, False)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -6092,6 +6094,9 @@ class GnomeSpeaksService:
             messages = list(history) + [{"role": "user", "content": user_text}]
             cfg = {"api_key": api_key}
             cfg.update(self._load_cca_config())
+            if refused:   # after every merge: a refused call carries no provider key at all (xreview)
+                for k in ("api_key", "llm_api_key"):
+                    cfg.pop(k, None)
             if provider == "local":
                 # llm_thinking (config + "cast deep thought") decides whether
                 # a reasoning model may think before answering — off = fast
