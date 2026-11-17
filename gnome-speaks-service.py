@@ -176,20 +176,24 @@ logging.basicConfig(
 log = logging.getLogger("gnome-speaks")
 
 
-# speech-to-cli's state.llm_policy (2026-11-17); the same rule inline when an
-# older speech-to-cli lacks it, so the guard never depends on the version:
-# every provider that can host Claude under any name is refused, and a
-# Claude-named model is allowed on "anthropic" (direct) only.
+# The rule of speech-to-cli's state.llm_policy (2026-11-17), applied HERE
+# unconditionally so it never depends on the installed version: every
+# provider that can host Claude under any name is refused, and a
+# Claude-named model is allowed on "anthropic" (direct) only. An installed
+# state.llm_policy can refuse more, never less.
 _MARKETPLACE = frozenset({"bedrock", "vertex", "azure", "foundry", "digitalocean", "puter", "openrouter"})
 _CLAUDE_WORD = re.compile(r"claude|anthropic", re.I)
 
 
 def _llm_policy(provider, model, api_key=""):
-    policy = getattr(state, "llm_policy", None)
-    if policy is not None:
-        return policy(provider, model, api_key)
     p, m = str(provider or "").strip().lower(), str(model or "")
     refused = p in _MARKETPLACE or (p != "anthropic" and bool(_CLAUDE_WORD.search(m)))
+    policy = getattr(state, "llm_policy", None)
+    if not refused and policy is not None:
+        try:
+            refused = bool(policy(provider, model, api_key)[3])
+        except Exception:
+            refused = True   # a broken policy fails closed
     return ("local", "qwen36-coder", "", True) if refused else (provider, model, api_key, False)
 
 # ---------------------------------------------------------------------------
