@@ -175,6 +175,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("gnome-speaks")
 
+
+# speech-to-cli's state.llm_policy (2026-11-17); the same rule inline when an
+# older speech-to-cli lacks it, so the guard never depends on the version.
+_MARKETPLACE = frozenset({"bedrock", "vertex", "azure", "foundry"})
+_CLAUDE_MODEL = re.compile(r"claude|anthropic|opus|sonnet|haiku|fable|mythos", re.I)
+
+
+def _llm_policy(provider, model, api_key=""):
+    policy = getattr(state, "llm_policy", None)
+    if policy is not None:
+        return policy(provider, model, api_key)
+    if str(provider or "").strip().lower() in _MARKETPLACE and _CLAUDE_MODEL.search(str(model or "")):
+        return "local", "qwen36-coder", "", True
+    return provider, model, api_key, False
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -6062,12 +6077,20 @@ class GnomeSpeaksService:
         try:
             provider = CONFIG.get("llm_provider", "anthropic")
             model = CONFIG.get("llm_model", "claude-opus-4.6")
+            api_key = CONFIG.get("llm_api_key", "")
+            # Claude is never called through a marketplace (Bedrock, Vertex,
+            # Foundry bill it as Marketplace). Checked HERE, at the call,
+            # because a live prefs edit reaches CONFIG through
+            # _reload_config_flags() without speech-to-cli's load_config().
+            provider, model, api_key, refused = _llm_policy(provider, model, api_key)
+            if refused:
+                log.warning("LLM: Claude on a marketplace provider refused; using local %s", model)
 
             system_prompt, history = self._build_context(user_text)
 
             # Build messages and config for stream_chat
             messages = list(history) + [{"role": "user", "content": user_text}]
-            cfg = {"api_key": CONFIG.get("llm_api_key", "")}
+            cfg = {"api_key": api_key}
             cfg.update(self._load_cca_config())
             if provider == "local":
                 # llm_thinking (config + "cast deep thought") decides whether
