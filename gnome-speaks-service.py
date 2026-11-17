@@ -175,6 +175,27 @@ logging.basicConfig(
 )
 log = logging.getLogger("gnome-speaks")
 
+
+# The rule of speech-to-cli's state.llm_policy (2026-11-17), applied HERE
+# unconditionally so it never depends on the installed version: every
+# provider that can host Claude under any name is refused, and a
+# Claude-named model is allowed on "anthropic" (direct) only. An installed
+# state.llm_policy can refuse more, never less.
+_MARKETPLACE = frozenset({"bedrock", "vertex", "azure", "foundry", "digitalocean", "puter", "openrouter"})
+_CLAUDE_WORD = re.compile(r"claude|anthropic", re.I)
+
+
+def _llm_policy(provider, model, api_key=""):
+    p, m = str(provider or "").strip().lower(), str(model or "")
+    refused = p in _MARKETPLACE or (p != "anthropic" and bool(_CLAUDE_WORD.search(m)))
+    policy = getattr(state, "llm_policy", None)
+    if not refused and policy is not None:
+        try:
+            refused = bool(policy(provider, model, api_key)[3])
+        except Exception:
+            refused = True   # a broken policy fails closed
+    return ("local", "qwen36-coder", "", True) if refused else (provider, model, api_key, False)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -6062,13 +6083,24 @@ class GnomeSpeaksService:
         try:
             provider = CONFIG.get("llm_provider", "anthropic")
             model = CONFIG.get("llm_model", "claude-opus-4.6")
+            api_key = CONFIG.get("llm_api_key", "")
+            # Claude is never called through a marketplace (Bedrock, Vertex,
+            # Foundry bill it as Marketplace). Checked HERE, at the call,
+            # because a live prefs edit reaches CONFIG through
+            # _reload_config_flags() without speech-to-cli's load_config().
+            provider, model, api_key, refused = _llm_policy(provider, model, api_key)
+            if refused:
+                log.warning("LLM: Claude on a marketplace provider refused; using local %s", model)
 
             system_prompt, history = self._build_context(user_text)
 
             # Build messages and config for stream_chat
             messages = list(history) + [{"role": "user", "content": user_text}]
-            cfg = {"api_key": CONFIG.get("llm_api_key", "")}
+            cfg = {"api_key": api_key}
             cfg.update(self._load_cca_config())
+            if refused:   # after every merge: a refused call carries no provider key at all (xreview)
+                for k in ("api_key", "llm_api_key"):
+                    cfg.pop(k, None)
             if provider == "local":
                 # llm_thinking (config + "cast deep thought") decides whether
                 # a reasoning model may think before answering — off = fast
